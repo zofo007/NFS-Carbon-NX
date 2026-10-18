@@ -175,6 +175,7 @@ upstream source trees are kept as patches in `patches/`. The verified host is Wi
 
 ## Credits
 
+- **[zofo007](https://github.com/zofo007)**: made and maintains this port (Switch runtime, hooks, testing, releases).
 - **Electronic Arts / EA Black Box**: Need for Speed: Carbon. This is an unofficial fan project.
 - **[Sampreeth004](https://github.com/Sampreeth004/nfs-carbon-recomp)**: the Carbon recompilation and the native
   Vulkan renderer this project is built on.

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-beta.2
+
+- Presenter waits at most 2 s for a swapchain image, then recreates it (picture-freeze mitigation, unconfirmed).
+- The NRO shows the author and version in the launcher and the first log line.
+- Build guide explains how to add DLC.
+
 ## 0.1.0-beta.1
 
 First public beta. Runs the Xbox 360 version of Need for Speed: Carbon on the Switch.

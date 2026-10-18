@@ -34,4 +34,5 @@
     <rect x="535" y="222" width="210" height="36" rx="18" fill="none" stroke="#ff5a1f" stroke-width="2"/>
     <text x="640" y="247" text-anchor="middle" fill="#ff8a5c">BETA  ·  0.1.0</text>
   </g>
+  <text x="640" y="284" text-anchor="middle" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="16" letter-spacing="2" fill="#8b96a3">Made by zofo007</text>
 </svg>

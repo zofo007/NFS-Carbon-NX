@@ -1,5 +1,5 @@
 param(
-    [string]$Version = '0.1.0-beta.1',
+    [string]$Version = (Select-String -Path "$PSScriptRoot/../CHANGELOG.md" -Pattern '^## (\S+)' | Select-Object -First 1).Matches[0].Groups[1].Value,
     [string]$Nro = '',
     [string]$Toml = '',
     [switch]$SourceOnly   # skip the NRO zip: only build release/src (used by make-public-branch.ps1)

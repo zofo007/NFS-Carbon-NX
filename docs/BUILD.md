@@ -63,6 +63,14 @@ The result is `artifacts/nfscarbon.nro`. Raise `-Jobs` if you have the memory; t
 Copy `nfscarbon.nro` and `config/nfscarbon.release.toml` (as `nfscarbon.toml`) to `sdmc:/switch/nfscarbon/`, together
 with your `game-data/` folder. See the README for launching.
 
+### Optional: DLC
+
+Copy your Xbox 360 DLC packages (the STFS files, from your own copy of the game) into
+`sdmc:/switch/nfscarbon/dlc/`, in any subfolder. At the next start the game extracts them into its content folder
+and the log shows `[dlc] N package(s) installed`. Nothing in `game-data/` is changed. Which pack unlocks what is
+still being tested; see KNOWN_ISSUES.
+
+
 ## Checks
 
 ```powershell
