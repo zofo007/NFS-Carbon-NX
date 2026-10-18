@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0-beta.6
+
+- Fixes the freeze when a cutscene starts after a long session (thread creation failed, error C0000017): the host stack of each
+  game thread is now 8 MiB instead of 16, which frees about 260 MB of the process memory. Setting `thread_host_stack_mib`.
+- Unjoined host threads are detached so their stacks are freed.
+- The log has a build line and a memory/thread/heap line every 10 seconds.
+
 ## 0.1.0-beta.5
 
 First release with a downloadable NRO.

@@ -1,4 +1,4 @@
-# nfscarbon.toml - NFS Carbon NX 0.1.0-beta.1
+# nfscarbon.toml - NFS Carbon NX
 # A missing line uses the default. Restart the game after editing. All options: docs/CONFIG.md
 gpu_plugin = "carbon"
 input_backend = "switch"
@@ -22,3 +22,7 @@ carbon_debug_skip_passes = 4
 # carbon_gpu_mip_nearest = false
 # carbon_gpu_bloom = true
 # carbon_gpu_stats = true      # false = no FPS lines in the log, slightly less CPU per draw
+
+# Host stack per guest thread in MiB (default 8; was 16 before 0.1.0-beta.6). A smaller value leaves more process memory
+# free for new threads (cutscenes froze when none was left). 16 = old behaviour.
+# thread_host_stack_mib = 8

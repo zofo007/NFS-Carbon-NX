@@ -55,8 +55,8 @@ $forbidden = '\.(xex|xexp|iso|wmv|bin|dll|exe|elf|nacp|log)$|game-data|HW-Test|U
 $bad = Get-ChildItem -Recurse -File $out | Where-Object { $_.FullName.Substring($out.Length) -match $forbidden -and $_.Name -ne 'PUT_YOUR_GAME_FILES_HERE.txt' }
 if ($bad) { throw "Forbidden files in the release tree:`n$($bad.FullName -join "`n")" }
 
-if (-not $SourceOnly) { & "$env:SystemRoot/System32/tar.exe" -a -c -f "$out/nfscarbon-$Version.zip" -C "$out/sd" . }  # bsdtar: forward slashes
-& "$env:SystemRoot/System32/tar.exe" -a -c -f "$out/nfscarbon-$Version-src.zip" -C "$out/src" .
+if (-not $SourceOnly) { & "$env:SystemRoot/System32/tar.exe" -a -c -f "$out/nfscarbon-$Version.zip" -C "$out/sd" switch }  # bsdtar: forward slashes
+& "$env:SystemRoot/System32/tar.exe" -a -c -f "$out/nfscarbon-$Version-src.zip" -C "$out/src" @(Get-ChildItem -Force "$out/src" | ForEach-Object Name)
 Get-ChildItem "$out/*.zip" | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } |
     Set-Content "$out/SHA256SUMS.txt" -Encoding ascii
 Get-Content "$out/SHA256SUMS.txt"
