@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="NFS Carbon NX">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#1b232e"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff5a1f" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#ff5a1f" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#ff5a1f" stop-opacity="0"/>
+    </linearGradient>
+    <pattern id="weave" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="8" height="8" fill="none"/>
+      <rect width="4" height="4" fill="#ffffff" fill-opacity="0.035"/>
+      <rect x="4" y="4" width="4" height="4" fill="#ffffff" fill-opacity="0.035"/>
+    </pattern>
+  </defs>
+  <rect width="1280" height="320" fill="url(#bg)"/>
+  <rect width="1280" height="320" fill="url(#weave)"/>
+  <!-- speed lines -->
+  <g stroke="#ff5a1f" stroke-linecap="round" opacity="0.55">
+    <line x1="60" y1="238" x2="520" y2="238" stroke-width="3"/>
+    <line x1="140" y1="256" x2="640" y2="256" stroke-width="2"/>
+    <line x1="30" y1="274" x2="400" y2="274" stroke-width="2"/>
+    <line x1="760" y1="86" x2="1230" y2="86" stroke-width="2"/>
+    <line x1="880" y1="68" x2="1250" y2="68" stroke-width="3"/>
+  </g>
+  <rect x="0" y="292" width="1280" height="3" fill="url(#glow)"/>
+  <text x="640" y="150" text-anchor="middle" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
+        font-size="92" font-weight="800" letter-spacing="6" fill="#f4f6f8">NFS CARBON <tspan fill="#ff5a1f">NX</tspan></text>
+  <text x="640" y="200" text-anchor="middle" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
+        font-size="30" font-weight="500" letter-spacing="1.5" fill="#aeb7c2">Need for Speed: Carbon (Xbox 360) on Nintendo Switch</text>
+  <g font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="20" font-weight="600" letter-spacing="2">
+    <rect x="535" y="222" width="210" height="36" rx="18" fill="none" stroke="#ff5a1f" stroke-width="2"/>
+    <text x="640" y="247" text-anchor="middle" fill="#ff8a5c">BETA  ·  0.1.0</text>
+  </g>
+</svg>

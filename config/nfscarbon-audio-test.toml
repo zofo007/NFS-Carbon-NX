@@ -1,0 +1,11 @@
+# Temporary hardware comparison: original audio queue is 10 frames (~53 ms).
+# 16 frames (~85 ms) may absorb late callbacks, but cannot fix silence in guest PCM.
+gpu_plugin = "carbon"
+input_backend = "switch"
+input_xbox_layout = false
+mnk_mode = false
+mnk_mouse = false
+log_level = "info"
+carbon_gpu_vsync = true
+carbon_gpu_watchdog = true
+audio_switch_tramas_en_cola = 16

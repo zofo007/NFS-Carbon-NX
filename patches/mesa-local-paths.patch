@@ -1,0 +1,30 @@
+diff --git a/src/nouveau/headers/util.py b/src/nouveau/headers/util.py
+index 0ccc4c5..2603668 100644
+--- a/src/nouveau/headers/util.py
++++ b/src/nouveau/headers/util.py
+@@ -29,6 +29,7 @@ def write_template_rs(out_file, template, environment):
+             ["rustfmt"],
+             input=contents,
+             text=True,
++            encoding="utf-8",
+         )
+     except (subprocess.CalledProcessError, FileNotFoundError, PermissionError):
+         pass
+diff --git a/switch-pkg-config-wrapper.sh b/switch-pkg-config-wrapper.sh
+index 3725cc1..3901835 100644
+--- a/switch-pkg-config-wrapper.sh
++++ b/switch-pkg-config-wrapper.sh
+@@ -5,8 +5,10 @@ set -o pipefail
+ export PKG_CONFIG_DIR=
+ export PKG_CONFIG_PATH=
+ export PKG_CONFIG_SYSROOT_DIR=
+-export PKG_CONFIG_LIBDIR=/opt/devkitpro/portlibs/switch/lib/pkgconfig
++dkp_root=${DEVKITPRO:-/opt/devkitpro}
++dkp_native=$(cygpath -m "$dkp_root")
++export PKG_CONFIG_LIBDIR="$(cygpath -u "$dkp_root")/portlibs/switch/lib/pkgconfig"
+ 
+ /usr/bin/pkg-config --static "$@" |
+-    /usr/bin/sed -e 's|/opt/devkitpro|C:/msys64/opt/devkitpro|g' \
+-        -e 's|$(DEVKITPRO)|C:/msys64/opt/devkitpro|g'
++    /usr/bin/sed -e "s|/opt/devkitpro|$dkp_native|g" \
++        -e "s|\$(DEVKITPRO)|$dkp_native|g"

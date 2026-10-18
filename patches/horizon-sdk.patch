@@ -1,0 +1,891 @@
+diff --git a/sdk/CMakeLists.txt b/sdk/CMakeLists.txt
+index c460dd3..8d9eb80 100644
+--- a/sdk/CMakeLists.txt
++++ b/sdk/CMakeLists.txt
+@@ -153,6 +153,10 @@ add_compile_options(
+ 
+ # Platform detection (supports AMD64 and ARM64)
+ set(REX_TARGET_PROCESSOR "${CMAKE_SYSTEM_PROCESSOR}")
++if(REX_TARGET_PROCESSOR MATCHES "^(AMD64|x86_64)$")
++    # The runtime's byte-swap intrinsics require SSSE3/SSE4.1, not the compiler's SSE2 default.
++    add_compile_options(-msse4.1)
++endif()
+ if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+     list(LENGTH CMAKE_OSX_ARCHITECTURES REX_OSX_ARCH_COUNT)
+     if(REX_OSX_ARCH_COUNT GREATER 1)
+diff --git a/sdk/include/rex/audio/xma/profile.h b/sdk/include/rex/audio/xma/profile.h
+new file mode 100644
+index 0000000..6fd3370
+--- /dev/null
++++ b/sdk/include/rex/audio/xma/profile.h
+@@ -0,0 +1,97 @@
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++
++namespace rex::audio {
++
++enum class XmaProfileStage { kEnable, kDisable, kWorkLock, kWorkBody, kCodec, kConvert, kCount };
++constexpr size_t kXmaProfileStageCount = size_t(XmaProfileStage::kCount);
++
++struct XmaProfileClock {
++  uint64_t wall_ns = 0, cpu_ns = 0;
++  bool cpu_valid = false;
++};
++
++struct XmaProfileSnapshot {
++  uint64_t calls, samples, wall_ns, wall_max_ns, cpu_ns, cpu_max_ns, cpu_samples;
++};
++
++struct XmaProfileStats {
++  std::atomic<uint64_t> calls{0}, samples{0}, wall_ns{0}, wall_max_ns{0};
++  std::atomic<uint64_t> cpu_ns{0}, cpu_max_ns{0}, cpu_samples{0};
++
++  static void Max(std::atomic<uint64_t>& target, uint64_t value) {
++    uint64_t previous = target.load(std::memory_order_relaxed);
++    while (value > previous &&
++           !target.compare_exchange_weak(previous, value, std::memory_order_relaxed)) {}
++  }
++
++  void Record(XmaProfileClock start, XmaProfileClock end) {
++    const uint64_t wall = end.wall_ns >= start.wall_ns ? end.wall_ns - start.wall_ns : 0;
++    wall_ns.fetch_add(wall, std::memory_order_relaxed);
++    Max(wall_max_ns, wall);
++    if (start.cpu_valid && end.cpu_valid && end.cpu_ns >= start.cpu_ns) {
++      const uint64_t cpu = end.cpu_ns - start.cpu_ns;
++      cpu_ns.fetch_add(cpu, std::memory_order_relaxed);
++      Max(cpu_max_ns, cpu);
++      cpu_samples.fetch_add(1, std::memory_order_relaxed);
++    }
++    samples.fetch_add(1, std::memory_order_relaxed);
++  }
++
++  XmaProfileSnapshot Take() {
++    return {calls.exchange(0, std::memory_order_relaxed),
++            samples.exchange(0, std::memory_order_relaxed),
++            wall_ns.exchange(0, std::memory_order_relaxed),
++            wall_max_ns.exchange(0, std::memory_order_relaxed),
++            cpu_ns.exchange(0, std::memory_order_relaxed),
++            cpu_max_ns.exchange(0, std::memory_order_relaxed),
++            cpu_samples.exchange(0, std::memory_order_relaxed)};
++  }
++};
++
++inline std::array<XmaProfileStats, kXmaProfileStageCount> g_xma_profile;
++inline thread_local std::array<uint32_t, kXmaProfileStageCount> g_xma_profile_sequence{};
++
++template <auto ReadClock>
++class SampledXmaProfileScope {
++ public:
++  SampledXmaProfileScope(XmaProfileStage stage, bool enabled) {
++    if (!enabled) return;
++    stats_ = &g_xma_profile[size_t(stage)];
++    stats_->calls.fetch_add(1, std::memory_order_relaxed);
++    // High LCG bits avoid repeatedly selecting the same voice in a periodic batch.
++    uint32_t& sequence = g_xma_profile_sequence[size_t(stage)];
++    sequence = sequence * 1664525u + 1013904223u;
++    sampled_ = (sequence >> 26) == 0;  // About 1/64; no clock/syscall otherwise.
++    if (sampled_) start_ = ReadClock();
++  }
++
++  ~SampledXmaProfileScope() {
++    if (sampled_) stats_->Record(start_, ReadClock());
++  }
++
++  void Next(XmaProfileStage stage) {
++    if (!stats_) return;
++    if (sampled_) {
++      const XmaProfileClock now = ReadClock();
++      stats_->Record(start_, now);
++      start_ = now;
++    }
++    stats_ = &g_xma_profile[size_t(stage)];
++    stats_->calls.fetch_add(1, std::memory_order_relaxed);
++  }
++
++  SampledXmaProfileScope(const SampledXmaProfileScope&) = delete;
++  SampledXmaProfileScope& operator=(const SampledXmaProfileScope&) = delete;
++
++ private:
++  XmaProfileStats* stats_ = nullptr;
++  XmaProfileClock start_{};
++  bool sampled_ = false;
++};
++
++}  // namespace rex::audio
+diff --git a/sdk/include/rex/ui/vulkan/functions/device_1_0.inc b/sdk/include/rex/ui/vulkan/functions/device_1_0.inc
+index aa55a4a..d9d6ed3 100644
+--- a/sdk/include/rex/ui/vulkan/functions/device_1_0.inc
++++ b/sdk/include/rex/ui/vulkan/functions/device_1_0.inc
+@@ -43,6 +43,7 @@ XE_UI_VULKAN_FUNCTION(vkCreateFramebuffer)
+ XE_UI_VULKAN_FUNCTION(vkCreateGraphicsPipelines)
+ XE_UI_VULKAN_FUNCTION(vkCreateImage)
+ XE_UI_VULKAN_FUNCTION(vkCreateImageView)
++XE_UI_VULKAN_FUNCTION(vkCreatePipelineCache)
+ XE_UI_VULKAN_FUNCTION(vkCreatePipelineLayout)
+ XE_UI_VULKAN_FUNCTION(vkCreateQueryPool)
+ XE_UI_VULKAN_FUNCTION(vkCreateRenderPass)
+@@ -59,6 +60,7 @@ XE_UI_VULKAN_FUNCTION(vkDestroyFramebuffer)
+ XE_UI_VULKAN_FUNCTION(vkDestroyImage)
+ XE_UI_VULKAN_FUNCTION(vkDestroyImageView)
+ XE_UI_VULKAN_FUNCTION(vkDestroyPipeline)
++XE_UI_VULKAN_FUNCTION(vkDestroyPipelineCache)
+ XE_UI_VULKAN_FUNCTION(vkDestroyPipelineLayout)
+ XE_UI_VULKAN_FUNCTION(vkDestroyQueryPool)
+ XE_UI_VULKAN_FUNCTION(vkDestroyRenderPass)
+@@ -72,6 +74,7 @@ XE_UI_VULKAN_FUNCTION(vkGetBufferMemoryRequirements)
+ XE_UI_VULKAN_FUNCTION(vkGetDeviceQueue)
+ XE_UI_VULKAN_FUNCTION(vkGetFenceStatus)
+ XE_UI_VULKAN_FUNCTION(vkGetImageMemoryRequirements)
++XE_UI_VULKAN_FUNCTION(vkGetPipelineCacheData)
+ XE_UI_VULKAN_FUNCTION(vkInvalidateMappedMemoryRanges)
+ XE_UI_VULKAN_FUNCTION(vkMapMemory)
+ XE_UI_VULKAN_FUNCTION(vkResetCommandPool)
+diff --git a/sdk/src/audio/audio_system.cpp b/sdk/src/audio/audio_system.cpp
+index eefee0e..103489c 100644
+--- a/sdk/src/audio/audio_system.cpp
++++ b/sdk/src/audio/audio_system.cpp
+@@ -25,6 +25,14 @@
+ #include <rex/thread.h>
+ #include <rex/cvar.h>
+ 
++#if REX_PLATFORM_SWITCH
++#include <rex/audio/switch/switch_audio_system.h>
++#include <switch/types.h>
++#include <switch/arm/counter.h>
++extern "C" void RexSwitchPerfAdd(unsigned id, uint64_t value);
++extern "C" void RexSwitchPerfMax(unsigned id, uint64_t value);
++#endif
++
+ REXCVAR_DEFINE_INT32(
+     audio_maxqframes, 8, "Audio",
+     "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
+@@ -150,6 +158,9 @@ void AudioSystem::WorkerThreadMain() {
+     bool pumped = false;
+     if (result.first == rex::thread::WaitResult::kSuccess) {
+       auto index = result.second;
++#if REX_PLATFORM_SWITCH
++      const uint64_t block_start = armGetSystemTick();
++#endif
+ 
+       auto global_lock = global_critical_region_.Acquire();
+       uint32_t client_callback = clients_[index].callback;
+@@ -168,6 +179,12 @@ void AudioSystem::WorkerThreadMain() {
+         uint64_t args[] = {client_callback_arg};
+         function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
+                                       rex::countof(args));
++#if REX_PLATFORM_SWITCH
++        // Wall time includes dispatch-lock wait, guest production and preemption, not device wait.
++        const uint64_t block_ns = armTicksToNs(armGetSystemTick() - block_start);
++        RexSwitchPerfMax(36, block_ns / 1000);
++        RexSwitchPerfAdd(35, block_ns > 1'000'000'000ull * nx::SwitchAudioDriver::kChannelSamples / 48000);
++#endif
+         if (diag_pump_count < 10) {
+           REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
+         }
+diff --git a/sdk/src/audio/switch/switch_audio_system.cpp b/sdk/src/audio/switch/switch_audio_system.cpp
+index 6a9dc8d..8546f48 100644
+--- a/sdk/src/audio/switch/switch_audio_system.cpp
++++ b/sdk/src/audio/switch/switch_audio_system.cpp
+@@ -373,9 +373,11 @@ void SwitchAudioSystem::OutputThreadMain() {
+     if (output.pump) {
+       const u64 now = armGetSystemTick();
+       if (now >= deadline) {
++        RexSwitchPerfMax(34, armTicksToNs(now - deadline) / 1000);
+         PumpTick();
+         deadline += interval;
+         if (now >= deadline) {
++          RexSwitchPerfAdd(33, 1);
+           deadline = now + interval;  // more than one tick late: no catch-up burst
+         }
+         continue;
+diff --git a/sdk/src/audio/xma_context.cpp b/sdk/src/audio/xma_context.cpp
+index a902d01..525e7bf 100644
+--- a/sdk/src/audio/xma_context.cpp
++++ b/sdk/src/audio/xma_context.cpp
+@@ -26,6 +26,7 @@
+ #include <rex/audio/xma/context.h>
+ #include <rex/audio/xma/decoder.h>
+ #include <rex/audio/xma/helpers.h>
++#include <rex/audio/xma/profile.h>
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
+ #include <rex/memory/ring_buffer.h>
+@@ -34,6 +35,15 @@
+ #include <rex/cvar.h>
+ #include <rex/filesystem.h>
+ 
++#if REX_PLATFORM_SWITCH
++extern "C" {
++#include <switch/arm/counter.h>
++#include <switch/kernel/svc.h>
++#include <switch/kernel/thread.h>
++#include <switch/runtime/hosversion.h>
++}
++#endif
++
+ extern "C" {
+ #if REX_COMPILER_MSVC
+ #pragma warning(push)
+@@ -61,6 +71,14 @@ REXCVAR_DEFINE_INT32(audio_volcado_xma_mb, 32, "Audio",
+ REXCVAR_DEFINE_INT32(audio_volcado_xma_min_s, 2, "Audio",
+                      "Diagnostico: segundos minimos de un sonido XMA que se guardan cuando termina");
+ 
++#if REX_PLATFORM_SWITCH
++constexpr bool kXmaProfileDefault = true;
++#else
++constexpr bool kXmaProfileDefault = false;
++#endif
++REXCVAR_DEFINE_BOOL(audio_xma_profile, kXmaProfileDefault, "Audio",
++                    "Sample XMA CPU/wall stages (~1/64 calls); disable for diagnostic-overhead A/B");
++
+ namespace {
+ 
+ // Robotic audio diagnostic: 16-bit big-endian PCM of an XMA context, kept in memory until the
+@@ -275,6 +293,23 @@ void ReiniciarVolcadoXma(uint32_t contexto) {
+ 
+ namespace rex::audio {
+ 
++namespace {
++XmaProfileClock ReadXmaProfileClock() {
++#if REX_PLATFORM_SWITCH
++  const uint64_t wall_ns = armTicksToNs(armGetSystemTick());
++  uint64_t cpu_ticks = 0;
++  const uint32_t info = hosversionAtLeast(13, 0, 0) ? InfoType_ThreadTickCount
++                                                  : InfoType_ThreadTickCountDeprecated;
++  const bool valid = svcGetInfo(&cpu_ticks, info, threadGetCurHandle(), UINT64_MAX) == 0;
++  return {wall_ns, valid ? armTicksToNs(cpu_ticks) : 0, valid};
++#else
++  return {uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                      std::chrono::steady_clock::now().time_since_epoch()).count()), 0, false};
++#endif
++}
++using XmaProfileScope = SampledXmaProfileScope<ReadXmaProfileClock>;
++}  // namespace
++
+ using stream::BitStream;
+ 
+ const uint32_t XmaContext::kBitsPerPacketHeader;
+@@ -372,7 +407,9 @@ bool XmaContext::Work() {
+     return false;
+   }
+ 
++  XmaProfileScope profile(XmaProfileStage::kWorkLock, REXCVAR_GET(audio_xma_profile));
+   std::lock_guard<std::mutex> lock(lock_);
++  profile.Next(XmaProfileStage::kWorkBody);
+   // The immediate work and the XMA thread may have seen the same notification.
+   // Only one must consume it; Disable/Release also use this lock.
+   if (!is_allocated() || !is_enabled()) {
+@@ -481,6 +518,7 @@ bool XmaContext::Work() {
+ }
+ 
+ void XmaContext::Enable() {
++  XmaProfileScope profile(XmaProfileStage::kEnable, REXCVAR_GET(audio_xma_profile));
+   std::lock_guard<std::mutex> lock(lock_);
+   set_is_enabled(true);
+ }
+@@ -538,6 +576,7 @@ void XmaContext::ResetDecoderState() {
+ }
+ 
+ void XmaContext::Disable() {
++  XmaProfileScope profile(XmaProfileStage::kDisable, REXCVAR_GET(audio_xma_profile));
+   std::lock_guard<std::mutex> lock(lock_);
+   set_is_enabled(false);
+ }
+@@ -885,6 +924,7 @@ void XmaContext::PreparePacket(uint32_t frame_size, uint32_t frame_padding) {
+ 
+ bool XmaContext::DecodePacket(AVCodecContext* av_context, const AVPacket* av_packet,
+                               AVFrame* av_frame) {
++  XmaProfileScope profile(XmaProfileStage::kCodec, REXCVAR_GET(audio_xma_profile));
+   auto ret = avcodec_send_packet(av_context, av_packet);
+   if (ret < 0) {
+     char errbuf[AV_ERROR_MAX_STRING_SIZE];
+@@ -1097,6 +1137,7 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+ 
+ void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
+                               uint8_t* output_buffer) {
++  XmaProfileScope profile(XmaProfileStage::kConvert, REXCVAR_GET(audio_xma_profile));
+   // Loop through every sample, convert and drop it into the output array.
+   // If more than one channel, we need to interleave the samples from each
+   // channel next to each other. Always saturate because FFmpeg output is
+diff --git a/sdk/src/audio/xma_decoder.cpp b/sdk/src/audio/xma_decoder.cpp
+index 3a1bebb..5c63fc4 100644
+--- a/sdk/src/audio/xma_decoder.cpp
++++ b/sdk/src/audio/xma_decoder.cpp
+@@ -26,6 +26,8 @@
+ #include <atomic>
+ #include <chrono>
+ 
++#include "xma_despertar.h"
++
+ extern "C" {
+ #include "libavutil/cpu.h"
+ #include "libavutil/log.h"
+@@ -55,6 +57,10 @@ REXCVAR_DEFINE_INT32(audio_xma_en_trabajador, REX_XMA_EN_TRABAJADOR_POR_DEFECTO,
+                      "como hasta ahora; 1 = el hilo XMA Decoder, que en la Switch va a 0x2B y no lo preempta "
+                      "el anillo de la GPU; 2 = el trabajador, y el hilo que pide el kick solo termina los "
+                      "contextos que el trabajador no haya cogido (para el PC, donde no hay esas prioridades)");
++REXCVAR_DEFINE_BOOL(audio_xma_despertar_si_duerme, false, "Audio",
++                    "Con audio_xma_en_trabajador: el kick solo despierta al hilo XMA Decoder si esta dormido; "
++                    "si ya esta despierto encuentra el contexto marcado en su siguiente pasada. false = avisar "
++                    "en cada kick, como hasta ahora (Carbon lo activa al arrancar)");
+ 
+ // As with normal Microsoft, there are like twelve different ways to access
+ // the audio APIs. Early games use XMA*() methods almost exclusively to touch
+@@ -221,6 +227,16 @@ MedidaXma g_medida_xma;
+ constexpr uint32_t kPalabrasPendientes = 10;  // 320 contextos / 32
+ std::atomic<uint32_t> g_pendientes[kPalabrasPendientes];
+ std::atomic<int64_t> g_pendiente_desde_ns{0};
++DespertarXma g_despertar_xma;
++
++bool HayPendientes() {
++  for (uint32_t palabra = 0; palabra < kPalabrasPendientes; ++palabra) {
++    if (g_pendientes[palabra].load(std::memory_order_acquire) != 0) {
++      return true;
++    }
++  }
++  return false;
++}
+ 
+ int64_t AhoraNs() {
+   using namespace std::chrono;
+@@ -357,8 +373,14 @@ void XmaDecoder::WorkerThreadMain() {
+     if (did_work) {
+       continue;
+     }
+-    // No work done this iteration, block until signaled.
++    // No work done this iteration, block until signaled. With audio_xma_despertar_si_duerme a kick only
++    // signals a sleeping worker, so look for marks once more after saying so (xma_despertar.h). Always
++    // declared, whatever the option is now: it can be switched on while the worker is waiting.
++    if (!g_despertar_xma.PuedeDormir(&HayPendientes)) {
++      continue;
++    }
+     rex::thread::Wait(work_event_.get(), false);
++    g_despertar_xma.Despierto();
+   }
+ }
+ 
+@@ -514,7 +536,9 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+         }
+       }
+       g_pendiente_desde_ns.store(AhoraNs(), std::memory_order_release);
+-      work_event_->Set();
++      if (!REXCVAR_GET(audio_xma_despertar_si_duerme) || g_despertar_xma.DebeAvisar()) {
++        work_event_->Set();
++      }
+     }
+     for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
+       if (kicked_value & 1) {
+diff --git a/sdk/src/audio/xma_despertar.h b/sdk/src/audio/xma_despertar.h
+new file mode 100644
+index 0000000..1fd34dc
+--- /dev/null
++++ b/sdk/src/audio/xma_despertar.h
+@@ -0,0 +1,48 @@
++#pragma once
++
++// Carbon (audio_xma_despertar_si_duerme): the kick wakes the XMA worker only when it is asleep.
++// Measured on Carbon (e8d4, 2026-10-16): ~3,000 kicks/s cost the game's mixer thread ~20 us each
++// (540-660 ms per 10 s), mostly the wake itself; a worker that is already awake finds the marked
++// context on its next pass anyway.
++//
++// Lost-wakeup safety (Dekker): the kicker marks its context, then reads the flag; the worker sets the
++// flag, then looks for marked contexts. With a full fence on both sides at least one of them sees the
++// other, so either the worker keeps running or the kicker wakes it. Both seeing each other only costs
++// one extra pass of the worker (the auto-reset event stays signaled).
++
++#include <atomic>
++
++namespace rex::audio {
++
++class DespertarXma {
++ public:
++  // Kicker, after marking its contexts: true = signal the work event.
++  bool DebeAvisar() {
++    std::atomic_thread_fence(std::memory_order_seq_cst);
++    return dormido_.exchange(false, std::memory_order_seq_cst);
++  }
++
++  // Worker, with nothing done in its last pass: true = it may wait on the event. `hay_pendientes`
++  // reports whether any context is still marked.
++  template <typename HayPendientes>
++  bool PuedeDormir(HayPendientes hay_pendientes) {
++    dormido_.store(true, std::memory_order_seq_cst);
++    std::atomic_thread_fence(std::memory_order_seq_cst);
++    if (hay_pendientes()) {
++      dormido_.store(false, std::memory_order_relaxed);
++      return false;
++    }
++    return true;
++  }
++
++  // Worker, back from the wait (also after a timeout or another wake-up source).
++  void Despierto() { dormido_.store(false, std::memory_order_relaxed); }
++
++ private:
++  // Starts asleep: the worker may already be waiting when the option is switched on (Carbon turns it on
++  // after the worker started; hardware 19d24a38cf07 lost the first kick and hung the game's mixer).
++  // Extra signals only cost one extra worker pass.
++  std::atomic<bool> dormido_{true};
++};
++
++}  // namespace rex::audio
+diff --git a/sdk/src/core/CMakeLists.txt b/sdk/src/core/CMakeLists.txt
+index 10cb9f1..2493491 100644
+--- a/sdk/src/core/CMakeLists.txt
++++ b/sdk/src/core/CMakeLists.txt
+@@ -79,6 +79,7 @@ elseif(REXGLUE_PLATFORM_SWITCH)
+         memory_switch.cpp             # rex::memory API on top of the core
+         seh_switch.cpp                # SEH interface; faults inside SEH scopes are fatal
+         switch_libc_supplement.c      # pread, pwrite and friends: newlib declares them, libnx does not
++        switch_entropy.c
+     )
+ elseif(UNIX)
+     # Linux and macOS/Darwin share the POSIX sources; Darwin-specific behavior
+diff --git a/sdk/src/core/switch_entropy.c b/sdk/src/core/switch_entropy.c
+new file mode 100644
+index 0000000..ae4093f
+--- /dev/null
++++ b/sdk/src/core/switch_entropy.c
+@@ -0,0 +1,16 @@
++/* Newlib entropy hook, extracted from switch_libc_supplement.c.
++ * Distributed under the SDK's BSD license (see LICENSE).
++ * libnx randomGet uses a kernel-seeded ChaCha generator without a service.
++ * getentropy's contract limits a single request to 256 bytes. */
++#include <errno.h>
++#include <sys/reent.h>
++#include <switch.h>
++
++int _getentropy_r(struct _reent* r, void* buf, size_t len) {
++    if (len > 256) {
++        r->_errno = EIO;
++        return -1;
++    }
++    randomGet(buf, len);
++    return 0;
++}
+diff --git a/sdk/src/core/switch_libc_supplement.c b/sdk/src/core/switch_libc_supplement.c
+index d604044..2531785 100644
+--- a/sdk/src/core/switch_libc_supplement.c
++++ b/sdk/src/core/switch_libc_supplement.c
+@@ -139,26 +139,6 @@ int pthread_setname_np(pthread_t thread, const char* name) {
+     return 0;
+ }
+ 
+-/* --- getentropy ------------------------------------------------------------
+- *
+- * newlib's getentropy only forwards to _getentropy_r, the syscall a platform is
+- * expected to provide, and libnx does not. It surfaced linking the full
+- * runtime through CMake: the manual probes did not pull in the object that
+- * calls it (std::random_device, FFmpeg's arc4random). libnx's randomGet is a
+- * ChaCha generator seeded from the kernel's entropy and needs no service.
+- * getentropy's contract caps a request at 256 bytes. */
+-
+-#include <sys/reent.h>
+-
+-int _getentropy_r(struct _reent* r, void* buf, size_t len) {
+-    if (len > 256) {
+-        r->_errno = EIO;
+-        return -1;
+-    }
+-    randomGet(buf, len);
+-    return 0;
+-}
+-
+ /* --- timegm ----------------------------------------------------------------
+  *
+  * newlib has mktime, which interprets struct tm in the local time zone, but not
+diff --git a/sdk/src/input/switch/switch_input_driver.cpp b/sdk/src/input/switch/switch_input_driver.cpp
+index ccf5e2a..ee36923 100644
+--- a/sdk/src/input/switch/switch_input_driver.cpp
++++ b/sdk/src/input/switch/switch_input_driver.cpp
+@@ -27,6 +27,9 @@
+ // letter: A accepts and B goes back, as in other Switch games. With true they go by position, as on
+ // an Xbox pad: the bottom one (B on the Switch) acts as A, the mapping of 1.0.0. It applies at once;
+ // the settings menu reads it too (window_switch.cpp).
++REXCVAR_DEFINE_BOOL(switch_log_console_shortcut, false, "Input",
++                    "L+R+Down opens the ImGui log console. Off by default: opening/closing it on a Carbon session hung the whole console (03:12 run)");
++
+ REXCVAR_DEFINE_BOOL(input_xbox_layout, false, "Input",
+                     "Face buttons by position, as on an Xbox pad (the bottom button, B, acts as A). "
+                     "false = by letter: A accepts and B goes back");
+@@ -377,6 +380,7 @@ void SwitchInputDriver::DispatchMenuShortcuts(Slot& slot, uint64_t held) {
+ 
+   const bool modificador = (held & kModificador) == kModificador;
+   for (size_t i = 0; i < std::size(kAtajos); ++i) {
++    if (kAtajos[i].tecla == rex::ui::VirtualKey::kOem3 && !REXCVAR_GET(switch_log_console_shortcut)) continue;
+     const uint64_t bit = uint64_t(1) << i;
+     const bool ahora = modificador && (held & kAtajos[i].boton) != 0;
+     const bool antes = (slot.menu_shortcuts & bit) != 0;
+diff --git a/sdk/src/kernel/xam/xam_user.cpp b/sdk/src/kernel/xam/xam_user.cpp
+index 8778066..93f380f 100644
+--- a/sdk/src/kernel/xam/xam_user.cpp
++++ b/sdk/src/kernel/xam/xam_user.cpp
+@@ -598,6 +598,8 @@ class XStaticAchievementEnumerator : public XEnumerator {
+ u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 xuid, u32 flags,
+                                              u32 offset, u32 count, mapped_u32 buffer_size_ptr,
+                                              mapped_u32 handle_ptr) {
++  REXKRNL_INFO("[logros] XamUserCreateAchievementEnumerator title {:08X} user {} xuid {:08X} offset {} count {}",
++               title_id, user_index, xuid, offset, count);
+   if (!count || !buffer_size_ptr || !handle_ptr) {
+     return X_ERROR_INVALID_PARAMETER;
+   }
+diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/sdk/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+index d8fac47..22348f9 100644
+--- a/sdk/src/kernel/xboxkrnl/xboxkrnl_io.cpp
++++ b/sdk/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+@@ -372,12 +372,15 @@ inline void AnotarLectura(uint64_t us, uint32_t bytes, const std::string_view ru
+ // natively with FFmpeg, because the recompiled XDK WMV decoder does not reach real time on the
+ // Switch.
+ namespace {
++#if defined(__SWITCH__)
++extern "C" void CarbonOnWmvOpened() __attribute__((weak));
++#endif
+ std::mutex g_nfsmw_wmv_mutex;
+ std::string g_nfsmw_ultimo_wmv;
+ std::vector<std::pair<const rex::filesystem::Entry*, std::string>> g_nfsmw_wmv_abiertos;
+ std::string g_nfsmw_ultimo_wmv_leido;
+ 
+-void NfsmwAnotarApertura(const rex::filesystem::Entry* entrada, const std::string& ruta) {
++static void NfsmwAnotarAperturaLocked(const rex::filesystem::Entry* entrada, const std::string& ruta) {
+   std::lock_guard<std::mutex> lock(g_nfsmw_wmv_mutex);
+   g_nfsmw_ultimo_wmv = ruta;
+   for (auto& [e, r] : g_nfsmw_wmv_abiertos) {
+@@ -393,6 +396,14 @@ void NfsmwAnotarApertura(const rex::filesystem::Entry* entrada, const std::strin
+   REXLOG_INFO("[video] el juego abre '{}'", ruta);
+ }
+ 
++void NfsmwAnotarApertura(const rex::filesystem::Entry* entrada, const std::string& ruta) {
++  NfsmwAnotarAperturaLocked(entrada, ruta);
++#if defined(__SWITCH__)
++  // After the mutex is released (the app's hook takes its own lock): frees the previous movie's decoder.
++  if (CarbonOnWmvOpened) CarbonOnWmvOpened();
++#endif
++}
++
+ void NfsmwAnotarLectura(const rex::filesystem::Entry* entrada) {
+   std::lock_guard<std::mutex> lock(g_nfsmw_wmv_mutex);
+   for (const auto& [e, r] : g_nfsmw_wmv_abiertos) {
+@@ -538,6 +549,10 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+       (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0, &vfs_file, &file_action);
+   const uint64_t io_fin_us = AhoraUs();
+   AnotarApertura(io_fin_us - io_inicio_us, XSUCCEEDED(result), target_path);
++  // DLC packages are mounted with the root name "save" (profiles use "rmcsave"): show what the game opens in them.
++  if (target_path.rfind("save:", 0) == 0 || target_path.rfind("SAVE:", 0) == 0) {
++    REXKRNL_INFO("[dlc] el juego abre '{}' -> {:08X}", target_path, uint32_t(result));
++  }
+   QuizaResumenIo(io_fin_us);
+   object_ref<XFile> file = nullptr;
+ 
+diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 57fd161..0a817d6 100644
+--- a/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -39,6 +39,11 @@
+ #include <rex/thread/atomic.h>
+ #include <rex/thread/mutex.h>
+ 
++// Optional app hook (Carbon logs the process limits and heap there); unset elsewhere.
++#if defined(__SWITCH__)
++extern "C" void CarbonOnThreadCreateFailed() __attribute__((weak));
++#endif
++
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ using rex::runtime::current_ppc_context;
+@@ -147,6 +152,9 @@ u32 ExCreateThread_entry(mapped_u32 handle_ptr, u32 stack_size, mapped_u32 threa
+   if (XFAILED(result)) {
+     // Failed!
+     REXKRNL_ERROR("Thread creation failed: {:08X}", result);
++#if defined(__SWITCH__)
++    if (CarbonOnThreadCreateFailed) CarbonOnThreadCreateFailed();  // app hook (memory/limits log)
++#endif
+     return result;
+   }
+ 
+diff --git a/sdk/src/ui/switch_hotspot_policy.h b/sdk/src/ui/switch_hotspot_policy.h
+new file mode 100644
+index 0000000..6e2ade8
+--- /dev/null
++++ b/sdk/src/ui/switch_hotspot_policy.h
+@@ -0,0 +1,36 @@
++#pragma once
++
++#include <cstdint>
++#include <string_view>
++
++namespace rex::ui::switch_profile {
++
++enum class StackMode { kOff, kFull, kHotspots };
++
++constexpr StackMode SelectMode(bool full_flag, bool hotspot_flag) {
++  return hotspot_flag ? StackMode::kHotspots : full_flag ? StackMode::kFull : StackMode::kOff;
++}
++
++constexpr bool IsHotspotThread(std::string_view name) {
++  // Main XThread and Render XThread: the game's two frame threads (Carbon labels the render one from
++  // its frame handoff hook; its own name is an address that changes every run).
++  return name.starts_with("RWAudioCore Dac") || name.starts_with("GPU Commands") ||
++         name.starts_with("XMA Decoder") || name.starts_with("Main XThread") ||
++         name.starts_with("Render XThread") ||
++         name.starts_with("XThread");  // the game's other worker threads (AI, loading, cutscene video decode)
++}
++
++constexpr bool ShouldSample(StackMode mode, uint32_t handle, uint32_t target_handle) {
++  return handle && (mode == StackMode::kFull ||
++                    (mode == StackMode::kHotspots && target_handle == handle));
++}
++
++inline uint64_t SampleDelayNs(StackMode mode, uint32_t& sequence) {
++  if (mode == StackMode::kOff) return 100'000'000;
++  if (mode == StackMode::kFull) return 1'000'000;
++  // Vary the phase relative to the 187.5 Hz audio pump and periodic guest work.
++  sequence = sequence * 1664525u + 1013904223u;
++  return 8'000'000 + uint64_t(sequence >> 20) * 1000;
++}
++
++}  // namespace rex::ui::switch_profile
+diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
+index 6b3d30a..6da63aa 100644
+--- a/sdk/src/ui/switch_perf.cpp
++++ b/sdk/src/ui/switch_perf.cpp
+@@ -49,9 +49,12 @@
+ 
+ #include <switch.h>
+ 
++#include <rex/audio/xma/profile.h>
++
+ #include "rex/ui/switch_apm.h"
+ #include "rex/ui/switch_saltynx.h"
+ #include "rex/ui/switch_sysclk.h"
++#include "switch_hotspot_policy.h"
+ 
+ extern "C" {
+ void _start(void);
+@@ -84,7 +87,6 @@ void __real_svcSleepThread(s64 nano);
+ namespace {
+ 
+ constexpr size_t kMaxThreads = 160;
+-constexpr u64 kSampleIntervalNs = 1000000ULL;  // 1 ms
+ constexpr u64 kSegundoNs = 1000000000ULL;      // tick for the console overlays
+ 
+ /* internal resolution published to the overlays. The game sets it when choosing the video mode. */
+@@ -94,6 +96,15 @@ constexpr u64 kPassiveIntervalNs = 100000000ULL;  // 100 ms, without pausing thr
+ std::string StackFlagPath() {
+   return std::string(RexSwitchLogDir()) + "perfil_pilas.flag";
+ }
++std::string HotspotFlagPath() {
++  return std::string(RexSwitchLogDir()) + "perfil_hotspots.flag";
++}
++using namespace rex::ui::switch_profile;
++StackMode g_stack_mode = StackMode::kOff;
++struct CaptureStats {
++  u64 attempts = 0, paused = 0, captured = 0, resume_failed = 0;
++  u64 wall_ticks = 0, max_wall_ticks = 0;
++} g_capture_stats;
+ constexpr u64 kReportSeconds = 10;
+ /*
+  * Let the game start first. This only delays stack sampling and the first report, which read the
+@@ -103,7 +114,7 @@ constexpr u64 kReportSeconds = 10;
+ constexpr u64 kStartDelayNs = 8000000000ULL;
+ constexpr size_t kMaxSamples = 1 << 15;
+ constexpr size_t kFrames = 10;
+-constexpr unsigned kCounterCount = 33;
++constexpr unsigned kCounterCount = 42;
+ // In <NRO folder>/logs/rex/ (switch_crash_hooks.c computes it at startup).
+ std::string ReportPath() {
+   return std::string(RexSwitchLogDir()) + "rex_perfil.log";
+@@ -111,6 +122,7 @@ std::string ReportPath() {
+ 
+ struct Slot {
+   std::atomic<u32> handle{0};
++  std::atomic<u32> hotspot_handle{0};
+   char name[32]{};
+   // Only the profiler thread touches these:
+   u32 seen = 0;
+@@ -272,6 +284,7 @@ void Register(Handle h) {
+   for (auto& s : g_slots) {
+     u32 expected = 0;
+     if (s.handle.compare_exchange_strong(expected, h)) {
++      s.hotspot_handle.store(0, std::memory_order_relaxed);
+       s.name[0] = 0;
+       return;
+     }
+@@ -405,6 +418,17 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+                                               : "sin probar"),
+                 double(counters_now[20] - counters_last[20]) / seconds,
+                 double(counters_now[19] - counters_last[19]) / seconds);
++  if (g_stack_mode != StackMode::kOff) {
++    std::fprintf(f,
++                 "     stack capture %s: %llu attempts, %llu paused, %llu captured, "
++                 "%llu resume failures | attempt wall total/max %.3f/%.3f ms\n",
++                 g_stack_mode == StackMode::kHotspots ? "hotspots" : "full",
++                 g_capture_stats.attempts, g_capture_stats.paused, g_capture_stats.captured,
++                 g_capture_stats.resume_failed,
++                 double(g_capture_stats.wall_ticks) * 1000.0 / tick_freq,
++                 double(g_capture_stats.max_wall_ticks) * 1000.0 / tick_freq);
++    g_capture_stats = {};
++  }
+   // Work the game sends to the GPU, per presented frame. One screen is
+   // 1280x720 = 921,600 pixels.
+   const auto delta = [&](unsigned id) { return double(counters_now[id] - counters_last[id]); };
+@@ -421,6 +445,32 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+                rex::ui::switch_saltynx::ModoBase(appletGetOperationMode() == AppletOperationMode_Console)
+                    ? "sobremesa"
+                    : "portatil");
++  const u64 pump_late_us = g_counters[34].exchange(0, std::memory_order_relaxed);
++  const u64 worker_block_us = g_counters[36].exchange(0, std::memory_order_relaxed);
++  std::fprintf(f,
++               "     audio timing: pump deadline resets %.0f, max lateness %.3f ms | "
++               "worker blocks >5.333 ms %.0f, max worker block %.3f ms\n",
++               delta(33), double(pump_late_us) / 1000.0, delta(35), double(worker_block_us) / 1000.0);
++  static constexpr const char* xma_stage_names[] = {
++      "enable", "disable", "work.lock", "work.body(inclusive)", "codec", "convert"};
++  static_assert(std::size(xma_stage_names) == rex::audio::kXmaProfileStageCount);
++  for (size_t i = 0; i < rex::audio::kXmaProfileStageCount; ++i) {
++    const auto sample = rex::audio::g_xma_profile[i].Take();
++    if (!sample.calls && !sample.samples) continue;
++    std::fprintf(f,
++                 "     xma-profile %s: %.0f calls, %.0f samples | wall avg/max %.3f/%.3f ms | "
++                 "cpu avg/max %.3f/%.3f ms (%.0f valid CPU samples)\n",
++                 xma_stage_names[i], double(sample.calls), double(sample.samples),
++                 sample.samples ? double(sample.wall_ns) / sample.samples / 1e6 : 0.0,
++                 double(sample.wall_max_ns) / 1e6,
++                 sample.cpu_samples ? double(sample.cpu_ns) / sample.cpu_samples / 1e6 : 0.0,
++                 double(sample.cpu_max_ns) / 1e6, double(sample.cpu_samples));
++  }
++  const u64 ring_wait_us = g_counters[40].exchange(0, std::memory_order_relaxed);
++  std::fprintf(f,
++               "     carbon ring wait: attempts %.0f, progress observed %.0f, total %.3f ms, "
++               "max %.3f ms, unexpected errors %.0f\n",
++               delta(37), delta(38), delta(39) / 1'000'000.0, double(ring_wait_us) / 1000.0, delta(41));
+   // Reverse-NX state as is, without interpretation. A whole test session was wasted because its
+   // overlay said "Docked" while "Controlled by system" was Yes, and in that case its mode does not
+   // rule: it only mirrors the console's. This shows at a glance which of the two is happening.
+@@ -808,6 +858,13 @@ void ProfilerMain(void*) {
+     sample_stacks = true;
+     std::fclose(flag);
+   }
++  bool hotspot_flag = false;
++  if (FILE* flag = std::fopen(HotspotFlagPath().c_str(), "r")) {
++    hotspot_flag = true;
++    std::fclose(flag);
++  }
++  g_stack_mode = SelectMode(sample_stacks, hotspot_flag);
++  sample_stacks = g_stack_mode != StackMode::kOff;
+ 
+   u64 counters_last[kCounterCount]{};
+   for (unsigned i = 0; i < kCounterCount; ++i) {
+@@ -816,7 +873,10 @@ void ProfilerMain(void*) {
+   if (FILE* f = std::fopen(ReportPath().c_str(), "w")) {
+     std::fprintf(f, "imagen 0x%016" PRIx64 ", codigo hasta 0x%016" PRIx64 "\n\n", g_base,
+                  g_text_hi);
+-    std::fprintf(f, "Muestreo de pilas: %s\n", sample_stacks ? "activo (1 ms)" : "desactivado");
++    std::fprintf(f, "Muestreo de pilas: %s\n",
++                 g_stack_mode == StackMode::kHotspots
++                     ? "hotspots (~100 Hz total, RWAudioCore Dac/GPU Commands/XMA Decoder/Main+Render+other XThreads)"
++                     : sample_stacks ? "activo (1 ms)" : "desactivado");
+     std::fclose(f);
+   }
+ 
+@@ -830,24 +890,32 @@ void ProfilerMain(void*) {
+ 
+   size_t rr = 0;
+   size_t mode_index = 0;
++  uint32_t sample_sequence = 1;
+   while (true) {
+-    __real_svcSleepThread(sample_stacks ? kSampleIntervalNs : kPassiveIntervalNs);
++    __real_svcSleepThread(SampleDelayNs(g_stack_mode, sample_sequence));
+ 
+     for (size_t tries = 0; sample_stacks && tries < kMaxThreads; ++tries) {
+       const size_t idx = rr;
+       rr = (rr + 1) % kMaxThreads;
+       Slot& s = g_slots[idx];
+       const u32 h = s.handle.load();
+-      if (!h || !s.busy) {
++      if (!s.busy || !ShouldSample(g_stack_mode, h, s.hotspot_handle.load(std::memory_order_relaxed))) {
+         continue;
+       }
++      const u64 capture_start = armGetSystemTick();
++      ++g_capture_stats.attempts;
+       if (R_FAILED(svcSetThreadActivity(h, ThreadActivity_Paused))) {
++        const u64 capture_ticks = armGetSystemTick() - capture_start;
++        g_capture_stats.wall_ticks += capture_ticks;
++        g_capture_stats.max_wall_ticks = std::max(g_capture_stats.max_wall_ticks, capture_ticks);
+         break;
+       }
++      ++g_capture_stats.paused;
+       ThreadContext ctx;
+       const Result rc = svcGetThreadContext3(&ctx, h);
+       if (R_SUCCEEDED(rc) && g_sample_count < kMaxSamples) {
+         Sample& out = g_samples[g_sample_count++];
++        ++g_capture_stats.captured;
+         out = {};
+         out.pc = ctx.pc.x;
+         out.lr = ctx.lr;
+@@ -870,7 +938,12 @@ void ProfilerMain(void*) {
+           }
+         }
+       }
+-      svcSetThreadActivity(h, ThreadActivity_Runnable);
++      if (R_FAILED(svcSetThreadActivity(h, ThreadActivity_Runnable))) {
++        ++g_capture_stats.resume_failed;
++      }
++      const u64 capture_ticks = armGetSystemTick() - capture_start;
++      g_capture_stats.wall_ticks += capture_ticks;
++      g_capture_stats.max_wall_ticks = std::max(g_capture_stats.max_wall_ticks, capture_ticks);
+       break;
+     }
+ 
+@@ -1065,7 +1138,8 @@ void RexSwitchPerfAdd(unsigned id, u64 value) {
+   }
+ }
+ 
+-/* max counter (23 = audio mix peak in ten-thousandths; the report resets it to 0). */
++// 33 = pump deadline resets, 34 = max pump lateness us, 35 = worker block overruns,
++// 36 = max worker block wall time us. Maxima (including 23) reset at each report.
+ void RexSwitchPerfMax(unsigned id, u64 value) {
+   if (id >= kCounterCount) {
+     return;
+@@ -1092,6 +1166,7 @@ void RexSwitchPerfSetThreadName(u32 handle, const char* name) {
+       char tmp[sizeof(s.name)]{};
+       std::strncpy(tmp, name, sizeof(tmp) - 1);
+       std::memcpy(s.name, tmp, sizeof(tmp));
++      s.hotspot_handle.store(IsHotspotThread(tmp) ? handle : 0, std::memory_order_relaxed);
+       return;
+     }
+   }
+diff --git a/sdk/thirdparty/CMakeLists.txt b/sdk/thirdparty/CMakeLists.txt
+index aa3c58c..0438ebe 100644
+--- a/sdk/thirdparty/CMakeLists.txt
++++ b/sdk/thirdparty/CMakeLists.txt
+@@ -68,11 +68,11 @@ if(REXGLUE_BUILD_TESTS)
+ endif()
+ 
+ foreach(submodule ${REQUIRED_SUBMODULES})
+-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}/.git")
++    # fetch_thirdparty.py intentionally omits Git metadata from vendored sources.
++    if(NOT IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}")
+         message(FATAL_ERROR
+-            "Git submodule '${submodule}' is not initialized.\n"
+-            "Please run: git submodule update --init --recursive\n"
+-            "from the repository root directory."
++            "Dependency '${submodule}' is missing.\n"
++            "Run python tools/fetch_thirdparty.py from the reference repository."
+         )
+     endif()
+ endforeach()
+@@ -129,8 +129,8 @@ target_include_directories(aes128 PUBLIC
+ target_compile_options(aes128 PRIVATE -w)
+ 
+ # libmspack - LZX decompression (only lzxd.c needed for XEX decompression)
+-# Uses cabextract version which has all needed headers in one place
+-set(MSPACK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libmspack/cabextract/mspack")
++# cabextract/mspack contains symlinks, which become text placeholders on Windows.
++set(MSPACK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libmspack/libmspack/mspack")
+ add_library(mspack STATIC
+     ${MSPACK_DIR}/lzxd.c
+ )

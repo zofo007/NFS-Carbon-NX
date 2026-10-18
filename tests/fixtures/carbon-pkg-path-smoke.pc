@@ -1,0 +1,9 @@
+prefix=/opt/devkitpro
+libdir=${prefix}/portlibs/switch/lib
+includedir=${prefix}/portlibs/switch/include
+
+Name: Carbon package-path smoke
+Description: Temporary metadata to test portable Switch pkg-config paths
+Version: 1.0
+Libs: -L${libdir} -lcarbon_path_smoke
+Cflags: -I${includedir}

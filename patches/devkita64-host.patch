@@ -1,0 +1,12 @@
+diff --git a/config.guess b/config.guess
+--- a/config.guess
++++ b/config.guess
+@@ -926,7 +926,7 @@ case "$UNAME_MACHINE:$UNAME_SYSTEM:$UNAME_RELEASE:$UNAME_VERSION" in
+ 	GUESS=$UNAME_MACHINE-pc-cygwin
+ 	;;
+     *:MINGW64*:*)
+-	GUESS=$UNAME_MACHINE-pc-mingw64
++	GUESS=$UNAME_MACHINE-w64-mingw32
+ 	;;
+     *:MINGW*:*)
+ 	GUESS=$UNAME_MACHINE-pc-mingw32

@@ -1,0 +1,24 @@
+# nfscarbon.toml - NFS Carbon NX 0.1.0-beta.1
+# A missing line uses the default. Restart the game after editing. All options: docs/CONFIG.md
+gpu_plugin = "carbon"
+input_backend = "switch"
+input_xbox_layout = false
+mnk_mode = false
+mnk_mouse = false
+log_level = "info"
+carbon_gpu_vsync = true
+carbon_gpu_watchdog = true
+carbon_gpu_render_scale = 90
+carbon_gpu_max_anisotropy = 4
+
+# Audio: 32 frames (about 170 ms) queued before output.
+audio_switch_tramas_en_cola = 32
+carbon_handoff_priority = 58
+# Skips the car cube-reflection pass (its faces are never sampled).
+carbon_debug_skip_passes = 4
+
+# Quality / speed (defaults shown commented):
+# carbon_gpu_texture_lod_bias = 0.0
+# carbon_gpu_mip_nearest = false
+# carbon_gpu_bloom = true
+# carbon_gpu_stats = true      # false = no FPS lines in the log, slightly less CPU per draw

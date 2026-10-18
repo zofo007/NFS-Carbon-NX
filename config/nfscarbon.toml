@@ -1,0 +1,9 @@
+# Carbon's existing renderer; use "xenos" for comparison on the same executable.
+gpu_plugin = "carbon"
+input_backend = "switch"
+input_xbox_layout = false
+mnk_mode = false
+mnk_mouse = false
+log_level = "info"
+carbon_gpu_vsync = true
+carbon_gpu_watchdog = true

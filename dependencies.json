@@ -1,0 +1,31 @@
+{
+  "carbon": {"url": "https://github.com/Sampreeth004/nfs-carbon-recomp.git", "revision": "5bbebdfcbe9fe970692fe5b5c9da2cfc8f5388a0", "local_revision": "5d203704dc09ba87191cea7ac61f81cb1d0bf1b7"},
+  "switch_reference": {"url": "https://github.com/StevensND/nfsmw-nx.git", "revision": "be2d4c67ab42d6d629746a01dbf03cef824c8d2d", "local_revision": "dfda2ec31fa9a33ca15619abbc3b63a0776befc0"},
+  "rexglue_thirdparty": {"url": "https://github.com/rexglue/rexglue-sdk.git", "revision": "c94f5ebdcb3c9d1a460ca48e04f9758448f8d518"},
+  "rexglue_host_release": "0.10.0",
+  "cmake": "3.31.6",
+  "ninja": "1.11.1.4",
+  "mesa": {"url": "https://github.com/danfromtico/mesa-switch.git", "revision": "1a8c1a66d6fd8d65f10107c4627ffc3606ba5631", "local_revision": "78a3b4f67adbe80b9de72c8dcf90f8f63f330af9", "patch": "reference-nfsmw-nx/mesa/mesa-switch-nfsmw.patch"},
+  "host_build_tools": "Visual Studio Build Tools 2022 17.14.41",
+  "host_clang": "19.1.5",
+  "rust_toolchain": "1.90.0-x86_64-pc-windows-gnu",
+  "graphics_tool_versions": {"llvm": "23.1.3-1", "spirv_llvm_translator": "23.1.2-1", "meson": "1.12.1-1", "bindgen": "0.73.2-1", "cbindgen": "0.29.4-1"},
+  "rustup_installer": {"url": "https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-pc-windows-msvc/rustup-init.exe", "version": "1.28.2", "sha256": "88d8258dcf6ae4f7a80c7d1088e1f36fa7025a1cfd1343731b4ee6f385121fc0"},
+  "windows_sdk_component": "Microsoft.VisualStudio.Component.Windows11SDK.26100",
+  "msys2": {"version": "2026-09-27", "archive_sha256": "ea2f31a0b6ade63914ce441ffb022f0f6aa96982bfefa2326460a26d5fb01322"},
+  "libnx": {"url": "https://github.com/switchbrew/libnx.git", "revision": "7644c9b26099aa2d2145bc72a21ee24190e92085", "version": "4.12.0"},
+  "devkita64_buildscripts": {"url": "https://github.com/devkitPro/buildscripts.git", "revision": "6af2efa45ab83f39416bc24d5c889c75a3ad6c03", "local_revision": "c02a37caf616f6184dfe1ea2725e664e450b09b1", "version": "r29.1"},
+  "devkita64_rules": {"url": "https://github.com/devkitPro/devkita64-rules.git", "revision": "b037940200a5a9a87888743fb83d7a87e348c8e7", "version": "1.1.1"},
+  "general_tools": {"url": "https://github.com/devkitPro/general-tools.git", "revision": "46086605cdc63fb02ba0ed08cdc00801ba00c6f0", "version": "1.4.4"},
+  "switch_tools": {"url": "https://github.com/switchbrew/switch-tools.git", "revision": "22756068dd0ed6ff9734c59cb4f99ebd3f62555b", "version": "1.13.1"},
+  "switch_portlibs": [
+    {"name": "expat", "version": "2.9.0", "url": "https://github.com/libexpat/libexpat/releases/download/R_2_9_0/expat-2.9.0.tar.xz", "sha256": "1e6371862cc31999b368c3b89b49994f0677e1bab5f1b2b85ae3741f5d803051", "checksum_source": "https://github.com/msys2/MINGW-packages/blob/master/mingw-w64-expat/PKGBUILD"},
+    {"name": "zlib", "version": "1.3.2", "url": "https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.xz", "sha256": "d7a0654783a4da529d1bb793b7ad9c3318020af77667bcae35f95d0e42a792f3", "checksum_source": "https://github.com/msys2/MINGW-packages/blob/master/mingw-w64-zlib/PKGBUILD"},
+    {"name": "zstd", "version": "1.5.7", "url": "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz", "sha256": "eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3", "checksum_source": "https://github.com/devkitPro/pacman-packages/blob/f103fe88e37180ecd0b7a9173b52b7580a54f71a/switch/libzstd/PKGBUILD"}
+  ],
+  "devkita64_sources": [
+    {"url": "https://ftp.gnu.org/gnu/binutils/binutils-2.45.1.tar.xz", "algorithm": "SHA512", "hash": "ea030419eba387579ab717be7e3223fc99e93b586860b06003c12489f93441640d4082736f76aa5e98233db4f46e232f536a45e471486de1f5b64e1b827c167e", "checksum_source": "https://sourceware.org/pub/binutils/releases/sha512.sum"},
+    {"url": "https://gcc.gnu.org/pub/gcc/releases/gcc-15.2.0/gcc-15.2.0.tar.xz", "algorithm": "SHA512", "hash": "89047a2e07bd9da265b507b516ed3635adb17491c7f4f67cf090f0bd5b3fc7f2ee6e4cc4008beef7ca884b6b71dffe2bb652b21f01a702e17b468cca2d10b2de", "checksum_source": "https://gcc.gnu.org/pub/gcc/releases/gcc-15.2.0/sha512.sum"},
+    {"url": "https://sourceware.org/pub/newlib/newlib-4.6.0.20260123.tar.gz", "algorithm": "SHA256", "hash": "6ff27e3bf022666f43f7802255be680eeff722ac181b1725d21e2e8318604ee3", "checksum_source": "https://github.com/devkitPro/pacman-packages/blob/f103fe88e37180ecd0b7a9173b52b7580a54f71a/devkita64/newlib/PKGBUILD"}
+  ]
+}
