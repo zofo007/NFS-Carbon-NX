@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-beta.5
+
+First release with a downloadable NRO.
+
+- README thanks Sampreeth004 explicitly for the Carbon recompilation this port is built on.
+
 ## 0.1.0-beta.4
 
 - Ko-fi support button in the README.

@@ -185,7 +185,8 @@ This is a free-time project. Testing on real hardware takes many hours, and the 
 - **[zofo007](https://github.com/zofo007)**: made and maintains this port (Switch runtime, hooks, testing, releases).
 - **Electronic Arts / EA Black Box**: Need for Speed: Carbon. This is an unofficial fan project.
 - **[Sampreeth004](https://github.com/Sampreeth004/nfs-carbon-recomp)**: the Carbon recompilation and the native
-  Vulkan renderer this project is built on.
+  Vulkan renderer this project is built on. Without this work the Switch port would not exist; it is the foundation
+  of everything here. Thank you.
 - **[StevensND](https://github.com/StevensND/nfsmw-nx)**: the Most Wanted Switch port. Its Horizon layer of the SDK is
   used here, and many ideas (audio packet wait, frame hand-off, FFmpeg cutscenes, overlays, memory handling) were
   studied from it. No Most Wanted assets, addresses or game code are used.
