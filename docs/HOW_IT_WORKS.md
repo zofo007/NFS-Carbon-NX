@@ -81,7 +81,7 @@ alone.
 
 ## 7. What limits it
 
-Three cores, a CPU at 1224 MHz in our tests, and a game written for a console with three dual-threaded cores and a
+Three cores, a CPU at 1428 MHz in our tests, and a game written for a console with three dual-threaded cores and a
 much faster memory path. Most of the remaining time is spread over many small pieces (no function above about 3% of a
 thread), which is why we recommend a CPU overclock for the heaviest scenes and publish the measurements in the README.
 `scripts/summarize_run.py` turns a log folder into the numbers quoted there.

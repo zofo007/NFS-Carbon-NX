@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.0-beta.3
+
+- Docs use CPU 1428 / GPU 768 / RAM 1600 MHz as the reference clocks, with results from two measured sessions.
+- Support section (Ko-fi) and funding button.
+- Release scripts: version comes from this file, only numbered headings, `-beta` suffix required.
+- The log's first line shows the version and author; a startup log line moved out of the DLC code.
+- Swapchain-timeout error is logged at most every 30th time.
+
 ## 0.1.0-beta.2
 
 - Presenter waits at most 2 s for a swapchain image, then recreates it (picture-freeze mitigation, unconfirmed).

@@ -18,8 +18,8 @@ by a native Vulkan renderer running on NVK (Mesa). It runs the **Xbox 360 releas
 Xbox version. You need your own copy of the Xbox 360 game.
 
 > [!WARNING]
-> **Beta, and it needs an overclock.** It boots, plays and saves. At stock clocks the heavy scenes (race start, dense
-> city) drop to the low 20s and the audio stutters. With the CPU at about 1785 MHz and memory at 1600 MHz it plays well.
+> **Beta, and it needs an overclock.** It boots, plays and saves. At stock handheld clocks it is too slow and the audio
+> stutters. At the reference overclock (CPU 1428 MHz, GPU 768 MHz, memory 1600 MHz) it plays at about 30 FPS or better.
 > Read [Overclocking](#overclocking) and [Known issues](#known-issues) first.
 
 ## Status
@@ -27,25 +27,26 @@ Xbox version. You need your own copy of the Xbox 360 game.
 | Area | State |
 |---|---|
 | Boot, menus, career, saves | Work (saves persist across launches) |
-| Races | Playable. Measured session at CPU 1428 / GPU 768 / RAM 1600 MHz: median 38 FPS, 93% of the time at 30 FPS or more ([details](docs/PERFORMANCE.md)). Dense areas fall to the low 20s |
+| Races | Playable. Two measured sessions at CPU 1428 / GPU 768 / RAM 1600 MHz: median 32 and 38 FPS, 53% and 93% of the time at 30 FPS or more ([details](docs/PERFORMANCE.md)). The densest scenes fall to the low 20s |
 | Cutscenes | Work, decoded with FFmpeg and checked against the game's own decoder at the start of each movie |
-| Audio | Almost clean with the overclock. At 1224 MHz it stutters in heavy scenes. Not perfect: see Known issues |
+| Audio | Almost clean at the reference clocks. Not perfect: see Known issues |
 | DLC packages | **Can be loaded**: put the packages in `dlc/` and the game reads them (see DLC) |
 | Achievements | Not confirmed to work |
 | Other editions / regions | Not supported. Only one edition has been tested (see below) |
 
-The numbers above were measured at CPU 1224 MHz, GPU 768 MHz, memory 1331 MHz. That is already above stock handheld
-clocks (CPU 1020 MHz, GPU 460 MHz). See the next section for what higher clocks do.
+The numbers above were measured at CPU 1428 MHz, GPU 768 MHz, memory 1600 MHz. Stock handheld clocks are CPU 1020 MHz
+and GPU 460 MHz. See the next section.
 
 ## Overclocking
 
 The game's code runs on three Switch cores and the CPU is the limit, so this port **is meant to be used with a CPU
-overclock**. In the maintainer's tests, with the CPU at 1428 to 1785 MHz, GPU 768 MHz and memory at 1600 MHz:
+overclock**. The reference settings are CPU 1428 MHz, GPU 768 MHz and memory 1600 MHz. In the maintainer's tests with them:
 
 - one measured session at 1428 MHz (scene resolution 90%) ran at a median of 38 FPS with 93% of the time at 30 FPS
   or more, and audio drop-outs were rare ([docs/PERFORMANCE.md](docs/PERFORMANCE.md));
-- places that run in the low 20s at 1224 MHz reach about 30 FPS at higher clocks, and open roads run 40-50 FPS;
-- at 1785 MHz the audio drop-outs almost disappear even at the race start.
+- a longer 22-minute session ran at a median of 32 FPS, with 53% of the time at 30 FPS or more and 2% under 25;
+- open roads run 40-50 FPS, the densest city scenes about 20-30;
+- audio drop-outs are rare, though they can still happen at the race start.
 
 Use a clock manager of your choice (for example Horizon OC or sys-clk) and set the profile for the game you launch it
 from. Overclocking is at your own risk: it can make the console unstable, hot, or corrupt data. Back up your SD card
@@ -116,13 +117,13 @@ game, so the list of working packs can grow.
 
 ## Known issues
 
-- **At 1224 MHz or lower**, audio drop-outs in the heaviest moments (race countdown, close packs of cars, the dense
-  neon city): the game's software mixer needs more CPU than three cores give there. A higher CPU clock fixes most of it.
-- **Audio is not perfect.** With the overclock it is almost clean, but rare short drop-outs can still happen in the
+- **Below the reference clocks**, audio drop-outs and low frame rates are likely: the game's software mixer needs more
+  CPU than three slow cores give.
+- **Audio is not perfect.** At the reference clocks it is almost clean, but rare short drop-outs can still happen in the
   worst moments (the race countdown, close packs of cars). The game ties its sound updates to the frame rate, so when
   the frame rate dips the sound can stutter with it. Menus are normally fine.
-- **Frame rate** falls to about 18-25 FPS in those same places at 1224 MHz (about 4000 draws per frame). Open roads
-  run much better, and so does everything with the overclock above.
+- **Frame rate** falls to about 20-25 FPS in the densest scenes (about 4000 draws per frame), with single windows lower.
+  Open roads run much better.
 - **Black flashes** of the car shadows for a frame, now and then. Cause unknown.
 - **Achievements** are not confirmed. The SDK handles the unlock call, but no unlock has been seen in the logs.
 - A forwarder needs the 39-bit address space option (see Install). Without it the game aborts while creating threads.
@@ -172,6 +173,10 @@ The logs contain your save profile names and SD paths; remove what you do not wa
 You build it yourself from your own `default.xex`; the translated game code is never distributed.
 [docs/BUILD.md](docs/BUILD.md) has the full procedure. Dependencies are pinned in `dependencies.json`; changes to the
 upstream source trees are kept as patches in `patches/`. The verified host is Windows with PowerShell.
+
+## Support
+
+This is a free-time project. Testing on real hardware takes many hours, and the AI assistants used for development are not free. If you like the work, you can kindly leave a tip on [Ko-fi](https://ko-fi.com/ojojoj). It is never required, and the port stays free.
 
 ## Credits
 

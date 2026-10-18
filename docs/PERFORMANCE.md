@@ -48,19 +48,23 @@ The renderer reports the number of draws per frame. More draws means a busier sc
   crowded. The two windows with more than 2500 draws are the only ones under the 30 FPS mark by a wide margin.
 - **Audio was almost clean.** The mixer delivered at least 1800 of the 1875 packets it owes per 10 seconds in 32 of 33
   windows, and the drop-outs that did occur
-  were small (at most 55 data-less requests in 10 seconds, against 400-750 in the worst windows at 1224 MHz).
+  were small (at most 55 data-less requests in 10 seconds).
 - **This session had few extreme moments.** The dense city centre and the race countdown stress the console far more
-  than most of what is measured here. Earlier sessions at 1224 MHz saw about 4000 draws per frame there and 18-25 FPS.
+  than most of what is measured here. The second session below reached about 4000 draws per frame there.
 
-## Compared with lower clocks
+## A longer session
 
-Measured earlier on the same console and scenes (different sessions, so only the trend counts):
+Same clocks (1428 / 768 / 1600 MHz), 22.5 minutes of racing and city driving, 261 in-game windows:
 
-| CPU clock | Heavy scenes |
+| Measure | Value |
 |---|---|
-| 1224 MHz | 18-25 FPS, audio drop-outs of 100-750 data-less requests per 10 s |
-| 1428 MHz | 21-28 FPS in the two heaviest windows of the session above, about 31 FPS with 1500-2500 draws, drop-outs rare |
-| 1785 MHz (earlier session) | about 30 FPS in the heaviest places, drop-outs almost gone |
+| FPS | median 31.9, 10th percentile 29.6, 90th 45.4, lowest 13.8, highest 48.5 |
+| Windows at or above 30 FPS | 53% |
+| Windows below 25 FPS | 2% |
+| Draws per frame | median 1782, 90th percentile 3293, highest 4206 |
+| GPU time per frame | median 30.2 ms |
+
+This session spent much more time in busy city scenes, which is why its median is lower than the first one.
 
 ## Caveats
 
