@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.0-beta.4
+
+- Ko-fi support button in the README.
+- The banner shows the release version, stamped automatically when a release is built.
+
 ## 0.1.0-beta.3
 
 - Docs use CPU 1428 / GPU 768 / RAM 1600 MHz as the reference clocks, with results from two measured sessions.

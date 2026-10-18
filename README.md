@@ -2,7 +2,7 @@
 
 <img src="docs/banner.svg" alt="NFS Carbon NX" width="70%">
 
-![status](https://img.shields.io/badge/status-beta-orange) ![platform](https://img.shields.io/badge/platform-Nintendo%20Switch%20(ARM64)-lightgrey) ![license](https://img.shields.io/badge/license-GPL--3.0-blue)
+![status](https://img.shields.io/badge/status-beta-orange) ![platform](https://img.shields.io/badge/platform-Nintendo%20Switch%20(ARM64)-lightgrey) ![license](https://img.shields.io/badge/license-GPL--3.0-blue) [![Support me on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20me-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/ojojoj)
 
 [Status](#status) · [Install](#install) · [Overclocking](#overclocking) · [Known issues](#known-issues) · [Send logs](#help-improve-it-send-your-logs) · [Docs](#documentation) · [Credits](#credits)
 
@@ -177,6 +177,8 @@ upstream source trees are kept as patches in `patches/`. The verified host is Wi
 ## Support
 
 This is a free-time project. Testing on real hardware takes many hours, and the AI assistants used for development are not free. If you like the work, you can kindly leave a tip on [Ko-fi](https://ko-fi.com/ojojoj). It is never required, and the port stays free.
+
+[![Support me on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20me-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/ojojoj)
 
 ## Credits
 
