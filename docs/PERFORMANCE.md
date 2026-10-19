@@ -9,7 +9,7 @@ how we read the numbers. Other consoles, scenes and clocks will differ, which is
 |---|---|
 | Mode | Handheld (1280x720 display) |
 | CPU / GPU / memory | 1428 / 768 / 1600 MHz |
-| Scene resolution | 90% of 1280x720 (1152x648) |
+| Scene resolution | 90% of 1280x720 (1152x648), plain bilinear scaling. The shipped default is now 80% with FSR; not measured at these clocks yet |
 | Anisotropic filtering | 4x |
 | Launch | Title override, host game memory budget 3189 MB |
 | Session | 5.7 minutes of in-game windows: menus, a race, four cutscenes, DLC packages installed |
@@ -51,6 +51,19 @@ The renderer reports the number of draws per frame. More draws means a busier sc
   were small (at most 55 data-less requests in 10 seconds).
 - **This session had few extreme moments.** The dense city centre and the race countdown stress the console far more
   than most of what is measured here. The second session below reached about 4000 draws per frame there.
+
+## Beta.7 defaults, 15 minutes
+
+Reference clocks (1428 / 768 / 1600 MHz), the shipped settings of 0.1.0-beta.7 (scene at 80% upscaled with FSR, quiet log, rumble on), 88 in-game windows of 10 seconds from the game's own profiler:
+
+| Measure | Value |
+|---|---|
+| FPS | median 40.8, 10th percentile 31.6, 90th 46.1, lowest 21.3, highest 53.2 |
+| Windows at or above 30 FPS | 95% (84 of 88) |
+| Windows below 25 FPS | 2 |
+| Audio requests without data per 10 s | 0 in the median window; 7 windows around a race start had 24 to 482 (worst 482) |
+
+This is a different scene mix from the two sessions above, so it is not a controlled comparison with 90% plain scaling; it shows that the new defaults keep the frame rate high. The audio drop-outs sit in the race start, where the process CPU was at 280-290% of 300%.
 
 ## A longer session
 

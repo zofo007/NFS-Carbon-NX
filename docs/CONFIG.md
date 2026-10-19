@@ -10,9 +10,12 @@ editing. The release file ships the values below under "Shipped"; everything els
 | `gpu_plugin` | `"carbon"` | The native Vulkan renderer (the other value, `"xenos"`, is the SDK's slower emulation) |
 | `input_backend` | `"switch"` | Controllers through libnx |
 | `input_xbox_layout` | `false` | `true` swaps A/B and X/Y by position, as on an Xbox pad |
-| `log_level` | `"info"` | `"warn"` writes much less to the SD card |
+| `log_level` | `"warn"` | Quiet: only warnings and errors. `"info"` logs everything (use `nfscarbon.report.toml` for a report) |
 | `carbon_gpu_vsync` | `true` | |
-| `carbon_gpu_render_scale` | see file | Percent of 1280x720 the scene is drawn at (100 = native) |
+| `carbon_gpu_render_scale` | `80` | Percent of 1280x720 the scene is drawn at (100 = native) |
+| `present_effect` | `"fsr"` | How the scene is scaled to the screen: `"fsr"` (AMD FSR upscale plus sharpening), `"cas"` (sharpen only), `"bilinear"` (plain stretch) |
+| `input_vibracion` | `true` | Controller rumble. `false` turns it off |
+| `carbon_gpu_stats`, `carbon_audio_mixer_diag`, `audio_xma_profile` | `false` | Statistics and diagnostics, off for speed; on in `nfscarbon.report.toml` |
 | `carbon_gpu_max_anisotropy` | `4` | 1 = off, up to 16 |
 | `audio_switch_tramas_en_cola` | `32` | Audio frames queued before output (about 170 ms of cushion) |
 | `carbon_handoff_priority` | `58` | Horizon priority of the two frame hand-off threads |
@@ -22,7 +25,9 @@ editing. The release file ships the values below under "Shipped"; everything els
 
 | Setting | Default | Effect |
 |---|---|---|
-| `carbon_gpu_render_scale` | 100 | Lower = faster, softer image |
+| `carbon_gpu_render_scale` | 100 | Lower = faster, softer image (the shipped file uses 80 with FSR) |
+| `carbon_gpu_texture_budget_mb` | 704 on Switch | Texture memory above which the least recently used textures are freed. Without a cap the cache grew until memory ran out in long sessions |
+| `thread_host_stack_mib` | 8 | Host stack per game thread. Smaller leaves more memory free for new threads |
 | `carbon_gpu_max_anisotropy` | 4 on Switch | 1 = off |
 | `carbon_gpu_texture_lod_bias` | 0.0 | 0 to 2. +1 uses one mip level lower on scene textures: blurrier, less memory traffic |
 | `carbon_gpu_mip_nearest` | false | Bilinear instead of trilinear mip filtering (visible mip steps) |
@@ -49,8 +54,8 @@ editing. The release file ships the values below under "Shipped"; everything els
 
 | Setting | Default | Effect |
 |---|---|---|
-| `carbon_gpu_stats` | true | Statistics lines in the log (FPS, draws, GPU time). `false` also skips two clock reads per draw |
-| `carbon_audio_mixer_diag` | true | `[mixer-diag]` timing of the audio mixer every 10 s |
+| `carbon_gpu_stats` | true (shipped false) | Statistics lines in the log (FPS, draws, GPU time). The short summary is printed every 5 s, the detailed one once a minute. `false` also skips two clock reads per draw |
+| `carbon_audio_mixer_diag` | true (shipped false) | `[mixer-diag]` timing of the audio mixer every 10 s, plus a memory and thread line |
 | `carbon_video_wmv3_shadow` | false | The game decodes every cutscene frame and FFmpeg only compares |
 | `switch_log_console_shortcut` | false | L+R+Down log console. Off because opening it froze the console |
 

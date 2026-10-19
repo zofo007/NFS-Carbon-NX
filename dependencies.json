@@ -1,6 +1,6 @@
 {
-  "carbon": {"url": "https://github.com/Sampreeth004/nfs-carbon-recomp.git", "revision": "5bbebdfcbe9fe970692fe5b5c9da2cfc8f5388a0", "local_revision": "5d203704dc09ba87191cea7ac61f81cb1d0bf1b7"},
-  "switch_reference": {"url": "https://github.com/StevensND/nfsmw-nx.git", "revision": "be2d4c67ab42d6d629746a01dbf03cef824c8d2d", "local_revision": "dfda2ec31fa9a33ca15619abbc3b63a0776befc0"},
+  "carbon": {"url": "https://github.com/Sampreeth004/nfs-carbon-recomp.git", "revision": "5bbebdfcbe9fe970692fe5b5c9da2cfc8f5388a0", "local_revision": "1f2449b564eb8f8eca9a14677438f030cbb40332"},
+  "switch_reference": {"url": "https://github.com/StevensND/nfsmw-nx.git", "revision": "be2d4c67ab42d6d629746a01dbf03cef824c8d2d", "local_revision": "3bc8416d0de066188b3828027836041cc022dd1a"},
   "rexglue_thirdparty": {"url": "https://github.com/rexglue/rexglue-sdk.git", "revision": "c94f5ebdcb3c9d1a460ca48e04f9758448f8d518"},
   "rexglue_host_release": "0.10.0",
   "cmake": "3.31.6",

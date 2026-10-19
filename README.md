@@ -27,9 +27,11 @@ Xbox version. You need your own copy of the Xbox 360 game.
 | Area | State |
 |---|---|
 | Boot, menus, career, saves | Work (saves persist across launches) |
-| Races | Playable. Two measured sessions at CPU 1428 / GPU 768 / RAM 1600 MHz: median 32 and 38 FPS, 53% and 93% of the time at 30 FPS or more ([details](docs/PERFORMANCE.md)). The densest scenes fall to the low 20s |
+| Races | Playable. Two measured sessions at CPU 1428 / GPU 768 / RAM 1600 MHz (scene at 90%, plain scaling): median 32 and 38 FPS, 53% and 93% of the time at 30 FPS or more ([details](docs/PERFORMANCE.md)). The densest scenes fall to the low 20s. With the new default (80% with FSR upscaling, quiet log) a 15-minute session at the same clocks ran at a median of 40.8 FPS, 95% of the time at 30 FPS or more (different scenes, so not a strict comparison) |
 | Cutscenes | Work, decoded with FFmpeg and checked against the game's own decoder at the start of each movie |
 | Audio | Almost clean at the reference clocks. Not perfect: see Known issues |
+| Controller rumble | On by default (`input_vibracion`) |
+| Long sessions | Fixed in 0.1.0-beta.7: texture memory is now capped, so a 90-minute session no longer runs out of memory |
 | DLC packages | **Can be loaded**: put the packages in `dlc/` and the game reads them (see DLC) |
 | Achievements | Not confirmed to work |
 | Other editions / regions | Not supported. Only one edition has been tested (see below) |
@@ -42,11 +44,13 @@ and GPU 460 MHz. See the next section.
 The game's code runs on three Switch cores and the CPU is the limit, so this port **is meant to be used with a CPU
 overclock**. The reference settings are CPU 1428 MHz, GPU 768 MHz and memory 1600 MHz. In the maintainer's tests with them:
 
-- one measured session at 1428 MHz (scene resolution 90%) ran at a median of 38 FPS with 93% of the time at 30 FPS
+- one measured session at 1428 MHz (scene resolution 90%, plain scaling) ran at a median of 38 FPS with 93% of the time at 30 FPS
   or more, and audio drop-outs were rare ([docs/PERFORMANCE.md](docs/PERFORMANCE.md));
 - a longer 22-minute session ran at a median of 32 FPS, with 53% of the time at 30 FPS or more and 2% under 25;
 - open roads run 40-50 FPS, the densest city scenes about 20-30;
-- audio drop-outs are rare, though they can still happen at the race start.
+- with the beta.7 defaults (80% with FSR) a 15-minute session ran at a median of 40.8 FPS, 84 of 88 windows at 30 FPS
+  or more, lowest 21.3 ([docs/PERFORMANCE.md](docs/PERFORMANCE.md));
+- audio drop-outs are rare, but they still happen around the start of a race (see Known issues).
 
 Use a clock manager of your choice (for example Horizon OC or sys-clk) and set the profile for the game you launch it
 from. Overclocking is at your own risk: it can make the console unstable, hot, or corrupt data. Back up your SD card
@@ -69,7 +73,8 @@ Extract the zip so that the SD card looks like this:
 ```text
 sdmc:/switch/nfscarbon/
   nfscarbon.nro
-  nfscarbon.toml
+  nfscarbon.toml          (quiet default settings)
+  nfscarbon.report.toml   (full logging, for performance reports)
   game-data/
     default.xex
     NFS/
@@ -93,6 +98,7 @@ races can stutter for a few seconds. Do not delete `user/cache`.
 
 Each Switch button acts as the Xbox 360 button with the same letter. `+` is Start, `-` is Back, ZL/ZR are the
 triggers, L/R the bumpers. Set `input_xbox_layout = true` in `nfscarbon.toml` to swap the face buttons by position.
+Controller rumble is on; set `input_vibracion = false` to turn it off.
 
 Shortcuts (hold **L + R** and press):
 
@@ -105,8 +111,12 @@ Shortcuts (hold **L + R** and press):
 ## Settings
 
 `nfscarbon.toml` next to the NRO holds the settings. The ones that matter are described in
-[docs/CONFIG.md](docs/CONFIG.md), including the quality switches (texture detail, anisotropic filtering, bloom).
-Every setting has a default; the file only lists what differs.
+[docs/CONFIG.md](docs/CONFIG.md), including the quality switches (render scale, upscaling filter, texture detail,
+anisotropic filtering, bloom). Every setting has a default; the file only lists what differs.
+
+The shipped file is **quiet**: it logs warnings only and the statistics are off, because logging costs frame rate
+(most at the race start). The scene is drawn at 80% and upscaled with FSR; set `present_effect = "bilinear"` and
+`carbon_gpu_render_scale = 90` for the older plain scaling.
 
 ## DLC
 
@@ -115,23 +125,62 @@ extracted into the content folder and the game finds them through its normal con
 `[dlc] N package(s) installed`. DLC can be loaded this way; tell us which packs you tried and what showed up in the
 game, so the list of working packs can grow.
 
+**DLC may have a limit that is not verified yet.** One run with many packs (36 extracted DLC folders, some of them
+leftovers of packages that had been removed or installed twice) crashed while loading the profiles. After the extracted
+folders were deleted and re-created from the same `dlc/` files, the game loaded again. We do not know yet whether the
+cause is the number of packs or the stale leftovers, so treat large DLC sets as untested.
+
+Packages verified working on the Switch port. All 11 were installed together and a 57-minute career session ran on
+them (boss races, cutscenes, saves) without a DLC-related crash. "Token" is the file the game opens inside the pack,
+seen in the log:
+
+| Package (folder name in `dlc/`) | Token the game opened | Status |
+|---|---|---|
+| Dump Truck (Addon) | `Dump Truck.txt` | Verified working |
+| Fire Truck (Addon) | `Fire Truck.txt` | Verified working |
+| 1971 Dodge Challenger | `1971 Dodge Challenger.txt` | Verified working |
+| 1987 Toyota Corolla GTS AE86 | `1987 Toyota Corolla GTS AE86.txt` | Verified working |
+| 2006 Pagani Zonda | `zonda.txt` | Verified working |
+| 2006 Porsche 911 Turbo | `2006 Porsche 911 Turbo.txt` | Verified working |
+| Autosculpt Tuner Body Kit Bundle | `AS_Tuner_Body.txt` | Verified working |
+| Exotic Car Kit Bundle | `Integrated_Kit_Exotic.txt` | Verified working |
+| Ultimate Performance Bundle | `Uber_Performance_T1.txt`, `T2`, `T3` | Verified working |
+| Exotic Base Car Bundle | `snips.txt`, `william.txt` (shared with the next row) | Verified working |
+| Need for Speed Carbon CE Bundle | `snips.txt`, `william.txt` (shared with the previous row) | Verified working |
+
+Verified means the pack loaded and the game ran; it does not mean every item inside the pack was checked in the game.
+Other packs (muscle and tuner kits, parts, vinyls, more cars) are untested: a run with a much larger set crashed while
+the profiles loaded. Add packs a few at a time and tell us what happens.
+
+**If the game crashes while loading the profile after you changed your DLC** (the log ends right after a line like
+`[dlc] el juego abre 'save:\...'`, and `rex_crash.log` reports a call to an invalid guest address):
+
+1. Back up `sdmc:/switch/nfscarbon/user/` first.
+2. Delete everything inside these two folders (only the extracted DLC, never the other folders in `user/`, those hold
+   your profile and saves):
+   - `sdmc:/switch/nfscarbon/user/0000000000000000/454107EC/00000002/`
+   - `sdmc:/switch/nfscarbon/user/0000000000000000/454107EC/Headers/00000002/`
+3. Start the game. The packages in `dlc/` are extracted again at launch. If it still crashes, move most packages out of
+   `dlc/` and add them back a few at a time.
+
 ## Known issues
 
 - **Below the reference clocks**, audio drop-outs and low frame rates are likely: the game's software mixer needs more
   CPU than three slow cores give.
-- **Audio is not perfect.** At the reference clocks it is almost clean, but rare short drop-outs can still happen in the
-  worst moments (the race countdown, close packs of cars). The game ties its sound updates to the frame rate, so when
+- **Audio is not perfect.** At the reference clocks it is clean most of the time, but the race start still stutters: in the
+  latest 15-minute session 7 windows of 10 seconds around a race start had audio requests without data (up to 482
+  per 10 s in the worst one, 0 in the median window) while the CPU was saturated. Close packs of cars can do it too. The game ties its sound updates to the frame rate, so when
   the frame rate dips the sound can stutter with it. Menus are normally fine.
 - **Frame rate** falls to about 20-25 FPS in the densest scenes (about 4000 draws per frame), with single windows lower.
   Open roads run much better.
 - **Black flashes** of the car shadows for a frame, now and then. Cause unknown.
 - **Achievements** are not confirmed. The SDK handles the unlock call, but no unlock has been seen in the logs.
 - A forwarder needs the 39-bit address space option (see Install). Without it the game aborts while creating threads.
-- Only one edition is tested. Cutscenes that need memory can still fail on a title-override host with a small
-  memory budget (the game then waits for a thread that was never created and appears frozen).
+- Only one edition is tested. A title-override host with a small memory budget can still make a cutscene fail (the
+  game then waits for a thread that was never created and appears frozen); pick a host that leaves about 3.2 GB.
 
 More detail in [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) and the measurements in
-[docs/HW_RETEST_RESULTS.md](docs/HW_RETEST_RESULTS.md).
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ## How it works
 
@@ -141,6 +190,7 @@ More detail in [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) and the measurements
 - **Native renderer.** The game's GPU command stream is read and drawn with Vulkan (`renderer/`), with its own shader
   translation (Xenos microcode to GLSL to SPIR-V) cached on disk.
 - **Driver.** Vulkan comes from NVK, via [mesa-switch](https://github.com/danfromtico/mesa-switch).
+- **Upscaling.** The scene is drawn at 80% of 1280x720 and scaled up with FSR (or CAS or bilinear, your choice).
 - **Hand-written fast paths** where profiling showed the recompiled code is slow: audio mixer helpers (some with
   NEON), the cutscene decoder (FFmpeg WMV3, verified against the game's own output), texture untiling, vertex
   and constant uploads. Each one has an off-switch in `nfscarbon.toml`.
@@ -151,6 +201,8 @@ Where it runs well and where it does not depends on the console, the clocks and 
 something. Higher frame rates (60 FPS is the long-term wish, but it is far away) will come from finding what
 limits real setups. If you play it, please send a report in the same shape every time:
 
+0. The default `nfscarbon.toml` is quiet (it logs warnings only) because statistics cost frame rate. For a report,
+   copy `nfscarbon.report.toml` over `nfscarbon.toml` for one session, then put your normal file back.
 1. Play for at least one race and note the clocks you used.
 2. Copy `sdmc:/switch/nfscarbon/logs/` to your PC.
 3. Run `powershell -File scripts/pack-logs.ps1 -Logs <that folder>`. It writes a zip and prints the summary

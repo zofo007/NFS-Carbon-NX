@@ -498,6 +498,46 @@ index d604044..2531785 100644
  /* --- timegm ----------------------------------------------------------------
   *
   * newlib has mktime, which interprets struct tm in the local time zone, but not
+diff --git a/sdk/src/core/threading_posix.cpp b/sdk/src/core/threading_posix.cpp
+index 5d26022..bab20fb 100644
+--- a/sdk/src/core/threading_posix.cpp
++++ b/sdk/src/core/threading_posix.cpp
+@@ -744,6 +744,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+   /// Thread::GetCurrentThread() on the main thread
+   explicit PosixCondition(pthread_t thread)
+       : thread_(thread),
++        joined_(true),  // adopted thread (main): never ours to detach
+         signaled_(false),
+         exit_code_(0),
+         state_(State::kRunning),
+@@ -762,6 +763,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     // Match Canary/Edge behavior.
+     // Force-cancel/join from the condition destructor can self-join/crash
+     // depending on shutdown ordering, so threads must be stopped explicitly.
++#if REX_PLATFORM_SWITCH
++    // Nobody waits on most guest threads (cutscene decode threads, for one); without a join or detach their 16 MiB
++    // stack is never freed. A few leaked stacks made CreateThread fail (C0000017) and froze the next cutscene.
++    if (thread_ && !joined_) pthread_detach(thread_);
++#endif
+   }
+ 
+   bool Signal() override { return true; }
+@@ -1118,6 +1124,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+   inline void post_execution() override {
+     if (thread_) {
+       pthread_join(thread_, nullptr);
++      joined_ = true;
+     }
+ #if defined(__APPLE__)
+     if (suspend_sem_ != SEM_FAILED) {
+@@ -1129,6 +1136,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+ #endif
+   }
+   pthread_t thread_;
++  bool joined_ = false;  // Switch: an unjoined, undetached thread keeps its 16 MiB host stack forever
+   bool signaled_;
+   int exit_code_;
+   State state_;             // Protected by state_mutex_
 diff --git a/sdk/src/input/switch/switch_input_driver.cpp b/sdk/src/input/switch/switch_input_driver.cpp
 index ccf5e2a..ee36923 100644
 --- a/sdk/src/input/switch/switch_input_driver.cpp
@@ -520,6 +560,40 @@ index ccf5e2a..ee36923 100644
      const uint64_t bit = uint64_t(1) << i;
      const bool ahora = modificador && (held & kAtajos[i].boton) != 0;
      const bool antes = (slot.menu_shortcuts & bit) != 0;
+diff --git a/sdk/src/kernel/xam/xam_content.cpp b/sdk/src/kernel/xam/xam_content.cpp
+index 78734b4..4244d14 100644
+--- a/sdk/src/kernel/xam/xam_content.cpp
++++ b/sdk/src/kernel/xam/xam_content.cpp
+@@ -58,6 +58,11 @@ u32 XamContentResolve_entry(u32 user_index, mapped_void content_data_ptr, mapped
+ 
+ // https://github.com/MrColdbird/gameservice/blob/master/ContentManager.cpp
+ // https://github.com/LestaD/SourceEngine2007/blob/master/se2007/engine/xboxsystem.cpp#L499
++// Carbon with 36 extracted DLC folders crashed in profile loading (call to a garbage guest address right after the
++// last pack was opened); 9 packs worked. A fixed table in the game is the suspect. 0 = no limit.
++REXCVAR_DEFINE_INT32(content_max_marketplace_items, 0, "Kernel",
++                     "Maximum marketplace (type 2) items listed to the game, 0 = all. Test setting for big DLC sets");
++
+ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_type,
+                                      u32 content_flags, u32 items_per_enumerate,
+                                      mapped_u32 buffer_size_ptr, mapped_u32 handle_out) {
+@@ -87,7 +92,9 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
+     // Enumerate user-specific content
+     auto content_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
+         static_cast<uint32_t>(DummyDeviceId::HDD), xuid, XContentType(uint32_t(content_type)));
++    const int32_t item_limit = content_type == 2 ? REXCVAR_GET(content_max_marketplace_items) : 0;
+     for (const auto& content_data : content_datas) {
++      if (item_limit > 0 && int32_t(e->item_count()) >= item_limit) break;
+       auto item = e->AppendItem();
+       *item = content_data;
+     }
+@@ -97,6 +104,7 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
+       auto common_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
+           static_cast<uint32_t>(DummyDeviceId::HDD), 0, XContentType(uint32_t(content_type)));
+       for (const auto& content_data : common_datas) {
++        if (item_limit > 0 && int32_t(e->item_count()) >= item_limit) break;
+         auto item = e->AppendItem();
+         *item = content_data;
+       }
 diff --git a/sdk/src/kernel/xam/xam_user.cpp b/sdk/src/kernel/xam/xam_user.cpp
 index 8778066..93f380f 100644
 --- a/sdk/src/kernel/xam/xam_user.cpp
@@ -606,6 +680,33 @@ index 57fd161..0a817d6 100644
      return result;
    }
  
+diff --git a/sdk/src/system/xthread.cpp b/sdk/src/system/xthread.cpp
+index af02bc0..da5a126 100644
+--- a/sdk/src/system/xthread.cpp
++++ b/sdk/src/system/xthread.cpp
+@@ -43,6 +43,13 @@
+ #include "../core/threading_switch.h"
+ #endif
+ 
++#if REX_PLATFORM_SWITCH
++REXCVAR_DEFINE_INT32(thread_host_stack_mib, 8, "Kernel",
++                     "Host stack per guest thread in MiB. Every thread's stack comes out of the process memory, which on the "
++                     "Switch is full: with 16 MiB x 33 threads a cutscene thread could not be created (C0000017)");
++#else
++REXCVAR_DEFINE_INT32(thread_host_stack_mib, 16, "Kernel", "Host stack per guest thread in MiB");
++#endif
+ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
+                     "Ignores game-specified thread priorities");
+ 
+@@ -464,7 +471,7 @@ X_STATUS XThread::Create() {
+   RetainHandle();
+ 
+   rex::thread::Thread::CreationParameters params;
+-  params.stack_size = 16_MiB;  // Allocate a big host stack.
++  params.stack_size = size_t(std::max(1, REXCVAR_GET(thread_host_stack_mib))) * 1_MiB;
+   params.create_suspended = true;
+   thread_ = rex::thread::Thread::Create(params, [this]() {
+     rex::initialize_seh_thread();
 diff --git a/sdk/src/ui/switch_hotspot_policy.h b/sdk/src/ui/switch_hotspot_policy.h
 new file mode 100644
 index 0000000..6e2ade8
@@ -858,6 +959,35 @@ index 6b3d30a..6da63aa 100644
        return;
      }
    }
+diff --git a/sdk/src/ui/vulkan/vulkan_presenter.cpp b/sdk/src/ui/vulkan/vulkan_presenter.cpp
+index 271e8b6..b7c7631 100644
+--- a/sdk/src/ui/vulkan/vulkan_presenter.cpp
++++ b/sdk/src/ui/vulkan/vulkan_presenter.cpp
+@@ -2068,13 +2068,23 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   } else {
+     ++paint_context_.anticipadas_fallos;
+     acquire_result = dfn.vkAcquireNextImageKHR(
+-        device, paint_context_.swapchain, UINT64_MAX, adquisicion_en_cpu ? VK_NULL_HANDLE : acquire_semaphore,
++        device, paint_context_.swapchain, 2000000000ull, adquisicion_en_cpu ? VK_NULL_HANDLE : acquire_semaphore,
+         adquisicion_en_cpu ? acquire_fence : VK_NULL_HANDLE, &swapchain_image_index);
+   }
+   switch (acquire_result) {
+     case VK_SUCCESS:
+     case VK_SUBOPTIMAL_KHR:
+       break;
++    case VK_TIMEOUT:
++    case VK_NOT_READY:
++      // No image for 2 s (picture frozen while the game runs): recreate the swapchain instead of blocking forever.
++      {
++        static uint32_t tiempos_agotados = 0;
++        if (tiempos_agotados++ % 30 == 0) {  // backgrounded app: avoid one error line every 2 s
++          REXLOG_ERROR("[presentador] sin imagen de la cadena de intercambio tras 2 s: se recrea la cadena ({})", tiempos_agotados);
++        }
++      }
++      return PaintResult::kNotPresentedConnectionOutdated;
+     case VK_ERROR_DEVICE_LOST:
+       REXLOG_ERROR(
+           "VulkanPresenter: Failed to acquire the swapchain image as the "
 diff --git a/sdk/thirdparty/CMakeLists.txt b/sdk/thirdparty/CMakeLists.txt
 index aa3c58c..0438ebe 100644
 --- a/sdk/thirdparty/CMakeLists.txt

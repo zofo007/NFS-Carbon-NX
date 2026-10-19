@@ -19,6 +19,7 @@ if (-not $SourceOnly) {
     foreach ($f in @($Nro, $Toml)) { if (-not (Test-Path -LiteralPath $f)) { throw "Missing $f" } }
     Copy-Item -LiteralPath $Nro "$out/sd/switch/nfscarbon/nfscarbon.nro"
     Copy-Item -LiteralPath $Toml "$out/sd/switch/nfscarbon/nfscarbon.toml"
+    Copy-Item "$Workspace/config/nfscarbon.report.toml" "$out/sd/switch/nfscarbon/nfscarbon.report.toml"
     foreach ($f in @('README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'CHANGELOG.md')) {
         Copy-Item "$Workspace/$f" "$out/sd/switch/nfscarbon/$f"
     }
