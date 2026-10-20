@@ -20,7 +20,7 @@ class UploadMemoryTests(unittest.TestCase):
 
     def test_cached_switch_policy_and_chunk_high_water(self):
         text = (ROOT / "carbon-source/renderer/src/renderer.cpp").read_text(encoding="utf-8")
-        acquire = text[text.index("bool Renderer::AcquireChunk()"):text.index("void Renderer::ReserveUpload(")]
+        acquire = text[text.index("bool Renderer::AcquireChunk()"):text.index("bool Renderer::ReserveUpload(")]
         self.assertIn("#if defined(__SWITCH__)", acquire)
         switch, host = acquire.split("#else", 1)
         self.assertIn("aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT", switch)

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.0-beta.8
+
+Stability and data-safety fixes for the Switch port. Keeps the beta.7 release settings.
+
+### Changed
+- Completed guest threads are joined and their retained objects and host stacks are released, including threads the game never waits for.
+- GPU uploads stop safely on allocation failure. Vertex data and draw constants stay associated with the correct upload buffer; copied vertex ranges follow the shader's index rules.
+- Audio client teardown waits for callbacks already in progress before freeing or reusing their state.
+- Shutdown waits for threads and decoder work to finish. Unsupported external cancellation no longer reports success or frees live thread state.
+- Switch thread registration, priority and suspend/resume bookkeeping now include threads created by other threads.
+- DLC files and metadata are staged and checked before replacing an installation. Failed reads, writes, flushes, closes or publication steps preserve the previous install; interrupted replacements can recover on a later launch or content access.
+- Achievement history writes check file operations and preserve the previous file when replacement fails. This does not confirm in-game achievement unlocks.
+- Normal builds now retain the beta.7 release preset: 80% resolution with FSR, warning-only logs, diagnostics off and rumble on.
+
+### Validation and limits
+- The maintainer reports the combined fixes running successfully on Switch. Longer sessions and individual failure paths still need hardware coverage; no new FPS or endurance claim is made.
+- 118 host regression tests and the separate file-replacement check passed. The Switch Release build and ARM64 ELF/NRO validation passed.
+- Removing a package from `dlc/` still does not uninstall its extracted copy. Mixed or large DLC sets can still cause profile-loading problems; see the README cleanup steps. The 55-pack set is unverified.
+- Nonreturning guest code, audio callbacks or decoder work can still prevent shutdown from completing.
+- Collector's Edition support is not included.
+
 ## 0.1.0-beta.7
 
 Fixes the long-session freezes and the periodic hiccups, makes the default quiet and adds FSR and rumble.

@@ -12,5 +12,7 @@
 | First launch | Shaders and pipelines compile as needed | Stutters for a few seconds the first races; cached on the SD card afterwards |
 | Debug console | L+R+Down log console is off | Opening it froze the whole console. Enable it with `switch_log_console_shortcut = true` at your own risk |
 | DLC | Packages load; which ones unlock what is untested. A large set with leftover extracted folders crashed profile loading | Keep to the known working packs in the README; if loading crashes, clear the extracted folders (see DLC in the README) |
+| DLC removal | Removing files from `dlc/` leaves their extracted copies installed | Back up `user/` and follow the README cleanup steps when changing packs. Beta.8 improves installation safety but does not synchronize removals |
+| Shutdown | Nonreturning guest code, audio callbacks or decoder work can prevent shutdown from completing | Beta.8 waits for live work instead of treating unsupported cancellation as completion |
 
 Measurements behind these entries: [PERFORMANCE.md](PERFORMANCE.md).

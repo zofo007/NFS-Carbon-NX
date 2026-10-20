@@ -13,6 +13,43 @@ index c460dd3..8d9eb80 100644
  if(APPLE AND CMAKE_OSX_ARCHITECTURES)
      list(LENGTH CMAKE_OSX_ARCHITECTURES REX_OSX_ARCH_COUNT)
      if(REX_OSX_ARCH_COUNT GREATER 1)
+diff --git a/sdk/include/rex/audio/audio_system.h b/sdk/include/rex/audio/audio_system.h
+index 28e92e7..e9625c7 100644
+--- a/sdk/include/rex/audio/audio_system.h
++++ b/sdk/include/rex/audio/audio_system.h
+@@ -12,6 +12,7 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <condition_variable>
+ #include <queue>
+ 
+ #include <rex/kernel.h>
+@@ -91,16 +92,23 @@ class AudioSystem : public system::IAudioSystem {
+     uint32_t callback_arg;
+     uint32_t wrapped_callback_arg;
+     bool in_use;
++    bool callback_active;
++    bool unregistering;
++    bool deferred_cleanup;
+   } clients_[kMaximumClientCount];
+ 
+   int FindFreeClient();
++  // Called with the global critical region held.
++  void DestroyClient(size_t index);
++  void CompleteClientCallback(size_t index);
++  std::condition_variable_any client_callbacks_done_;
+ 
+   std::unique_ptr<rex::thread::Semaphore> client_semaphores_[kMaximumClientCount];
+   // Event is always there in case we have no clients.
+   std::unique_ptr<rex::thread::Event> shutdown_event_;
+   rex::thread::WaitHandle* wait_handles_[kMaximumClientCount + 1];
+ 
+-  bool paused_ = false;
++  std::atomic<bool> paused_{false};
+   rex::thread::Fence pause_fence_;
+   std::unique_ptr<rex::thread::Event> resume_event_;
+ };
 diff --git a/sdk/include/rex/audio/xma/profile.h b/sdk/include/rex/audio/xma/profile.h
 new file mode 100644
 index 0000000..6fd3370
@@ -116,6 +153,159 @@ index 0000000..6fd3370
 +};
 +
 +}  // namespace rex::audio
+diff --git a/sdk/include/rex/filesystem/atomic_file.h b/sdk/include/rex/filesystem/atomic_file.h
+new file mode 100644
+index 0000000..f8d1430
+--- /dev/null
++++ b/sdk/include/rex/filesystem/atomic_file.h
+@@ -0,0 +1,61 @@
++#pragma once
++
++#include <filesystem>
++#include <system_error>
++
++namespace rex::filesystem {
++
++using RenameFile = void (*)(const std::filesystem::path&, const std::filesystem::path&,
++                            std::error_code&);
++
++inline void CommitFile(const std::filesystem::path& temporary,
++                       const std::filesystem::path& target, std::error_code& error,
++                       RenameFile rename_file = std::filesystem::rename) {
++  rename_file(temporary, target, error);
++  if (error != std::errc::file_exists) {
++    return;
++  }
++
++  std::error_code check_error;
++  if (!std::filesystem::is_regular_file(target, check_error)) {
++    error = check_error ? check_error : std::make_error_code(std::errc::operation_not_permitted);
++    return;
++  }
++
++  auto backup = target;
++  backup += ".bak";
++  const bool has_backup = std::filesystem::exists(backup, check_error);
++  if (check_error) {
++    error = check_error;
++    return;
++  }
++  if (has_backup) {
++    if (!std::filesystem::is_regular_file(backup, check_error)) {
++      error = check_error ? check_error : std::make_error_code(std::errc::operation_not_permitted);
++      return;
++    }
++    std::filesystem::remove(backup, error);
++    if (error) {
++      return;
++    }
++  }
++
++  // Horizon cannot replace an existing destination. Keep the old save until
++  // replacement succeeds, and restore it if the second rename fails.
++  rename_file(target, backup, error);
++  if (error) {
++    return;
++  }
++
++  rename_file(temporary, target, error);
++  if (!error) {
++    std::filesystem::remove(backup, check_error);
++    return;
++  }
++
++  const auto replacement_error = error;
++  rename_file(backup, target, check_error);
++  error = check_error ? check_error : replacement_error;
++}
++
++}  // namespace rex::filesystem
+diff --git a/sdk/include/rex/system/kernel_state.h b/sdk/include/rex/system/kernel_state.h
+index 9b9cf9e..d853a94 100644
+--- a/sdk/include/rex/system/kernel_state.h
++++ b/sdk/include/rex/system/kernel_state.h
+@@ -76,6 +76,9 @@
+ 
+ namespace rex {
+ class Runtime;
++namespace thread {
++class Thread;
++}
+ namespace stream {
+ class ByteStream;
+ }  // namespace stream
+@@ -280,6 +283,10 @@ class KernelState {
+   void UnregisterThread(XThread* thread);
+   void OnThreadExecute(XThread* thread);
+   void OnThreadExit(XThread* thread);
++#if REX_PLATFORM_SWITCH
++  bool TrackThread(XThread* thread);
++  void RetireThread(XThread* thread);
++#endif
+   object_ref<XThread> GetThreadByID(uint32_t thread_id);
+ 
+   FiberInfo* LookupFiber(uint32_t guest_addr);
+@@ -345,6 +352,11 @@ class KernelState {
+   void SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uint32_t tls_data_size,
+                          uint32_t tls_raw_data_address);
+   void LoadAchievementsData();
++#if REX_PLATFORM_SWITCH
++  void StartThreadReaper();
++  void ThreadReaperMain();
++  void StopThreadReaper();
++#endif
+ 
+   Runtime* emulator_;
+   memory::Memory* memory_;
+@@ -360,6 +372,15 @@ class KernelState {
+   // Must be guarded by the global critical region.
+   util::ObjectTable object_table_;
+   std::unordered_map<uint32_t, XThread*> threads_by_id_;
++#if REX_PLATFORM_SWITCH
++  std::unique_ptr<rex::thread::Thread> thread_reaper_;
++  std::mutex thread_reaper_mutex_;
++  std::condition_variable thread_reaper_cond_;
++  bool thread_reaper_stopping_ = false;
++  // Own each started thread until its actual host exit and join. Protected by
++  // thread_reaper_mutex_; exit transfers a list node without allocating.
++  std::list<object_ref<XThread>> active_threads_, retired_threads_;
++#endif
+   std::vector<object_ref<XNotifyListener>> notify_listeners_;
+   bool has_notified_startup_ = false;
+ 
+diff --git a/sdk/include/rex/system/xthread.h b/sdk/include/rex/system/xthread.h
+index a72911e..e0c27c2 100644
+--- a/sdk/include/rex/system/xthread.h
++++ b/sdk/include/rex/system/xthread.h
+@@ -331,6 +331,9 @@ class XThread : public XObject {
+   bool is_guest_thread() const { return guest_thread_; }
+   bool main_thread() const { return main_thread_; }
+   bool is_running() const { return running_; }
++#if REX_PLATFORM_SWITCH
++  bool host_thread_ready() const { return host_thread_ready_.load(std::memory_order_acquire); }
++#endif
+ 
+   uint32_t thread_id() const { return thread_id_; }
+   uint32_t last_error();
+@@ -396,6 +399,7 @@ class XThread : public XObject {
+   bool AllocateStack(uint32_t size);
+   void FreeStack();
+   void InitializeGuestObject();
++  void UnlinkFromProcess();
+ 
+   void RundownAPCs();
+ 
+@@ -421,6 +425,10 @@ class XThread : public XObject {
+   // Atomic: written by the thread itself in Exit/Terminate, read cross-thread by
+   // KernelState::TerminateTitle's cooperative drain.
+   std::atomic<bool> running_{false};
++  bool process_linked_ = false;
++#if REX_PLATFORM_SWITCH
++  std::atomic<bool> host_thread_ready_{false};
++#endif
+ 
+   std::string thread_name_;
+   std::unique_ptr<runtime::ThreadState> thread_state_;
 diff --git a/sdk/include/rex/ui/vulkan/functions/device_1_0.inc b/sdk/include/rex/ui/vulkan/functions/device_1_0.inc
 index aa55a4a..d9d6ed3 100644
 --- a/sdk/include/rex/ui/vulkan/functions/device_1_0.inc
@@ -145,7 +335,7 @@ index aa55a4a..d9d6ed3 100644
  XE_UI_VULKAN_FUNCTION(vkMapMemory)
  XE_UI_VULKAN_FUNCTION(vkResetCommandPool)
 diff --git a/sdk/src/audio/audio_system.cpp b/sdk/src/audio/audio_system.cpp
-index eefee0e..103489c 100644
+index eefee0e..7e7433c 100644
 --- a/sdk/src/audio/audio_system.cpp
 +++ b/sdk/src/audio/audio_system.cpp
 @@ -25,6 +25,14 @@
@@ -163,7 +353,17 @@ index eefee0e..103489c 100644
  REXCVAR_DEFINE_INT32(
      audio_maxqframes, 8, "Audio",
      "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
-@@ -150,6 +158,9 @@ void AudioSystem::WorkerThreadMain() {
+@@ -125,6 +133,9 @@ void AudioSystem::WorkerThreadMain() {
+     // (signaling a sample has finished playing)
+     auto result = rex::thread::WaitAny(wait_handles_, rex::countof(wait_handles_), true,
+                                        std::chrono::milliseconds(500));
++    if (!worker_running_) {
++      break;
++    }
+     if (result.first == rex::thread::WaitResult::kFailed) {
+       REXAPU_WARN("AudioWorker: WaitAny failed");
+       continue;
+@@ -150,13 +161,22 @@ void AudioSystem::WorkerThreadMain() {
      bool pumped = false;
      if (result.first == rex::thread::WaitResult::kSuccess) {
        auto index = result.second;
@@ -172,8 +372,30 @@ index eefee0e..103489c 100644
 +#endif
  
        auto global_lock = global_critical_region_.Acquire();
-       uint32_t client_callback = clients_[index].callback;
-@@ -168,6 +179,12 @@ void AudioSystem::WorkerThreadMain() {
+-      uint32_t client_callback = clients_[index].callback;
++      uint32_t client_callback = clients_[index].unregistering ? 0 : clients_[index].callback;
+       uint32_t client_callback_arg = clients_[index].wrapped_callback_arg;
++      if (client_callback) clients_[index].callback_active = true;
+       global_lock.unlock();
+ 
+       if (client_callback) {
++        struct CallbackScope {
++          AudioSystem* system;
++          size_t index;
++          ~CallbackScope() { system->CompleteClientCallback(index); }
++        } callback_scope{this, index};
+         if (diag_pump_count < 10) {
+           REXAPU_DEBUG("AudioWorker: dispatching callback {:08X} with arg {:08X} for client {}",
+                        client_callback, client_callback_arg, index);
+@@ -164,10 +184,20 @@ void AudioSystem::WorkerThreadMain() {
+         if (const GanchoAntesDeTrama gancho = g_gancho_antes_de_trama.load(std::memory_order_acquire)) {
+           gancho(index);
+         }
++        global_lock.lock();
++        const bool dispatch = worker_running_ && !clients_[index].unregistering;
++        global_lock.unlock();
++        if (!dispatch) continue;
+         SCOPE_profile_cpu_i("apu", "rex::audio::AudioSystem->client_callback");
          uint64_t args[] = {client_callback_arg};
          function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
                                        rex::countof(args));
@@ -186,6 +408,177 @@ index eefee0e..103489c 100644
          if (diag_pump_count < 10) {
            REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
          }
+@@ -207,44 +237,36 @@ int AudioSystem::FindFreeClient() {
+ void AudioSystem::Initialize() {}
+ 
+ void AudioSystem::Shutdown() {
+-  if (!worker_running_) {
+-    return;
+-  }
+-
+-  // Shut down XMA decoder first - its worker can stall in FFmpeg
+-  if (xma_decoder_) {
+-    xma_decoder_->Shutdown();
+-  }
+-
+   worker_running_ = false;
++  paused_ = false;
++  resume_event_->Set();
+   shutdown_event_->Set();
+   if (worker_thread_) {
+-    // The worker may be stuck inside a guest callback that is itself blocked on
+-    // guest objects (e.g. KeWaitForMultipleObjects), so terminating is the last
+-    // resort. Give it a chance to unwind first: TerminateThread abandons any
+-    // lock the thread holds, including the CRT heap lock.
+     rex::thread::Thread* host_thread = worker_thread_->thread();
+-    bool exited = host_thread && rex::thread::Wait(host_thread, false, kWorkerShutdownTimeout) ==
+-                                     rex::thread::WaitResult::kSuccess;
+-    if (!exited) {
+-      REXAPU_WARN("Audio worker did not exit within {} ms; terminating",
+-                  kWorkerShutdownTimeout.count());
+-      worker_thread_->Terminate(0);
++    if (host_thread) {
++      auto result = rex::thread::Wait(host_thread, false, kWorkerShutdownTimeout);
++      if (result == rex::thread::WaitResult::kTimeout) {
++        REXAPU_WARN("Audio worker did not exit within {} ms; waiting for its callback to return",
++                    kWorkerShutdownTimeout.count());
++        // Cancellation is unsupported on Horizon. Keep callback state alive
++        // until the host thread really exits; guest callbacks must cooperate.
++        result = rex::thread::Wait(host_thread, false);
++      }
++      if (result != rex::thread::WaitResult::kSuccess) {
++        rex::FatalError("Cannot wait for audio worker shutdown");
++      }
+     }
+-    worker_thread_.reset();
+   }
+ 
++  // A guest render callback can still use decoder contexts. Keep them alive
++  // until the audio worker has finished, then join the decoder worker too.
++  if (xma_decoder_) xma_decoder_->Shutdown();
++
+   // Destroy all active client drivers (closes SDL audio devices, stopping
+   // callback threads) before the semaphores they reference are destroyed.
+-  for (size_t i = 0; i < kMaximumClientCount; i++) {
+-    if (clients_[i].in_use) {
+-      DestroyDriver(clients_[i].driver);
+-      if (clients_[i].wrapped_callback_arg) {
+-        memory()->SystemHeapFree(clients_[i].wrapped_callback_arg);
+-      }
+-      clients_[i] = {nullptr, 0, 0, 0, false};
+-    }
+-  }
++  auto global_lock = global_critical_region_.Acquire();
++  worker_thread_.reset();
++  for (size_t i = 0; i < kMaximumClientCount; i++) DestroyClient(i);
+ }
+ 
+ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, size_t* out_index) {
+@@ -252,8 +274,9 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
+                callback_arg);
+   auto global_lock = global_critical_region_.Acquire();
+ 
++  if (!worker_running_) return X_STATUS_UNSUCCESSFUL;
+   auto index = FindFreeClient();
+-  assert_true(index >= 0);
++  if (index < 0) return X_STATUS_NO_MEMORY;
+   REXAPU_DEBUG("AudioSystem::RegisterClient: using client index={} queued_frames={}", index,
+                queued_frames_);
+ 
+@@ -264,14 +287,20 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
+   AudioDriver* driver;
+   auto result = CreateDriver(index, client_semaphore, &driver);
+   if (XFAILED(result)) {
++    DestroyClient(index);
+     return result;
+   }
+   assert_not_null(driver);
+ 
+   uint32_t ptr = memory()->SystemHeapAlloc(0x4);
++  if (!ptr) {
++    DestroyDriver(driver);
++    DestroyClient(index);
++    return X_STATUS_NO_MEMORY;
++  }
+   memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
+ 
+-  clients_[index] = {driver, callback, callback_arg, ptr, true};
++  clients_[index] = {driver, callback, callback_arg, ptr, true, false, false, false};
+ 
+   if (out_index) {
+     *out_index = index;
+@@ -301,9 +330,43 @@ void AudioSystem::UnregisterClient(size_t index) {
+ 
+   auto global_lock = global_critical_region_.Acquire();
+   assert_true(index < kMaximumClientCount);
+-  DestroyDriver(clients_[index].driver);
+-  memory()->SystemHeapFree(clients_[index].wrapped_callback_arg);
+-  clients_[index] = {nullptr, 0, 0, 0, false};
++  if (index >= kMaximumClientCount) return;
++  auto& client = clients_[index];
++  if (!client.in_use) return;
++  if (client.unregistering) {
++    if (!system::XThread::IsInThread(worker_thread_.get())) {
++      client_callbacks_done_.wait(global_lock, [&client] {
++        return !client.callback_active || !client.unregistering;
++      });
++    }
++    return;
++  }
++  client.unregistering = true;
++  client.callback = 0;
++  if (client.callback_active) {
++    if (system::XThread::IsInThread(worker_thread_.get())) {
++      // Callback-initiated teardown cannot wait for itself. Keep the slot and
++      // driver alive for any final submission until this callback returns.
++      client.deferred_cleanup = true;
++      return;
++    }
++    client_callbacks_done_.wait(global_lock, [&client] { return !client.callback_active; });
++  }
++  DestroyClient(index);
++}
++
++void AudioSystem::CompleteClientCallback(size_t index) {
++  auto global_lock = global_critical_region_.Acquire();
++  clients_[index].callback_active = false;
++  if (clients_[index].deferred_cleanup) DestroyClient(index);
++  client_callbacks_done_.notify_all();
++}
++
++void AudioSystem::DestroyClient(size_t index) {
++  auto& client = clients_[index];
++  if (client.driver) DestroyDriver(client.driver);
++  if (client.wrapped_callback_arg) memory()->SystemHeapFree(client.wrapped_callback_arg);
++  client = {};
+ 
+   // Drain the semaphore of its count.
+   auto client_semaphore = client_semaphores_[index].get();
+@@ -315,6 +378,10 @@ void AudioSystem::UnregisterClient(size_t index) {
+ }
+ 
+ bool AudioSystem::Save(stream::ByteStream* stream) {
++  auto global_lock = global_critical_region_.Acquire();
++  for (const auto& client : clients_) {
++    if (client.callback_active || client.unregistering) return false;
++  }
+   stream->Write(kAudioSaveSignature);
+ 
+   // Count the number of used clients first.
+@@ -343,6 +410,13 @@ bool AudioSystem::Save(stream::ByteStream* stream) {
+ }
+ 
+ bool AudioSystem::Restore(stream::ByteStream* stream) {
++  auto global_lock = global_critical_region_.Acquire();
++  for (const auto& client : clients_) {
++    if (client.callback_active || client.unregistering) {
++      REXAPU_WARN("AudioSystem::Restore requires callbacks to be paused");
++      return false;
++    }
++  }
+   if (stream->Read<uint32_t>() != kAudioSaveSignature) {
+     REXAPU_ERROR("AudioSystem::Restore - Invalid magic value!");
+     return false;
 diff --git a/sdk/src/audio/switch/switch_audio_system.cpp b/sdk/src/audio/switch/switch_audio_system.cpp
 index 6a9dc8d..8546f48 100644
 --- a/sdk/src/audio/switch/switch_audio_system.cpp
@@ -312,7 +705,7 @@ index a902d01..525e7bf 100644
    // If more than one channel, we need to interleave the samples from each
    // channel next to each other. Always saturate because FFmpeg output is
 diff --git a/sdk/src/audio/xma_decoder.cpp b/sdk/src/audio/xma_decoder.cpp
-index 3a1bebb..5c63fc4 100644
+index 3a1bebb..0128083 100644
 --- a/sdk/src/audio/xma_decoder.cpp
 +++ b/sdk/src/audio/xma_decoder.cpp
 @@ -26,6 +26,8 @@
@@ -368,7 +761,25 @@ index 3a1bebb..5c63fc4 100644
    }
  }
  
-@@ -514,7 +536,9 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+@@ -377,10 +399,15 @@ void XmaDecoder::Shutdown() {
+     Resume();
+   }
+ 
+-  // Wait up to 2 seconds for worker thread to exit gracefully.
++  // A timeout does not stop FFmpeg or the worker. Keep its contexts alive
++  // until the host thread has actually finished.
+   auto result = rex::thread::Wait(worker_thread_->thread(), false, std::chrono::milliseconds(2000));
+   if (result == rex::thread::WaitResult::kTimeout) {
+-    REXAPU_WARN("XMA: Worker thread did not exit within 2s, abandoning");
++    REXAPU_WARN("XMA: Worker thread did not exit within 2s; waiting for decoder completion");
++    result = rex::thread::Wait(worker_thread_->thread(), false);
++  }
++  if (result != rex::thread::WaitResult::kSuccess) {
++    rex::FatalError("Cannot wait for XMA worker shutdown");
+   }
+   worker_thread_.reset();
+ 
+@@ -514,7 +541,9 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
          }
        }
        g_pendiente_desde_ns.store(AhoraNs(), std::memory_order_release);
@@ -499,7 +910,7 @@ index d604044..2531785 100644
   *
   * newlib has mktime, which interprets struct tm in the local time zone, but not
 diff --git a/sdk/src/core/threading_posix.cpp b/sdk/src/core/threading_posix.cpp
-index 5d26022..bab20fb 100644
+index 5d26022..15bdee4 100644
 --- a/sdk/src/core/threading_posix.cpp
 +++ b/sdk/src/core/threading_posix.cpp
 @@ -744,6 +744,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
@@ -510,34 +921,443 @@ index 5d26022..bab20fb 100644
          signaled_(false),
          exit_code_(0),
          state_(State::kRunning),
-@@ -762,6 +763,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
-     // Match Canary/Edge behavior.
-     // Force-cancel/join from the condition destructor can self-join/crash
-     // depending on shutdown ordering, so threads must be stopped explicitly.
+@@ -759,9 +760,16 @@ class PosixCondition<Thread> : public PosixConditionBase {
+   }
+ 
+   virtual ~PosixCondition() {
+-    // Match Canary/Edge behavior.
+-    // Force-cancel/join from the condition destructor can self-join/crash
+-    // depending on shutdown ordering, so threads must be stopped explicitly.
 +#if REX_PLATFORM_SWITCH
-+    // Nobody waits on most guest threads (cutscene decode threads, for one); without a join or detach their 16 MiB
-+    // stack is never freed. A few leaked stacks made CreateThread fail (C0000017) and froze the next cutscene.
-+    if (thread_ && !joined_) pthread_detach(thread_);
++    Join();
++#endif
++#if defined(__APPLE__)
++    if (suspend_sem_ != SEM_FAILED) {
++      sem_close(suspend_sem_);
++    }
++#else
++    sem_destroy(&suspend_sem_);
 +#endif
    }
  
    bool Signal() override { return true; }
-@@ -1118,6 +1124,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
-   inline void post_execution() override {
-     if (thread_) {
-       pthread_join(thread_, nullptr);
-+      joined_ = true;
+@@ -995,26 +1003,29 @@ class PosixCondition<Thread> : public PosixConditionBase {
      }
- #if defined(__APPLE__)
-     if (suspend_sem_ != SEM_FAILED) {
-@@ -1129,6 +1136,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     WaitStarted();
+     std::unique_lock<std::mutex> lock(state_mutex_);
+-    if (suspend_count_ == 0) {
++    if (state_ == State::kFinished || suspend_count_ == 0) {
+       return false;
+     }
+     if (out_previous_suspend_count) {
+       *out_previous_suspend_count = suspend_count_;
+     }
+-    --suspend_count_;
+-    if (suspend_count_ == 0 && state_ == State::kSuspended) {
+-      state_ = State::kRunning;
+ #if defined(__SWITCH__)
+-      // Counterpart of RexSwitchPauseThread in Suspend(). The semaphore below
+-      // wakes a thread that suspended itself from WaitSuspended(); this call
+-      // resumes a thread that was paused from outside. Both are needed,
+-      // because they are two different suspension paths.
+-      if (!pthread_equal(thread_, pthread_self())) {
+-        RexSwitchResumeThread(thread_);
++    // Startup and self-suspension wait cooperatively. Only undo a kernel pause
++    // that actually succeeded, and leave the count intact if resuming fails.
++    if (suspend_count_ == 1 && externally_suspended_) {
++      if (RexSwitchResumeThread(thread_) != 0) {
++        return false;
+       }
++      externally_suspended_ = false;
++    }
  #endif
++    --suspend_count_;
++    if (suspend_count_ == 0 && state_ == State::kSuspended) {
++      state_ = State::kRunning;
++#if !defined(__SWITCH__)
+       // Async-signal-safe wakeup for WaitSuspended() from signal handler path.
+       sem_post(suspend_sem_ptr());
++#endif
+     }
+     state_signal_.notify_all();
+     return true;
+@@ -1028,30 +1039,38 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     bool is_current_thread = pthread_self() == thread_;
+     {
+       std::unique_lock<std::mutex> lock(state_mutex_);
++      if (state_ == State::kFinished) {
++        return false;
++      }
+       if (out_previous_suspend_count) {
+         *out_previous_suspend_count = suspend_count_;
+       }
++#if defined(__SWITCH__)
++      if (!is_current_thread && suspend_count_ == 0) {
++        if (RexSwitchPauseThread(thread_) != 0) {
++          return false;
++        }
++        externally_suspended_ = true;
++      }
++#endif
+       state_ = State::kSuspended;
+       ++suspend_count_;
++      state_signal_.notify_all();
++#if defined(__SWITCH__)
++      if (is_current_thread) {
++        state_signal_.wait(lock, [this] { return suspend_count_ == 0; });
++      }
++#endif
+     }
+ 
++#if defined(__SWITCH__)
++    return true;
++#else
+     if (is_current_thread) {
+       WaitSuspended();
+       return true;
+     }
+ 
+-#if defined(__SWITCH__)
+-    // Careful: pthread_kill does not work here.
+-    //
+-    // On Horizon newlib accepts the call and returns 0, but the signal is never
+-    // delivered. The result would be the worst possible: the state would say
+-    // kSuspended, the function would return true, and the thread would keep
+-    // running happily. A bug that compiles, gives no warning and shows up later
+-    // as random corruption.
+-    //
+-    // svcSetThreadActivity is the system's real mechanism.
+-    return RexSwitchPauseThread(thread_) == 0;
+-#else
+     int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadSuspend));
+     return result == 0;
+ #endif
+@@ -1059,6 +1078,13 @@ class PosixCondition<Thread> : public PosixConditionBase {
+ 
+   void Terminate(int exit_code) {
+     bool is_current_thread = pthread_self() == thread_;
++#if defined(__SWITCH__)
++    if (!is_current_thread) {
++      // Cancellation is unsupported. Do not publish completion for a live worker.
++      REXSYS_WARN("Terminate: external thread cancellation is unsupported on Switch");
++      return;
++    }
++#endif
+     {
+       std::unique_lock<std::mutex> lock(state_mutex_);
+       if (state_ == State::kFinished) {
+@@ -1083,6 +1109,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       cond_.notify_all();
+     }
+     if (is_current_thread) {
++#if defined(__SWITCH__)
++      // Switch pthread_exit does not unwind C++ locals.
++      RexSwitchUnregisterCurrentThread();
++#endif
+       pthread_exit(reinterpret_cast<void*>(exit_code));
+     } else {
+ #if REX_PLATFORM_ANDROID
+@@ -1110,29 +1140,33 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     } while (ret == -1 && errno == EINTR);
+   }
+ 
++  // Waiters hold mutex_; destruction has exclusive ownership of the wrapper.
++  void Join() {
++    if (thread_ && !joined_) {
++      if (pthread_equal(thread_, pthread_self()) || pthread_join(thread_, nullptr) != 0) {
++        REX_FATAL("Unable to join owned POSIX thread");
++      }
++      joined_ = true;
++    }
++  }
++
+   void* native_handle() const override { return reinterpret_cast<void*>(thread_); }
+ 
+  private:
+   static void* ThreadStartRoutine(void* parameter);
+   inline bool signaled() const override { return signaled_; }
+   inline void post_execution() override {
+-    if (thread_) {
+-      pthread_join(thread_, nullptr);
+-    }
+-#if defined(__APPLE__)
+-    if (suspend_sem_ != SEM_FAILED) {
+-      sem_close(suspend_sem_);
+-      suspend_sem_ = SEM_FAILED;
+-    }
+-#else
+-    sem_destroy(&suspend_sem_);
+-#endif
++    Join();
    }
    pthread_t thread_;
-+  bool joined_ = false;  // Switch: an unjoined, undetached thread keeps its 16 MiB host stack forever
++  bool joined_ = false;
    bool signaled_;
    int exit_code_;
    State state_;             // Protected by state_mutex_
+   uint32_t suspend_count_;  // Protected by state_mutex_
++#if defined(__SWITCH__)
++  bool externally_suspended_ = false;  // Protected by state_mutex_
++#endif
+ #if defined(__APPLE__)
+   sem_t* suspend_sem_ = SEM_FAILED;
+   sem_t* suspend_sem_ptr() { return suspend_sem_; }
+@@ -1460,11 +1494,22 @@ class PosixThread : public PosixConditionHandle<Thread> {
+  public:
+   PosixThread() = default;
+   explicit PosixThread(pthread_t thread) : PosixConditionHandle(thread) {}
+-  ~PosixThread() override = default;
++  ~PosixThread() override {
++#if REX_PLATFORM_SWITCH
++    // Join before destroying the entry function, which may still be executing.
++    handle_.Join();
++#endif
++  }
+ 
+   bool Initialize(CreationParameters params, std::function<void()> start_routine) {
++#if REX_PLATFORM_SWITCH
++    start_data_ = std::make_unique<ThreadStartData>(
++        ThreadStartData{std::move(start_routine), false, this});
++    return handle_.Initialize(params, start_data_.get());
++#else
+     auto start_data = new ThreadStartData({std::move(start_routine), false, this});
+     return handle_.Initialize(params, start_data);
++#endif
+   }
+ 
+   void set_name(std::string name) override {
+@@ -1499,6 +1544,11 @@ class PosixThread : public PosixConditionHandle<Thread> {
+   void Terminate(int exit_code) override { handle_.Terminate(exit_code); }
+ 
+   void WaitSuspended() { handle_.WaitSuspended(); }
++
++#if REX_PLATFORM_SWITCH
++ private:
++  std::unique_ptr<ThreadStartData> start_data_;
++#endif
+ };
+ 
+ thread_local PosixThread* current_thread_ = nullptr;
+@@ -1516,12 +1566,24 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+   assert_not_null(start_data->thread_obj);
+ 
+   auto thread = dynamic_cast<PosixThread*>(start_data->thread_obj);
++  // Switch pthread_exit bypasses local destructors. Keep captures in the owned
++  // wrapper so they are released after join, even on a non-returning exit.
++#if REX_PLATFORM_SWITCH
++  auto& start_routine = start_data->start_routine;
++#else
+   auto start_routine = std::move(start_data->start_routine);
++#endif
+   auto create_suspended = start_data->create_suspended;
++#if !REX_PLATFORM_SWITCH
+   delete start_data;
++#endif
+ 
+   current_thread_ = thread;
+   current_thread_condition_ = &thread->handle_;
++#if defined(__SWITCH__)
++  // Register before WaitStarted can expose this thread to cross-thread controls.
++  RexSwitchRegisterCurrentThread();
++#endif
+   {
+     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
+     thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;
+@@ -1544,6 +1606,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+ 
+   start_routine();
+ 
++#if defined(__SWITCH__)
++  RexSwitchUnregisterCurrentThread();
++#endif
+   {
+     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
+     thread->handle_.state_ = State::kFinished;
+@@ -1592,6 +1657,9 @@ Thread* Thread::GetCurrentThread() {
+   // The only thread not created by Thread::Create should be the main thread.
+   pthread_t handle = pthread_self();
+ 
++#if defined(__SWITCH__)
++  RexSwitchRegisterCurrentThread();
++#endif
+   current_thread_ = new PosixThread(handle);
+   current_thread_condition_ = &current_thread_->condition();
+   // TODO(bwrsandman): Disabling deleting thread_local current thread to prevent
+diff --git a/sdk/src/core/threading_switch.cpp b/sdk/src/core/threading_switch.cpp
+index 9743cbc..168837b 100644
+--- a/sdk/src/core/threading_switch.cpp
++++ b/sdk/src/core/threading_switch.cpp
+@@ -39,8 +39,13 @@ namespace {
+  * per frame. A plain mutex is more than enough.
+  */
+ struct Registro {
++  struct Entry {
++    RexSwitchHandle handle;
++    bool paused = false;
++  };
+   std::mutex m;
+-  std::unordered_map<uintptr_t, RexSwitchHandle> mapa;
++  bool suspension_enabled = true;
++  std::unordered_map<uintptr_t, Entry> mapa;
+ };
+ 
+ Registro& registro() {
+@@ -48,6 +53,14 @@ Registro& registro() {
+   return r;
+ }
+ 
++// Caller holds r.m through the syscall so exit cannot retire/reuse the handle.
++RexSwitchHandle HandleForLocked(Registro& r, pthread_t thread) {
++  if (pthread_equal(thread, pthread_self()))
++    return threadGetCurHandle();
++  auto it = r.mapa.find(reinterpret_cast<uintptr_t>(thread));
++  return it == r.mapa.end() ? REX_SWITCH_INVALID_HANDLE : it->second.handle;
++}
++
+ }  // namespace
+ 
+ extern "C" {
+@@ -55,7 +68,7 @@ extern "C" {
+ void RexSwitchRegisterCurrentThread(void) {
+   auto& r = registro();
+   std::lock_guard<std::mutex> lock(r.m);
+-  r.mapa[reinterpret_cast<uintptr_t>(pthread_self())] = threadGetCurHandle();
++  r.mapa[reinterpret_cast<uintptr_t>(pthread_self())] = {threadGetCurHandle()};
+ }
+ 
+ void RexSwitchUnregisterCurrentThread(void) {
+@@ -65,13 +78,9 @@ void RexSwitchUnregisterCurrentThread(void) {
+ }
+ 
+ RexSwitchHandle RexSwitchHandleFor(pthread_t thread) {
+-  if (pthread_equal(thread, pthread_self()))
+-    return threadGetCurHandle();
+-
+   auto& r = registro();
+   std::lock_guard<std::mutex> lock(r.m);
+-  auto it = r.mapa.find(reinterpret_cast<uintptr_t>(thread));
+-  return it == r.mapa.end() ? REX_SWITCH_INVALID_HANDLE : it->second;
++  return HandleForLocked(r, thread);
+ }
+ 
+ /* --- afinidad ---------------------------------------------------------- */
+@@ -80,7 +89,9 @@ int pthread_getaffinity_np(pthread_t thread, size_t size, cpu_set_t* set) {
+   if (set == nullptr || size < sizeof(cpu_set_t))
+     return EINVAL;
+ 
+-  RexSwitchHandle h = RexSwitchHandleFor(thread);
++  auto& r = registro();
++  std::lock_guard<std::mutex> lock(r.m);
++  RexSwitchHandle h = HandleForLocked(r, thread);
+   if (h == REX_SWITCH_INVALID_HANDLE)
+     return ESRCH;
+ 
+@@ -97,7 +108,9 @@ int pthread_setaffinity_np(pthread_t thread, size_t size, const cpu_set_t* set)
+   if (set == nullptr || size < sizeof(cpu_set_t))
+     return EINVAL;
+ 
+-  RexSwitchHandle h = RexSwitchHandleFor(thread);
++  auto& r = registro();
++  std::lock_guard<std::mutex> lock(r.m);
++  RexSwitchHandle h = HandleForLocked(r, thread);
+   if (h == REX_SWITCH_INVALID_HANDLE)
+     return ESRCH;
+ 
+@@ -136,7 +149,9 @@ int pthread_setaffinity_np(pthread_t thread, size_t size, const cpu_set_t* set)
+  */
+ 
+ int pthread_getschedparam(pthread_t thread, int* policy, struct sched_param* param) {
+-  RexSwitchHandle h = RexSwitchHandleFor(thread);
++  auto& r = registro();
++  std::lock_guard<std::mutex> lock(r.m);
++  RexSwitchHandle h = HandleForLocked(r, thread);
+   if (h == REX_SWITCH_INVALID_HANDLE)
+     return ESRCH;
+ 
+@@ -154,7 +169,9 @@ int pthread_setschedparam(pthread_t thread, int policy, const struct sched_param
+   if (param == nullptr)
+     return EINVAL;
+ 
+-  RexSwitchHandle h = RexSwitchHandleFor(thread);
++  auto& r = registro();
++  std::lock_guard<std::mutex> lock(r.m);
++  RexSwitchHandle h = HandleForLocked(r, thread);
+   if (h == REX_SWITCH_INVALID_HANDLE)
+     return ESRCH;
+ 
+@@ -210,19 +227,54 @@ int pthread_mutexattr_getrobust(const pthread_mutexattr_t* attr, int* robustness
+  */
+ 
+ int RexSwitchPauseThread(pthread_t thread) {
+-  RexSwitchHandle h = RexSwitchHandleFor(thread);
++  auto& r = registro();
++  std::lock_guard<std::mutex> lock(r.m);
++  if (!r.suspension_enabled)
++    return EBUSY;
++  RexSwitchHandle h = HandleForLocked(r, thread);
+   if (h == REX_SWITCH_INVALID_HANDLE)
+     return ESRCH;
+   if (pthread_equal(thread, pthread_self()))
+     return EDEADLK;  /* pausing oneself cannot be undone */
+-  return R_SUCCEEDED(svcSetThreadActivity(h, ThreadActivity_Paused)) ? 0 : EPERM;
++  auto& entry = r.mapa.at(reinterpret_cast<uintptr_t>(thread));
++  if (!entry.paused && R_FAILED(svcSetThreadActivity(h, ThreadActivity_Paused)))
++    return EPERM;
++  entry.paused = true;
++  return 0;
+ }
+ 
+ int RexSwitchResumeThread(pthread_t thread) {
+-  RexSwitchHandle h = RexSwitchHandleFor(thread);
++  auto& r = registro();
++  std::lock_guard<std::mutex> lock(r.m);
++  RexSwitchHandle h = HandleForLocked(r, thread);
+   if (h == REX_SWITCH_INVALID_HANDLE)
+     return ESRCH;
+-  return R_SUCCEEDED(svcSetThreadActivity(h, ThreadActivity_Runnable)) ? 0 : EPERM;
++  auto it = r.mapa.find(reinterpret_cast<uintptr_t>(thread));
++  if (it != r.mapa.end() && !it->second.paused)
++    return 0;
++  if (R_FAILED(svcSetThreadActivity(h, ThreadActivity_Runnable)))
++    return EPERM;
++  if (it != r.mapa.end()) it->second.paused = false;
++  return 0;
++}
++
++bool RexSwitchSetThreadSuspensionEnabled(bool enabled) {
++  auto& r = registro();
++  std::lock_guard<std::mutex> lock(r.m);
++  r.suspension_enabled = enabled;
++  if (enabled)
++    return true;
++  bool success = true;
++  for (auto& [id, entry] : r.mapa) {
++    if (entry.paused) {
++      if (R_SUCCEEDED(svcSetThreadActivity(entry.handle, ThreadActivity_Runnable))) {
++        entry.paused = false;
++      } else {
++        success = false;
++      }
++    }
++  }
++  return success;
+ }
+ 
+ /* --- priority of the current thread ------------------------------------ */
+diff --git a/sdk/src/core/threading_switch.h b/sdk/src/core/threading_switch.h
+index 9560d3d..e3c0866 100644
+--- a/sdk/src/core/threading_switch.h
++++ b/sdk/src/core/threading_switch.h
+@@ -127,6 +127,9 @@ RexSwitchHandle RexSwitchHandleFor(pthread_t thread);
+ 
+ int RexSwitchPauseThread(pthread_t thread);
+ int RexSwitchResumeThread(pthread_t thread);
++// Kernel teardown disables new pauses and releases existing hardware pauses
++// before taking locks owned by guests. A new kernel enables suspension again.
++bool RexSwitchSetThreadSuspensionEnabled(bool enabled);
+ 
+ /*
+  * --- the priority scheme -------------------------------------------------
 diff --git a/sdk/src/input/switch/switch_input_driver.cpp b/sdk/src/input/switch/switch_input_driver.cpp
 index ccf5e2a..ee36923 100644
 --- a/sdk/src/input/switch/switch_input_driver.cpp
@@ -680,8 +1500,768 @@ index 57fd161..0a817d6 100644
      return result;
    }
  
+diff --git a/sdk/src/system/achievement_manager.cpp b/sdk/src/system/achievement_manager.cpp
+index f4e0efd..3fe81be 100644
+--- a/sdk/src/system/achievement_manager.cpp
++++ b/sdk/src/system/achievement_manager.cpp
+@@ -18,6 +18,7 @@
+ #include <utility>
+ 
+ #include <fmt/format.h>
++#include <rex/filesystem/atomic_file.h>
+ #include <rex/logging.h>
+ #include <toml++/toml.hpp>
+ 
+@@ -303,14 +304,25 @@ void AchievementManager::SaveUnlockState() const {
+       REXSYS_WARN("Achievement save: cannot write {}", temporary_path.string());
+       return;
+     }
+-    file << content;
++    file.write(content.data(), static_cast<std::streamsize>(content.size()));
++    file.flush();
++    if (!file) {
++      REXSYS_WARN("Achievement save: write failed for {}", temporary_path.string());
++      file.close();
++      std::filesystem::remove(temporary_path, ec);
++      return;
++    }
++    file.close();
++    if (!file) {
++      REXSYS_WARN("Achievement save: close failed for {}", temporary_path.string());
++      std::filesystem::remove(temporary_path, ec);
++      return;
++    }
+   }
+ 
+-  std::filesystem::remove(save_path, ec);
+-  ec.clear();
+-  std::filesystem::rename(temporary_path, save_path, ec);
++  rex::filesystem::CommitFile(temporary_path, save_path, ec);
+   if (ec) {
+-    REXSYS_WARN("Achievement save: rename failed: {}", ec.message());
++    REXSYS_WARN("Achievement save: commit failed: {}", ec.message());
+   }
+ }
+ 
+diff --git a/sdk/src/system/kernel_state.cpp b/sdk/src/system/kernel_state.cpp
+index 697399c..33ee983 100644
+--- a/sdk/src/system/kernel_state.cpp
++++ b/sdk/src/system/kernel_state.cpp
+@@ -23,6 +23,7 @@
+ #include <rex/runtime.h>
+ #include <rex/stream.h>
+ #include <rex/thread/atomic.h>
++#include <rex/thread.h>
+ #include <rex/string.h>
+ #include <rex/kernel/xboxkrnl/threading.h>
+ #include <rex/system/kernel_module.h>
+@@ -42,6 +43,9 @@
+ #include <rex/system/xsemaphore.h>
+ #include <rex/system/xthread.h>
+ #include <rex/system/xtimer.h>
++#if REX_PLATFORM_SWITCH
++#include "../core/threading_switch.h"
++#endif
+ 
+ namespace rex::system {
+ 
+@@ -121,6 +125,9 @@ KernelState::KernelState(Runtime* emulator)
+   // SetExecutableModule() (e.g. XMA decoder) can link into its thread_list.
+   // SetExecutableModule() will re-initialize it fully with XEX header values.
+   InitializeProcess(&globals->title_process, X_PROCTYPE_USER, 0, 0, 0);
++#if REX_PLATFORM_SWITCH
++  StartThreadReaper();
++#endif
+ }
+ 
+ void KernelState::InitializeProcess(X_KPROCESS* process, uint32_t process_type, uint8_t unk_18,
+@@ -161,14 +168,30 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
+ }
+ 
+ KernelState::~KernelState() {
+-  app_manager_.reset();
+-
++#if REX_PLATFORM_SWITCH
++  terminating_title_.store(true, std::memory_order_release);
++  if (!RexSwitchSetThreadSuspensionEnabled(false)) {
++    REX_FATAL("Unable to resume paused threads for kernel teardown");
++  }
++#endif
+   // Stop the dispatch thread before touching the object table
+   if (dispatch_thread_running_) {
+-    dispatch_thread_running_ = false;
++    {
++      auto global_lock = global_critical_region_.Acquire();
++      dispatch_thread_running_ = false;
++    }
+     dispatch_cond_.notify_all();
++#if !REX_PLATFORM_SWITCH
+     dispatch_thread_->Wait(0, 0, 0, nullptr);
++#endif
+   }
++#if REX_PLATFORM_SWITCH
++  StopThreadReaper();
++  if (dispatch_thread_) {
++    dispatch_thread_->Wait(0, 0, 0, nullptr);
++  }
++#endif
++  app_manager_.reset();
+ 
+   // Unload through UnloadUserModule so the recompiled-DLL teardown runs.
+   // call_entry=false because guest DllMain is unsafe at shutdown.
+@@ -649,14 +672,14 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
+     dispatch_thread_running_ = true;
+     dispatch_thread_ = object_ref<XHostThread>(new XHostThread(this, 128 * 1024, 0, [this]() {
+       auto global_lock = global_critical_region_.AcquireDeferred();
+-      while (dispatch_thread_running_) {
++      for (;;) {
+         global_lock.lock();
+-        if (dispatch_queue_.empty()) {
+-          dispatch_cond_.wait(global_lock);
+-          if (!dispatch_thread_running_) {
+-            global_lock.unlock();
+-            break;
+-          }
++        dispatch_cond_.wait(global_lock, [this] {
++          return !dispatch_thread_running_ || !dispatch_queue_.empty();
++        });
++        if (!dispatch_thread_running_) {
++          global_lock.unlock();
++          break;
+         }
+         auto fn = std::move(dispatch_queue_.front());
+         dispatch_queue_.pop_front();
+@@ -1070,10 +1093,106 @@ void KernelState::OnThreadExit(XThread* thread) {
+   // Must be called on executing thread.
+   assert_true(XThread::GetCurrentThread() == thread);
+ 
++#if REX_PLATFORM_SWITCH
++  RetireThread(thread);
++#endif
+   // TODO(tomc): Do we need this? Same idea as OnThreadExecute
+   (void)thread;
+ }
+ 
++#if REX_PLATFORM_SWITCH
++void KernelState::StartThreadReaper() {
++  RexSwitchSetThreadSuspensionEnabled(true);
++  rex::thread::Thread::CreationParameters params;
++  params.stack_size = 128 * 1024;
++  thread_reaper_ = rex::thread::Thread::Create(params, [this] { ThreadReaperMain(); });
++  if (!thread_reaper_) {
++    REX_FATAL("Failed to create thread reaper");
++  }
++  thread_reaper_->set_name("Thread Reaper");
++  thread_reaper_->set_priority(REX_SWITCH_PRIO_PRESENT);
++}
++
++bool KernelState::TrackThread(XThread* thread) {
++  std::lock_guard<std::mutex> lock(thread_reaper_mutex_);
++  if (thread_reaper_stopping_) {
++    return false;
++  }
++  active_threads_.push_back(retain_object(thread));
++  return true;
++}
++
++void KernelState::RetireThread(XThread* thread) {
++  std::lock_guard<std::mutex> lock(thread_reaper_mutex_);
++  // ponytail: linear lookup among the game's few dozen threads; index only if measured.
++  auto it = std::find_if(active_threads_.begin(), active_threads_.end(),
++                         [thread](const auto& entry) { return entry.get() == thread; });
++  if (it == active_threads_.end()) {
++    REX_FATAL("Exiting thread has no completion owner");
++  }
++  retired_threads_.splice(retired_threads_.end(), active_threads_, it);
++  thread_reaper_cond_.notify_all();
++}
++
++void KernelState::ThreadReaperMain() {
++  for (;;) {
++    object_ref<XThread> thread;
++    {
++      std::unique_lock<std::mutex> lock(thread_reaper_mutex_);
++      thread_reaper_cond_.wait(lock, [this] {
++        return !retired_threads_.empty() || (thread_reaper_stopping_ && active_threads_.empty());
++      });
++      if (retired_threads_.empty()) {
++        return;
++      }
++      thread = std::move(retired_threads_.front());
++      retired_threads_.pop_front();
++    }
++    if (thread->thread() &&
++        rex::thread::Wait(thread->thread(), false) != rex::thread::WaitResult::kSuccess) {
++      REX_FATAL("Failed to join completed guest thread");
++    }
++    // Release the running handle and owner only after the trampoline is gone.
++    thread->ReleaseHandle();
++  }
++}
++
++void KernelState::StopThreadReaper() {
++  if (!thread_reaper_) {
++    return;
++  }
++  terminating_title_.store(true, std::memory_order_release);
++  // A guest may be paused while holding the kernel, reaper, or object locks.
++  // The registry mutex itself cannot be held by a thread paused by this shim.
++  if (!RexSwitchSetThreadSuspensionEnabled(false)) {
++    REX_FATAL("Unable to resume paused threads for kernel teardown");
++  }
++  std::vector<object_ref<XThread>> threads;
++  {
++    std::lock_guard<std::mutex> lock(thread_reaper_mutex_);
++    thread_reaper_stopping_ = true;
++    threads.assign(active_threads_.begin(), active_threads_.end());
++  }
++  for (auto& thread : threads) {
++    if (thread->is_guest_thread() && thread->host_thread_ready()) {
++      thread->thread()->QueueUserCallback([] {});
++      uint32_t previous = 0;
++      while (thread->Resume(&previous) == X_STATUS_SUCCESS && previous > 1) {}
++      // Also release startup/native suspensions, including creation in progress.
++      while (thread->thread()->Resume()) {}
++    }
++  }
++  SignalAllWaitableObjects();
++  thread_reaper_cond_.notify_all();
++  if (rex::thread::Wait(thread_reaper_.get(), false, std::chrono::milliseconds(500)) !=
++      rex::thread::WaitResult::kSuccess) {
++    REXSYS_WARN("Waiting for live threads before destroying kernel state");
++    rex::thread::Wait(thread_reaper_.get(), false);
++  }
++  thread_reaper_.reset();
++}
++#endif
++
+ object_ref<XThread> KernelState::GetThreadByID(uint32_t thread_id) {
+   auto global_lock = global_critical_region_.Acquire();
+   XThread* thread = nullptr;
+diff --git a/sdk/src/system/xam/content_manager.cpp b/sdk/src/system/xam/content_manager.cpp
+index 78826a6..72b842b 100644
+--- a/sdk/src/system/xam/content_manager.cpp
++++ b/sdk/src/system/xam/content_manager.cpp
+@@ -18,6 +18,7 @@
+ 
+ #include <rex/cvar.h>
+ #include <rex/filesystem.h>
++#include <rex/filesystem/atomic_file.h>
+ #include <rex/filesystem/devices/host_path_device.h>
+ #include <rex/filesystem/devices/stfs_container_device.h>
+ #include <rex/logging.h>
+@@ -294,9 +295,22 @@ std::filesystem::path ContentManager::ResolvePackageHeaderPath(const std::string
+          final_name;
+ }
+ 
++static bool RecoverContentInstall(const std::filesystem::path& work,
++                                   const std::filesystem::path& install,
++                                   const std::filesystem::path& header);
++
++static bool RecoverMarketplaceContent(const std::filesystem::path& install) {
++  const auto title = install.parent_path().parent_path();
++  auto header_name = install.filename();
++  header_name += ".header";
++  return RecoverContentInstall(title / ".dlc-install" / install.filename(), install,
++                               title / "Headers" / install.parent_path().filename() / header_name);
++}
++
+ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device_id, uint64_t xuid,
+                                                                  XContentType content_type,
+                                                                  uint32_t title_id) {
++  auto global_lock = global_critical_region_.Acquire();
+   std::vector<XCONTENT_AGGREGATE_DATA> result;
+ 
+   if (title_id == kCurrentlyRunningTitleId) {
+@@ -306,6 +320,26 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
+   // Search path:
+   // content_root/xuid/title_id/type_name/*
+   auto package_root = ResolvePackageRoot(xuid, content_type, title_id);
++  if (content_type == XContentType::kMarketplaceContent) {
++    // Recover even if the source STFS file has disappeared since an interrupted install.
++    const auto work_root = package_root.parent_path() / ".dlc-install";
++    std::error_code ec;
++    const bool pending = std::filesystem::exists(work_root, ec);
++    if (ec) return {};
++    if (pending) {
++      std::filesystem::directory_iterator it(work_root, ec), end;
++      while (!ec && it != end) {
++        const auto work = it->path();
++        it.increment(ec);  // Recovery removes this directory.
++        if (ec || !RecoverContentInstall(work, package_root / work.filename(),
++            ResolvePackageHeaderPath(rex::path_to_utf8(work.filename()), xuid, title_id, content_type))) {
++          REXSYS_ERROR("DLC recovery failed in {}", rex::path_to_utf8(work));
++          return {};
++        }
++      }
++      if (ec) return {};
++    }
++  }
+   auto file_infos = rex::filesystem::ListFiles(package_root);
+   for (const auto& file_info : file_infos) {
+     if (file_info.type != rex::filesystem::FileInfo::Type::kDirectory) {
+@@ -352,12 +386,39 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
+ }
+ 
+ bool ContentManager::ContentExists(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
++  auto global_lock = global_critical_region_.Acquire();
+   auto path = ResolvePackagePath(xuid, data);
++  if (data.content_type == XContentType::kMarketplaceContent && !RecoverMarketplaceContent(path)) {
++    return false;
++  }
+   return std::filesystem::exists(path);
+ }
+ 
++static bool WriteContentFile(const std::filesystem::path& path, std::span<const uint8_t> bytes) {
++  std::error_code ec;
++  std::filesystem::create_directories(path.parent_path(), ec);
++  if (ec) return false;
++  auto file = rex::filesystem::OpenFile(path, "wb");
++  if (!file) return false;
++  bool success = fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size();
++  if (fflush(file) != 0) success = false;
++  if (fclose(file) != 0) success = false;
++  return success;
++}
++
++static X_RESULT WriteContentHeader(const std::filesystem::path& path,
++                                    const XCONTENT_AGGREGATE_DATA& data, uint32_t license_mask) {
++  std::array<uint8_t, sizeof(data) + sizeof(license_mask)> bytes;
++  std::memcpy(bytes.data(), &data, sizeof(data));
++  std::memcpy(bytes.data() + sizeof(data), &license_mask, sizeof(license_mask));
++  const size_t size = sizeof(data) + (license_mask ? sizeof(license_mask) : 0);
++  return WriteContentFile(path, std::span<const uint8_t>(bytes.data(), size))
++             ? X_ERROR_SUCCESS : X_ERROR_ACCESS_DENIED;
++}
++
+ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGATE_DATA data,
+                                                 uint32_t license_mask) {
++  auto global_lock = global_critical_region_.Acquire();
+   if (data.title_id == uint32_t(-1)) {
+     data.title_id = kernel_state_->title_id();
+   }
+@@ -368,28 +429,18 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
+ 
+   auto header_path =
+       ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
+-  auto parent_path = header_path.parent_path();
+-
+-  if (!std::filesystem::exists(parent_path)) {
+-    if (!std::filesystem::create_directories(parent_path)) {
+-      return X_ERROR_ACCESS_DENIED;
+-    }
+-  }
+-
+-  rex::filesystem::CreateEmptyFile(header_path);
+-
+-  auto file = rex::filesystem::OpenFile(header_path, "wb");
+-  if (!file) {
+-    return X_ERROR_FILE_NOT_FOUND;
++  auto temporary = header_path;
++  temporary += ".tmp";
++  auto result = WriteContentHeader(temporary, data, license_mask);
++  std::error_code ec;
++  if (result == X_ERROR_SUCCESS) {
++    rex::filesystem::CommitFile(temporary, header_path, ec);
++    if (ec) result = X_ERROR_ACCESS_DENIED;
+   }
+-  fwrite(&data, 1, sizeof(XCONTENT_AGGREGATE_DATA), file);
+-  if (license_mask != 0) {
+-    fwrite(&license_mask, 1, sizeof(license_mask), file);
++  if (result != X_ERROR_SUCCESS) {
++    std::filesystem::remove(temporary, ec);
+   }
+-  const bool bien = fclose(file) == 0;
+-  REXSYS_INFO("[guardado] cabecera de «{}» {} en {}", data.file_name(),
+-              bien ? "escrita" : "FALLO al cerrarse", rex::path_to_utf8(header_path));
+-  return X_ERROR_SUCCESS;
++  return result;
+ }
+ 
+ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name, uint64_t xuid,
+@@ -427,6 +478,11 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
+ 
+ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_t xuid,
+                                        const XCONTENT_AGGREGATE_DATA& data) {
++  auto install_lock = global_critical_region_.Acquire();
++  if (data.content_type == XContentType::kMarketplaceContent &&
++      !RecoverMarketplaceContent(ResolvePackagePath(xuid, data))) {
++    return X_ERROR_ACCESS_DENIED;
++  }
+   {
+     auto global_lock = global_critical_region_.Acquire();
+     if (open_packages_.count(string::string_key_case(root_name))) {
+@@ -462,6 +518,7 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
+ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t xuid,
+                                      const XCONTENT_AGGREGATE_DATA& data,
+                                      uint32_t& content_license) {
++  auto install_lock = global_critical_region_.Acquire();
+   {
+     auto global_lock = global_critical_region_.Acquire();
+     if (open_packages_.count(string::string_key_case(root_name))) {
+@@ -470,6 +527,10 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t
+   }
+ 
+   auto package_path = ResolvePackagePath(xuid, data);
++  if (data.content_type == XContentType::kMarketplaceContent &&
++      !RecoverMarketplaceContent(package_path)) {
++    return X_ERROR_ACCESS_DENIED;
++  }
+   if (!std::filesystem::exists(package_path)) {
+     REXSYS_WARN("[guardado] abrir «{}»: no existe {}", data.file_name(),
+                 rex::path_to_utf8(package_path));
+@@ -709,7 +770,16 @@ void ContentManager::CloseOpenedFilesFromContent(const std::string_view root_nam
+ 
+ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
+                              const std::filesystem::path& base_path) {
+-  auto dest_path = base_path / rex::to_path(rex::string::utf8_fix_path_separators(entry->path()));
++  auto relative = rex::to_path(rex::string::utf8_fix_path_separators(entry->path()));
++  if (relative.is_absolute() || relative.has_root_name() || relative.has_root_directory()) {
++    return X_ERROR_ACCESS_DENIED;
++  }
++  for (const auto& part : relative) {
++    if (part == ".." || rex::path_to_utf8(part).find(':') != std::string::npos) {
++      return X_ERROR_ACCESS_DENIED;
++    }
++  }
++  auto dest_path = base_path / relative;
+ 
+   if (entry->attributes() & rex::filesystem::kFileAttributeDirectory) {
+     std::error_code ec;
+@@ -723,6 +793,7 @@ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
+   // Ensure parent directory exists
+   std::error_code ec;
+   std::filesystem::create_directories(dest_path.parent_path(), ec);
++  if (ec) return X_ERROR_ACCESS_DENIED;
+ 
+   rex::filesystem::File* in_file = nullptr;
+   X_STATUS status = entry->Open(rex::filesystem::FileAccess::kFileReadData, &in_file);
+@@ -741,62 +812,168 @@ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
+   size_t remaining = entry->size();
+   size_t offset = 0;
+ 
++  bool success = true;
+   while (remaining > 0) {
+     size_t bytes_read = 0;
+     size_t to_read = std::min(remaining, kBufferSize);
+-    in_file->ReadSync(std::span<uint8_t>(buffer.get(), to_read), offset, &bytes_read);
+-    if (bytes_read == 0) {
++    status = in_file->ReadSync(std::span<uint8_t>(buffer.get(), to_read), offset, &bytes_read);
++    if (status != X_STATUS_SUCCESS || bytes_read != to_read ||
++        fwrite(buffer.get(), 1, bytes_read, out_file) != bytes_read) {
++      success = false;
+       break;
+     }
+-    fwrite(buffer.get(), 1, bytes_read, out_file);
+     offset += bytes_read;
+     remaining -= bytes_read;
+   }
+ 
+-  fclose(out_file);
++  if (fflush(out_file) != 0) success = false;
++  if (fclose(out_file) != 0) success = false;
+   in_file->Destroy();
+-  return X_ERROR_SUCCESS;
++  return success ? X_ERROR_SUCCESS : X_ERROR_ACCESS_DENIED;
+ }
+ 
+-X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_path) {
+-  if (!std::filesystem::exists(package_path)) {
+-    return X_ERROR_FILE_NOT_FOUND;
++static bool RecoverContentInstall(const std::filesystem::path& work,
++                                   const std::filesystem::path& install,
++                                   const std::filesystem::path& header) {
++  std::error_code ec;
++  const auto journal = work / "journal";
++  const bool pending = std::filesystem::exists(journal, ec);
++  if (ec) return false;
++  if (pending) {
++    std::array<uint8_t, 6> state{};
++    auto file = rex::filesystem::OpenFile(journal, "rb");
++    if (!file) return false;
++    bool valid = fread(state.data(), 1, state.size(), file) == state.size();
++    valid = valid && std::memcmp(state.data(), "DLC1", 4) == 0 &&
++            (state[4] == '0' || state[4] == '1') && (state[5] == '0' || state[5] == '1');
++    if (ferror(file)) valid = false;
++    if (fclose(file) != 0) valid = false;
++    if (!valid) return false;  // Do not discard unknown or unreadable recovery data.
++    const std::array<std::filesystem::path, 2> targets{header, install};
++    const std::array<std::filesystem::path, 2> backups{work / "old.header", work / "old"};
++    for (size_t i = 0; i < targets.size(); ++i) {
++      const bool backup = std::filesystem::exists(backups[i], ec);
++      if (ec) return false;
++      if (backup || state[4 + i] == '0') {
++        std::filesystem::remove_all(targets[i], ec);
++        if (ec) return false;
++        if (backup) {
++          std::filesystem::rename(backups[i], targets[i], ec);
++          if (ec) return false;  // Keep the journal/remaining backups for the next retry.
++        }
++      } else {
++        const bool original = std::filesystem::exists(targets[i], ec);
++        if (ec || !original) return false;
++      }
++    }
+   }
++  // No journal means publication never started, or both final renames committed.
++  std::filesystem::remove_all(work, ec);
++  return !ec;
++}
+ 
+-  // Mount the STFS package as a virtual filesystem device
+-  auto device = std::make_unique<rex::filesystem::StfsContainerDevice>("", package_path);
+-  if (!device->Initialize()) {
++static X_RESULT PublishContentInstall(const std::filesystem::path& work,
++                                       const std::filesystem::path& install,
++                                       const std::filesystem::path& header) {
++  std::error_code ec;
++  std::filesystem::create_directories(install.parent_path(), ec);
++  if (ec) return X_ERROR_ACCESS_DENIED;
++  std::filesystem::create_directories(header.parent_path(), ec);
++  if (ec) return X_ERROR_ACCESS_DENIED;
++  const std::array<std::filesystem::path, 2> targets{header, install};
++  const std::array<std::filesystem::path, 2> staged{work / "new.header", work / "new"};
++  const std::array<std::filesystem::path, 2> backups{work / "old.header", work / "old"};
++  std::array<uint8_t, 6> state{'D', 'L', 'C', '1', '0', '0'};
++  for (size_t i = 0; i < targets.size(); ++i) {
++    const bool exists = std::filesystem::exists(targets[i], ec);
++    if (ec) return X_ERROR_ACCESS_DENIED;
++    if (exists) {
++      const bool correct_type = i == 0 ? std::filesystem::is_regular_file(targets[i], ec)
++                                       : std::filesystem::is_directory(targets[i], ec);
++      if (ec || !correct_type) return X_ERROR_ACCESS_DENIED;
++      state[4 + i] = '1';
++    }
++  }
++  // Persist rollback information before moving either live component. The two
++  // destinations cannot be atomically renamed together, including on Horizon.
++  if (!WriteContentFile(work / "journal.tmp", state)) {
++    RecoverContentInstall(work, install, header);
+     return X_ERROR_ACCESS_DENIED;
+   }
++  std::filesystem::rename(work / "journal.tmp", work / "journal", ec);
++  if (ec) {
++    RecoverContentInstall(work, install, header);
++    return X_ERROR_ACCESS_DENIED;
++  }
++  auto rollback = [&] {
++    if (!RecoverContentInstall(work, install, header)) {
++      REXSYS_ERROR("DLC rollback pending in {}", rex::path_to_utf8(work));
++    }
++    return X_ERROR_ACCESS_DENIED;
++  };
++  for (size_t i = 0; i < targets.size(); ++i) {
++    if (state[4 + i] == '1') {
++      std::filesystem::rename(targets[i], backups[i], ec);
++      if (ec) return rollback();
++    }
++  }
++  // Publish content first and the completed metadata last. Readers share the
++  // content-manager lock, so they cannot observe a half-published pair.
++  std::filesystem::rename(staged[1], targets[1], ec);
++  if (ec) return rollback();
++  std::filesystem::rename(staged[0], targets[0], ec);
++  if (ec) return rollback();
++  const bool committed = std::filesystem::remove(work / "journal", ec);
++  if (ec || !committed) return rollback();
++  std::filesystem::remove_all(work, ec);  // A stale committed backup is safe to clean next time.
++  return X_ERROR_SUCCESS;
++}
++
++X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_path) {
++  auto global_lock = global_critical_region_.Acquire();
++  std::error_code ec;
++  if (!std::filesystem::is_regular_file(package_path, ec) || ec) {
++    return X_ERROR_FILE_NOT_FOUND;
++  }
+ 
+   // Derive install destination:
+   // root_path_/0000000000000000/{title_id}/00000002/{filename}/
+   auto file_name = rex::path_to_utf8(package_path.filename());
+ 
+-  XCONTENT_AGGREGATE_DATA content_data;
++  XCONTENT_AGGREGATE_DATA content_data{};
+   content_data.device_id = static_cast<uint32_t>(DummyDeviceId::HDD);
+   content_data.content_type = XContentType::kMarketplaceContent;
+   content_data.title_id = kernel_state_->title_id();
+   content_data.xuid = 0;
+   content_data.set_file_name(file_name);
+ 
+-  // Read display name from STFS metadata
+-  auto display_name = device->header().metadata.display_name(rex::system::XLanguage::kEnglish);
+-  if (!display_name.empty()) {
+-    content_data.set_display_name(display_name);
+-  } else {
+-    content_data.set_display_name(rex::path_to_utf16(package_path.filename()));
+-  }
+-
+   auto install_path = ResolvePackagePath(0, content_data);
+-
+-  // Create destination directory
+-  std::error_code ec;
+-  std::filesystem::create_directories(install_path, ec);
+-  if (ec) {
++  const auto header_path = ResolvePackageHeaderPath(content_data.file_name(), 0,
++                                                    content_data.title_id, content_data.content_type);
++  // Standard guest content data uses a current-title sentinel and may name a
++  // different device. The resolved mount path is the identity we must protect.
++  if (std::any_of(open_packages_.cbegin(), open_packages_.cend(), [&](const auto& package) {
++        const auto& mounted = package.second->package_path();
++        if (mounted == install_path) return true;
++        std::error_code compare_ec;
++        if (!std::filesystem::exists(install_path, compare_ec)) return bool(compare_ec);
++        const bool same = std::filesystem::equivalent(mounted, install_path, compare_ec);
++        // Case aliases on FAT/Windows name the same directory. If identity
++        // cannot be checked, leave mounted data alone as well.
++        return same || bool(compare_ec);
++      })) return X_ERROR_BUSY;
++  // Keep staging and backups outside the directory enumerated as marketplace content.
++  const auto work = install_path.parent_path().parent_path() / ".dlc-install" / install_path.filename();
++  if (!RecoverContentInstall(work, install_path, header_path)) {
+     return X_ERROR_ACCESS_DENIED;
+   }
+ 
++  auto device = std::make_unique<rex::filesystem::StfsContainerDevice>("", package_path);
++  if (!device->Initialize()) return X_ERROR_ACCESS_DENIED;
++  auto display_name = device->header().metadata.display_name(rex::system::XLanguage::kEnglish);
++  content_data.set_display_name(display_name.empty() ? rex::path_to_utf16(package_path.filename())
++                                                    : display_name);
++
+   // Extract all files breadth-first
+   auto* root = device->ResolvePath("");
+   if (!root) {
+@@ -814,8 +991,9 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
+       queue.push(child.get());
+     }
+ 
+-    auto result = ExtractEntry(entry, install_path);
++    auto result = ExtractEntry(entry, work / "new");
+     if (result != X_ERROR_SUCCESS) {
++      RecoverContentInstall(work, install_path, header_path);
+       return result;
+     }
+   }
+@@ -828,8 +1006,12 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
+     }
+   }
+ 
+-  // Write .header file
+-  return WriteContentHeaderFile(0, content_data, license_mask);
++  auto result = WriteContentHeader(work / "new.header", content_data, license_mask);
++  if (result != X_ERROR_SUCCESS) {
++    RecoverContentInstall(work, install_path, header_path);
++    return result;
++  }
++  return PublishContentInstall(work, install_path, header_path);
+ }
+ 
+ }  // namespace xam
+diff --git a/sdk/src/system/xobject.cpp b/sdk/src/system/xobject.cpp
+index d358f39..e3bee26 100644
+--- a/sdk/src/system/xobject.cpp
++++ b/sdk/src/system/xobject.cpp
+@@ -9,6 +9,9 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
++#include <chrono>
++#include <utility>
+ #include <vector>
+ 
+ #include <rex/chrono/clock.h>
+@@ -186,6 +189,36 @@ void XObject::SetAttributes(uint32_t obj_attributes_ptr) {
+   }
+ }
+ 
++// Guest waits periodically reach the termination check, including non-alertable
++// timer/auto-reset waits that cannot all be released by signaling their objects.
++template <typename Wait>
++auto WaitWithTitleTermination(std::chrono::milliseconds timeout, Wait wait) {
++#if REX_PLATFORM_SWITCH
++  if (XThread::IsInThread() && XThread::GetCurrentThread()->is_guest_thread()) {
++    using clock = std::chrono::steady_clock;
++    const auto deadline = timeout == std::chrono::milliseconds::max()
++                              ? clock::time_point::max() : clock::now() + timeout;
++    for (;;) {
++      XThread::CheckTitleTermination();
++      const auto remaining = deadline == clock::time_point::max()
++                                 ? std::chrono::milliseconds(50)
++                                 : std::max(std::chrono::milliseconds::zero(),
++                                            std::chrono::ceil<std::chrono::milliseconds>(deadline - clock::now()));
++      auto result = wait(std::min(remaining, std::chrono::milliseconds(50)));
++      XThread::CheckTitleTermination();
++      const auto status = [&] {
++        if constexpr (requires { result.first; }) return result.first;
++        else return result;
++      }();
++      if (status != rex::thread::WaitResult::kTimeout || clock::now() >= deadline) {
++        return result;
++      }
++    }
++  }
++#endif
++  return wait(timeout);
++}
++
+ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
+   if (timeout_ticks > 0) {
+     // Absolute time, based on January 1, 1601.
+@@ -213,7 +246,9 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
+                                 : std::chrono::milliseconds::max();
+ 
+   XThread::CheckTitleTermination();
+-  auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
++  auto result = WaitWithTitleTermination(timeout_ms, [&](auto slice) {
++    return rex::thread::Wait(wait_handle, alertable ? true : false, slice);
++  });
+   XThread::CheckTitleTermination();
+   switch (result) {
+     case rex::thread::WaitResult::kSuccess:
+@@ -239,9 +274,14 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
+                                       TimeoutTicksToMs(*opt_timeout)))
+                                 : std::chrono::milliseconds::max();
+ 
+-  auto result =
+-      rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
+-                                 alertable ? true : false, timeout_ms);
++  bool first_wait = true;
++  auto result = WaitWithTitleTermination(timeout_ms, [&](auto slice) {
++    if (std::exchange(first_wait, false)) {
++      return rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
++                                         alertable ? true : false, slice);
++    }
++    return rex::thread::Wait(wait_object->GetWaitHandle(), alertable ? true : false, slice);
++  });
+   switch (result) {
+     case rex::thread::WaitResult::kSuccess:
+       wait_object->WaitCallback();
+@@ -274,8 +314,9 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+ 
+   XThread::CheckTitleTermination();
+   if (wait_type) {
+-    auto result =
+-        rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
++    auto result = WaitWithTitleTermination(timeout_ms, [&](auto slice) {
++      return rex::thread::WaitAny(wait_handles, alertable ? true : false, slice);
++    });
+     XThread::CheckTitleTermination();
+     switch (result.first) {
+       case rex::thread::WaitResult::kSuccess:
+@@ -295,8 +336,9 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+         return X_STATUS_UNSUCCESSFUL;
+     }
+   } else {
+-    auto result =
+-        rex::thread::WaitAll(std::move(wait_handles), alertable ? true : false, timeout_ms);
++    auto result = WaitWithTitleTermination(timeout_ms, [&](auto slice) {
++      return rex::thread::WaitAll(wait_handles, alertable ? true : false, slice);
++    });
+     XThread::CheckTitleTermination();
+     switch (result) {
+       case rex::thread::WaitResult::kSuccess:
 diff --git a/sdk/src/system/xthread.cpp b/sdk/src/system/xthread.cpp
-index af02bc0..da5a126 100644
+index af02bc0..b2de00e 100644
 --- a/sdk/src/system/xthread.cpp
 +++ b/sdk/src/system/xthread.cpp
 @@ -43,6 +43,13 @@
@@ -698,7 +2278,66 @@ index af02bc0..da5a126 100644
  REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
                      "Ignores game-specified thread priorities");
  
-@@ -464,7 +471,7 @@ X_STATUS XThread::Create() {
+@@ -262,6 +269,7 @@ void XThread::InitializeGuestObject() {
+         kernel::xboxkrnl::xeKeKfAcquireSpinLock(ctx, &target_process->thread_list_spinlock);
+     util::XeInsertTailList(&target_process->thread_list, &guest_thread->process_threads, memory());
+     target_process->thread_count = target_process->thread_count + 1;
++    process_linked_ = true;
+     kernel::xboxkrnl::xeKeKfReleaseSpinLock(ctx, &target_process->thread_list_spinlock, old_irql);
+   } else {
+     guest_thread->process_type = X_PROCTYPE_USER;
+@@ -332,6 +340,20 @@ void XThread::FreeStack() {
+   }
+ }
+ 
++void XThread::UnlinkFromProcess() {
++  if (!process_linked_) {
++    return;
++  }
++  auto thread = guest_object<X_KTHREAD>();
++  auto* ctx = thread_state_->context();
++  auto kprocess = memory()->TranslateVirtual<X_KPROCESS*>(thread->process);
++  auto old_irql = kernel::xboxkrnl::xeKeKfAcquireSpinLock(ctx, &kprocess->thread_list_spinlock);
++  util::XeRemoveEntryList(&thread->process_threads, memory());
++  kprocess->thread_count = kprocess->thread_count - 1;
++  process_linked_ = false;
++  kernel::xboxkrnl::xeKeKfReleaseSpinLock(ctx, &kprocess->thread_list_spinlock, old_irql);
++}
++
+ #if REX_PLATFORM_SWITCH
+ namespace {
+ 
+@@ -361,6 +383,19 @@ int SwitchPriorityFor(bool guest_thread, std::string_view name) {
+ #endif
+ 
+ X_STATUS XThread::Create() {
++#if REX_PLATFORM_SWITCH
++  // No caller receives the initial handle on failure.
++  struct CreationCleanup {
++    XThread* thread;
++    bool success = false;
++    ~CreationCleanup() {
++      if (!success) {
++        thread->UnlinkFromProcess();
++        thread->ReleaseHandle();
++      }
++    }
++  } cleanup{this};
++#endif
+   // Thread kernel object.
+   if (!CreateNative<X_KTHREAD>()) {
+     REXSYS_WARN("Unable to allocate thread object");
+@@ -460,11 +495,16 @@ X_STATUS XThread::Create() {
+ 
+   pcr->prcb_data.dpc_active = 0;
+ 
+-  // Always retain when starting - the thread owns itself until exited.
++  // Keep the primary handle valid until the host thread has actually completed.
++#if REX_PLATFORM_SWITCH
++  if (!kernel_state_->TrackThread(this)) {
++    return X_STATUS_UNSUCCESSFUL;
++  }
++#endif
    RetainHandle();
  
    rex::thread::Thread::CreationParameters params;
@@ -707,6 +2346,283 @@ index af02bc0..da5a126 100644
    params.create_suspended = true;
    thread_ = rex::thread::Thread::Create(params, [this]() {
      rex::initialize_seh_thread();
+@@ -485,7 +525,14 @@ X_STATUS XThread::Create() {
+     // Execute user code.
+     current_xthread_tls_ = this;
+     running_ = true;
++#if REX_PLATFORM_SWITCH
++    CheckTitleTermination();
++#endif
+     Execute();
++#if REX_PLATFORM_SWITCH
++    // Also retire threads whose Execute returned early (for example no dispatcher).
++    Exit(0);
++#else
+     running_ = false;
+     current_xthread_tls_ = nullptr;
+ 
+@@ -494,11 +541,17 @@ X_STATUS XThread::Create() {
+ 
+     // Release the self-reference to the thread.
+     ReleaseHandle();
++#endif
+   });
+ 
+   if (!thread_) {
+     // TODO(benvanik): translate error?
+     REXSYS_ERROR("CreateThread failed");
++#if REX_PLATFORM_SWITCH
++    kernel_state_->RetireThread(this);
++#else
++    ReleaseHandle();
++#endif
+     return X_STATUS_NO_MEMORY;
+   }
+ 
+@@ -521,7 +574,15 @@ X_STATUS XThread::Create() {
+ 
+   // TODO(tomc): do we need thread notifications (related to processor thread management)?
+ 
+-  if ((creation_params_.creation_flags & X_CREATE_SUSPENDED) == 0) {
++#if REX_PLATFORM_SWITCH
++  host_thread_ready_.store(true, std::memory_order_release);
++  cleanup.success = true;
++#endif
++  if ((creation_params_.creation_flags & X_CREATE_SUSPENDED) == 0
++#if REX_PLATFORM_SWITCH
++      || kernel_state_->is_terminating_title()
++#endif
++  ) {
+     // Start the thread now that we're all setup.
+     thread_->Resume();
+   }
+@@ -532,10 +593,12 @@ X_STATUS XThread::Create() {
+ X_STATUS XThread::Exit(int exit_code) {
+   // This may only be called on the thread itself.
+   assert_true(XThread::GetCurrentThread() == this);
++#if !REX_PLATFORM_SWITCH
+   // Keep the object alive until Thread::Exit() transitions the host thread
+   // into pthread_exit(). Otherwise ReleaseHandle() below may delete `this`
+   // while this method is still running.
+   auto self = retain_object(this);
++#endif
+ 
+   // Mark as terminated before running down APCs.
+   auto kthread = guest_object<X_KTHREAD>();
+@@ -550,15 +613,7 @@ X_STATUS XThread::Exit(int exit_code) {
+   thread->exit_status = exit_code;
+ 
+   // Unlink thread from process thread list.
+-  uint32_t process_guest = thread->process;
+-  if (process_guest) {
+-    auto* ctx = thread_state_->context();
+-    auto kprocess = memory()->TranslateVirtual<X_KPROCESS*>(process_guest);
+-    auto old_irql = kernel::xboxkrnl::xeKeKfAcquireSpinLock(ctx, &kprocess->thread_list_spinlock);
+-    util::XeRemoveEntryList(&thread->process_threads, memory());
+-    kprocess->thread_count = kprocess->thread_count - 1;
+-    kernel::xboxkrnl::xeKeKfReleaseSpinLock(ctx, &kprocess->thread_list_spinlock, old_irql);
+-  }
++  UnlinkFromProcess();
+ 
+   kernel_state_->OnThreadExit(this);
+ 
+@@ -575,7 +630,9 @@ X_STATUS XThread::Exit(int exit_code) {
+   PROFILE_THREAD_EXIT();
+ 
+   running_ = false;
++#if !REX_PLATFORM_SWITCH
+   ReleaseHandle();
++#endif
+ 
+   // NOTE: this does not return!
+   rex::thread::Thread::Exit(exit_code);
+@@ -583,6 +640,12 @@ X_STATUS XThread::Exit(int exit_code) {
+ }
+ 
+ X_STATUS XThread::Terminate(int exit_code) {
++#if REX_PLATFORM_SWITCH
++  if (!IsInThread(this)) {
++    return X_STATUS_NOT_SUPPORTED;
++  }
++  return Exit(exit_code);
++#else
+   // TODO(benvanik): inform the profiler that this thread is exiting.
+ 
+   // Set exit code.
+@@ -607,6 +670,7 @@ X_STATUS XThread::Terminate(int exit_code) {
+   }
+ 
+   return X_STATUS_SUCCESS;
++#endif
+ }
+ 
+ void XThread::Execute() {
+@@ -971,6 +1035,9 @@ bool XThread::SetTLSValue(uint32_t slot, uint32_t value) {
+ }
+ 
+ uint32_t XThread::suspend_count() {
++#if REX_PLATFORM_SWITCH
++  std::lock_guard<std::mutex> lock(suspend_mutex_);
++#endif
+   return guest_object<X_KTHREAD>()->suspend_count;
+ }
+ 
+@@ -978,7 +1045,25 @@ X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
+   auto guest_thread = guest_object<X_KTHREAD>();
+   uint32_t unused_host_suspend_count = 0;
+ 
+-#if REX_PLATFORM_WIN32
++#if REX_PLATFORM_SWITCH
++  std::lock_guard<std::mutex> lock(suspend_mutex_);
++  uint8_t previous = guest_thread->suspend_count;
++  if (out_suspend_count) {
++    *out_suspend_count = previous;
++  }
++  if (previous == 0) {
++    suspend_cv_.notify_all();
++    return X_STATUS_SUCCESS;
++  }
++  // Each external suspend increments the host count. Resume each increment,
++  // including nested ones; SelfSuspend contributes only to the guest count.
++  if (!thread_->Resume(&unused_host_suspend_count) && unused_host_suspend_count != 0) {
++    return X_STATUS_UNSUCCESSFUL;
++  }
++  guest_thread->suspend_count = previous - 1;
++  suspend_cv_.notify_all();
++  return X_STATUS_SUCCESS;
++#elif REX_PLATFORM_WIN32
+   uint8_t previous_suspend_count =
+       reinterpret_cast<std::atomic_uint8_t*>(&guest_thread->suspend_count)->fetch_sub(1);
+   if (out_suspend_count) {
+@@ -1018,6 +1103,27 @@ X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
+ }
+ 
+ X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
++#if REX_PLATFORM_SWITCH
++  if (IsInThread(this)) {
++    auto previous = SelfSuspend();
++    if (out_suspend_count) {
++      *out_suspend_count = previous;
++    }
++    return X_STATUS_SUCCESS;
++  }
++  std::lock_guard<std::mutex> lock(suspend_mutex_);
++  auto guest_thread = guest_object<X_KTHREAD>();
++  uint8_t previous = guest_thread->suspend_count;
++  if (out_suspend_count) {
++    *out_suspend_count = previous;
++  }
++  uint32_t host_previous = 0;
++  if (previous == UINT8_MAX || !thread_->Suspend(&host_previous)) {
++    return X_STATUS_UNSUCCESSFUL;
++  }
++  guest_thread->suspend_count = previous + 1;
++  return X_STATUS_SUCCESS;
++#else
+   auto guest_thread = guest_object<X_KTHREAD>();
+   uint8_t previous_suspend_count =
+       reinterpret_cast<std::atomic_uint8_t*>(&guest_thread->suspend_count)->fetch_add(1);
+@@ -1031,6 +1137,7 @@ X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
+     return X_STATUS_SUCCESS;
+   }
+   return thread_->Suspend(&unused_host_suspend_count) ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
++#endif
+ }
+ 
+ #if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+@@ -1039,7 +1146,19 @@ uint32_t XThread::SelfSuspend() {
+   std::unique_lock<std::mutex> lock(suspend_mutex_);
+   uint32_t previous = guest_thread->suspend_count;
+   guest_thread->suspend_count++;
+-  suspend_cv_.wait(lock, [guest_thread]() { return guest_thread->suspend_count == 0; });
++  suspend_cv_.wait(lock, [this, guest_thread]() {
++    return guest_thread->suspend_count == 0
++#if REX_PLATFORM_SWITCH
++           || kernel_state_->is_terminating_title()
++#endif
++        ;
++  });
++#if REX_PLATFORM_SWITCH
++  if (kernel_state_->is_terminating_title()) {
++    lock.unlock();
++    Exit(0);
++  }
++#endif
+   return previous;
+ }
+ #endif
+@@ -1078,7 +1197,17 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
+         rex::thread::MaybeYield();
+       }
+     } else {
++#if REX_PLATFORM_SWITCH
++      const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
++      while (std::chrono::steady_clock::now() < deadline) {
++        CheckTitleTermination();
++        const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
++        rex::thread::Sleep(std::clamp(remaining, std::chrono::milliseconds::zero(),
++                                      std::chrono::milliseconds(50)));
++      }
++#else
+       rex::thread::Sleep(std::chrono::milliseconds(timeout_ms));
++#endif
+     }
+     CheckTitleTermination();
+   }
+@@ -1421,6 +1550,7 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
+   thread->stack_limit_ = state.stack_limit;
+   thread->stack_alloc_base_ = state.stack_alloc_base;
+   thread->stack_alloc_size_ = state.stack_alloc_size;
++  thread->process_linked_ = thread->guest_object<X_KTHREAD>()->process != 0;
+ 
+   // Register now that we know our thread ID.
+   kernel_state->RegisterThread(thread);
+@@ -1433,7 +1563,14 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
+     auto context = thread->thread_state_->context();
+     LoadContext(context, state);
+ 
+-    // Always retain when starting - the thread owns itself until exited.
++    // Keep restored native threads under the same completion owner.
++#if REX_PLATFORM_SWITCH
++    if (!kernel_state->TrackThread(thread)) {
++      thread->ReleaseHandle();
++      thread->Release();
++      return nullptr;
++    }
++#endif
+     thread->RetainHandle();
+ 
+     rex::thread::Thread::CreationParameters params;
+@@ -1467,13 +1604,29 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
+       REXSYS_ERROR("Thread restore not implemented");
+       (void)state;
+ 
++#if REX_PLATFORM_SWITCH
++      thread->Exit(0);
++#else
+       current_xthread_tls_ = nullptr;
+ 
+       PROFILE_THREAD_EXIT();
+ 
+       // Release the self-reference to the thread.
+       thread->ReleaseHandle();
++#endif
+     });
++#if REX_PLATFORM_SWITCH
++    if (!thread->thread_) {
++      kernel_state->RetireThread(thread);
++      thread->ReleaseHandle();
++      thread->Release();
++      return nullptr;
++    }
++    thread->host_thread_ready_.store(true, std::memory_order_release);
++    if (kernel_state->is_terminating_title()) {
++      thread->thread_->Resume();
++    }
++#endif
+     assert_not_null(thread->thread_);
+ 
+     // NOTE(tomc): if this is kept and processor notification dispatch is implemented,
 diff --git a/sdk/src/ui/switch_hotspot_policy.h b/sdk/src/ui/switch_hotspot_policy.h
 new file mode 100644
 index 0000000..6e2ade8

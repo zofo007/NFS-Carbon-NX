@@ -10,7 +10,12 @@ param(
 #   release/SHA256SUMS.txt
 . "$PSScriptRoot/environment.ps1"
 $out = "$Workspace/release"
-if (Test-Path $out) { Remove-Item -Recurse -Force $out }
+$out = [IO.Path]::GetFullPath($out)
+if ($out -ne (Join-Path ([IO.Path]::GetFullPath($Workspace)) 'release')) { throw 'Unexpected release output path.' }
+if (Test-Path -LiteralPath $out) {
+    if ((Get-Item -LiteralPath $out).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing linked release output.' }
+    Remove-Item -LiteralPath $out -Recurse -Force
+}
 New-Item -ItemType Directory -Force "$out/sd/switch/nfscarbon", "$out/src" | Out-Null
 
 if (-not $SourceOnly) {
@@ -32,10 +37,10 @@ if (-not $SourceOnly) {
 $include = @('README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'CHANGELOG.md', 'dependencies.json', '.gitignore', '.gitattributes', '.editorconfig', 'CONTRIBUTING.md', 'docs/README.md',
     'docs/CONFIG.md', 'docs/HOW_IT_WORKS.md', 'docs/PERFORMANCE.md', 'docs/banner.svg',
     'patches', 'scripts', 'tests', 'config', '.github')
-# Public versions of two pages that are working notes in the development tree.
+# Public build and known-issues pages are already in the repository.
 New-Item -ItemType Directory -Force "$out/src/docs" | Out-Null
-Copy-Item "$Workspace/docs/public/BUILD.md" "$out/src/docs/BUILD.md"
-Copy-Item "$Workspace/docs/public/KNOWN_ISSUES.md" "$out/src/docs/KNOWN_ISSUES.md"
+Copy-Item "$Workspace/docs/BUILD.md" "$out/src/docs/BUILD.md"
+Copy-Item "$Workspace/docs/KNOWN_ISSUES.md" "$out/src/docs/KNOWN_ISSUES.md"
 foreach ($item in $include) {
     $src = "$Workspace/$item"
     if (-not (Test-Path -LiteralPath $src)) { continue }
@@ -49,7 +54,11 @@ if (Test-Path $svg) { $t = (Get-Content $svg -Raw -Encoding utf8) -replace '(fil
 Remove-Item -Force -ErrorAction SilentlyContinue "$out/src/scripts/setup-claude-lane.ps1", "$out/src/scripts/allow-claude-push.ps1", "$out/src/scripts/push-private.ps1", "$out/src/scripts/make-public-branch.ps1"
 # The committed .gitignore, without local additions.
 git show HEAD:.gitignore | Set-Content "$out/src/.gitignore" -Encoding ascii
-Get-ChildItem -Recurse -Directory -Filter __pycache__ "$out/src" | Remove-Item -Recurse -Force
+Get-ChildItem -Recurse -Directory -Filter __pycache__ "$out/src" | ForEach-Object {
+    $cache = [IO.Path]::GetFullPath($_.FullName)
+    if (-not $cache.StartsWith("$out\src\", [StringComparison]::OrdinalIgnoreCase)) { throw 'Unexpected cache path.' }
+    Remove-Item -LiteralPath $cache -Recurse -Force
+}
 
 # Refuse to continue if anything proprietary or private slipped in.
 $forbidden = '\.(xex|xexp|iso|wmv|bin|dll|exe|elf|nacp|log)$|game-data|HW-Test|USERNOTES|hardware-[0-9a-f]{12}|AGENTS\.md|CLAUDE|continue-prompt'

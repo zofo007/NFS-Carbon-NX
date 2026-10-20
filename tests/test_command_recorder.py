@@ -36,7 +36,7 @@ class CommandRecorderBindingTests(unittest.TestCase):
                 found.add((name, match.group(0)))
         self.assertEqual(found, allowed)
         textures = read("textures.cpp")
-        upload = function(textures, "void Renderer::UploadTexture(")
+        upload = function(textures, "bool Renderer::UploadTexture(")
         self.assertIn("VkCommandBuffer cb = frame().upload_cb;", upload)
         null_clear = function(textures, "void Renderer::CreateNullTextures(")
         self.assertIn("Frame& f = frames_[0];", null_clear)

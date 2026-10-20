@@ -125,6 +125,10 @@ extracted into the content folder and the game finds them through its normal con
 `[dlc] N package(s) installed`. DLC can be loaded this way; tell us which packs you tried and what showed up in the
 game, so the list of working packs can grow.
 
+Removing a source package from `dlc/` does **not** uninstall its extracted copy in `user/`.
+When changing packs, back up `user/` and follow the cleanup steps below to avoid mixing old and new installations.
+Beta.8 checks and stages replacement installs, but does not add automatic DLC removal or verify large pack sets.
+
 **DLC may have a limit that is not verified yet.** One run with many packs (36 extracted DLC folders, some of them
 leftovers of packages that had been removed or installed twice) crashed while loading the profiles. After the extracted
 folders were deleted and re-created from the same `dlc/` files, the game loaded again. We do not know yet whether the

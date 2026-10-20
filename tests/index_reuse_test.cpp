@@ -28,7 +28,10 @@ struct Fixture {
   struct UploadAllocation { uint8_t* ptr; VkBuffer buffer; VkDeviceSize offset; uint32_t chunk; };
   std::deque<std::vector<uint8_t>> storage;
   uint64_t frame_number_ = 1;
-  bool index_cache_enabled = false, arena_accept = false;
+  bool index_cache_enabled = false, arena_accept = false, fail_upload = false;
+  enum SkipReason { kSkipUpload };
+  unsigned skipped_uploads = 0;
+  void Skip(SkipReason) { ++skipped_uploads; }
   bool FLAGS_carbon_gpu_index_cache_storage_() const { return index_cache_enabled; }
   unsigned arena_fetches = 0;
   VkBuffer arena_buffer_ = reinterpret_cast<VkBuffer>(uintptr_t(0xCAFE));
@@ -48,6 +51,7 @@ struct Fixture {
   IndexUploadCache index_upload_cache_;
 #endif
   UploadAllocation Upload(VkDeviceSize n, VkDeviceSize) {
+    if (fail_upload) return {nullptr, VK_NULL_HANDLE, 0, 0};
     storage.emplace_back(n, 0xA5);
     return {storage.back().data(), reinterpret_cast<VkBuffer>(storage.size()), 0, uint32_t(storage.size())};
   }
@@ -57,6 +61,8 @@ struct Fixture {
   Result Draw(const uint8_t* guest_indices, uint32_t count, bool is16, xenos::Endian endian,
               bool restart = false, uint32_t reset_index = 0xFFFFFF, uint32_t index_offset_v = 0,
               uint32_t address = 0x123400) {
+    Result result{};
+    const auto draw = [&]() {
     struct { bool indexed; xenos::IndexFormat index_format; xenos::Endian index_endian; uint32_t index_base; }
       info{true, is16 ? xenos::IndexFormat::kInt16 : xenos::IndexFormat::kInt32, endian, address};
     enum class Expand { kNone };
@@ -70,12 +76,26 @@ struct Fixture {
     struct { bool known = false; uint32_t min_index = 0, max_index = 0; } vertex_range;
 #include "draw.inc"
     CHECK(host_indexed && indices_done);
-    return {index_buffer, index_offset, host_count, vertex_range.min_index,
-            vertex_range.max_index, vertex_range.known, index_type};
+    result = {index_buffer, index_offset, host_count, vertex_range.min_index,
+              vertex_range.max_index, vertex_range.known, index_type};
+    };
+    draw();
+    return result;
   }
 };
 
 int main() {
+  {
+    Fixture failing;
+    uint16_t input[] = {5, 2, 9};
+    failing.fail_upload = true;
+    auto skipped = failing.Draw(reinterpret_cast<uint8_t*>(input), 3, true, xenos::Endian::kNone);
+    CHECK(!skipped.buffer && !skipped.known && failing.skipped_uploads == 1 && failing.storage.empty());
+    failing.fail_upload = false;
+    auto retried = failing.Draw(reinterpret_cast<uint8_t*>(input), 3, true, xenos::Endian::kNone);
+    CHECK(retried.buffer && retried.lo == 2 && retried.hi == 9 && failing.storage.size() == 1);
+    std::puts("PASS actual Draw skips failed index upload and retries without caching invalid data");
+  }
   {
     Fixture arena;
     uint16_t input[] = {5, 2, 9};

@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import re
 import unittest
 
@@ -13,12 +14,20 @@ class RingWaitTests(unittest.TestCase):
         generated = CARBON / "generated/default"
         if not generated.is_dir():
             self.skipTest("Generated local guest sources unavailable")
-        for bucket, address in ((89, "826DBE14"), (107, "826DBBF8")):
-            caller = (generated / f"nfscarbon_recomp.{bucket}.cpp").read_text(encoding="utf-8")
+        assignments = {int(address, 16): bucket for address, bucket in
+                       json.loads((generated / "codegen.partition.json").read_text())["assignments"].items()}
+
+        def guest_source(address):
+            # Locate the containing function in the current codegen partition.
+            start = max(start for start in assignments if start <= int(address, 16))
+            return (generated / f"nfscarbon_recomp.{assignments[start]}.cpp").read_text(encoding="utf-8")
+
+        for address in ("826DBE14", "826DBBF8"):
+            caller = guest_source(address)
             self.assertIn(f"0x{address}", hook)
             self.assertIn(f"ctx.lr = 0x{address};\n\tsub_826E0250(ctx, base);", caller)
             self.assertIn("+ 10768)", caller)
-        original = (generated / "nfscarbon_recomp.91.cpp").read_text(encoding="utf-8")
+        original = guest_source("826E0250")
         self.assertIn("r29.u32 + 10813", original)  # ctx.r29, or a local with non_volatile_as_local
         pointer_read = hook.index("REX_LOAD_U32(REX_LOAD_U32(device + kDeviceRptrPointer))")
         self.assertLess(hook.index("const uint32_t before ="), pointer_read)

@@ -2160,7 +2160,7 @@ index d413fc5..3639e9f 100644
      }
      EndRendering();
 diff --git a/renderer/src/renderer.cpp b/renderer/src/renderer.cpp
-index 22736d5..a3c6d87 100644
+index 22736d5..2049779 100644
 --- a/renderer/src/renderer.cpp
 +++ b/renderer/src/renderer.cpp
 @@ -3,6 +3,7 @@
@@ -2613,7 +2613,16 @@ index 22736d5..a3c6d87 100644
      // Descriptor set 0 over this chunk.
      const auto& dfn = vulkan_device_->functions();
      VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-@@ -752,10 +933,25 @@ bool Renderer::AcquireChunk() {
+@@ -733,6 +914,8 @@ bool Renderer::AcquireChunk() {
+     dai.descriptorSetCount = 1;
+     dai.pSetLayouts = &set0_layout_;
+     if (dfn.vkAllocateDescriptorSets(vk_device_, &dai, &chunk.set0) != VK_SUCCESS) {
++      vmaDestroyBuffer(allocator_, chunk.buffer, chunk.allocation);
++      REXGPU_ERROR("[carbon-gpu] failed to allocate upload descriptors");
+       return false;
+     }
+     VkDescriptorBufferInfo bufs[5] = {{chunk.buffer, 0, 4096},
+@@ -752,36 +935,108 @@ bool Renderer::AcquireChunk() {
        w[i].pBufferInfo = &bufs[i];
      }
      dfn.vkUpdateDescriptorSets(vk_device_, 5, w, 0, nullptr);
@@ -2639,7 +2648,38 @@ index 22736d5..a3c6d87 100644
    current_chunk_ = index;
    chunk_offset_ = 0;
    return true;
-@@ -778,10 +974,58 @@ Renderer::UploadAllocation Renderer::Upload(VkDeviceSize size, VkDeviceSize alig
+ }
+ 
+-void Renderer::ReserveUpload(VkDeviceSize bytes) {
+-  if (current_chunk_ == UINT32_MAX || chunk_offset_ + bytes + 1024 > chunk_size_) {
+-    AcquireChunk();
++bool Renderer::ReserveUpload(VkDeviceSize bytes) {
++  if (bytes > chunk_size_) {
++    return false;
++  }
++  if (current_chunk_ == UINT32_MAX || bytes > chunk_size_ - chunk_offset_) {
++    return AcquireChunk();
+   }
++  return true;
+ }
+ 
+ Renderer::UploadAllocation Renderer::Upload(VkDeviceSize size, VkDeviceSize alignment) {
+-  if (current_chunk_ == UINT32_MAX) {
+-    AcquireChunk();
++  if (size > chunk_size_ || !alignment || (alignment & (alignment - 1))) {
++    return {};
++  }
++  if (current_chunk_ == UINT32_MAX && !AcquireChunk()) {
++    return {};
+   }
+   VkDeviceSize offset = AlignUp64(chunk_offset_, alignment);
+-  if (offset + size > chunk_size_) {
+-    AcquireChunk();
++  if (offset > chunk_size_ || size > chunk_size_ - offset) {
++    if (!AcquireChunk()) {
++      return {};
++    }
+     offset = 0;
    }
    UploadChunk& c = upload_chunks_[current_chunk_];
    chunk_offset_ = offset + size;
@@ -2698,7 +2738,7 @@ index 22736d5..a3c6d87 100644
  VkDescriptorSet Renderer::AllocateDescriptorSet(VkDescriptorSetLayout layout) {
    const auto& dfn = vulkan_device_->functions();
    VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-@@ -811,8 +1055,14 @@ void Renderer::TransitionImage(VkCommandBuffer cb, VkImage image, VkImageAspectF
+@@ -811,8 +1066,14 @@ void Renderer::TransitionImage(VkCommandBuffer cb, VkImage image, VkImageAspectF
    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
    b.image = image;
    b.subresourceRange = {aspect, 0, levels, 0, layers};
@@ -2715,7 +2755,7 @@ index 22736d5..a3c6d87 100644
    layout = new_layout;
  }
  
-@@ -824,11 +1074,13 @@ void Renderer::EndRendering() {
+@@ -824,11 +1085,13 @@ void Renderer::EndRendering() {
    if (!rendering_) {
      return;
    }
@@ -2730,7 +2770,7 @@ index 22736d5..a3c6d87 100644
    info.ps_hash = pass_ps_hash_;
    info.vs_hash = pass_vs_hash_;
    info.depth = current_pass_.depth != nullptr;
-@@ -850,7 +1102,7 @@ void Renderer::GpuStamp(GpuTag tag, const StampInfo* info) {
+@@ -850,7 +1113,7 @@ void Renderer::GpuStamp(GpuTag tag, const StampInfo* info) {
    if (!pool || n >= kMaxStamps) {
      return;
    }
@@ -2739,7 +2779,7 @@ index 22736d5..a3c6d87 100644
    ts_tag_[frame_index_][n] = tag;
    ts_info_[frame_index_][n] = info ? *info : StampInfo();
    ++n;
-@@ -887,6 +1139,7 @@ void Renderer::ReadGpuStamps(uint32_t slot) {
+@@ -887,6 +1150,7 @@ void Renderer::ReadGpuStamps(uint32_t slot) {
          a.info = si;
          a.seconds += dt;
          a.draws += si.draws;
@@ -2747,7 +2787,7 @@ index 22736d5..a3c6d87 100644
          ++a.count;
        }
      }
-@@ -896,7 +1149,6 @@ void Renderer::ReadGpuStamps(uint32_t slot) {
+@@ -896,7 +1160,6 @@ void Renderer::ReadGpuStamps(uint32_t slot) {
  
  bool Renderer::BeginRendering(const PassState& pass) {
    cmd_ = CmdCache();
@@ -2755,7 +2795,7 @@ index 22736d5..a3c6d87 100644
    VkCommandBuffer cb = frame().cb;
    VkRenderingAttachmentInfo color[4] = {};
    for (uint32_t i = 0; i < 4; ++i) {
-@@ -941,7 +1193,7 @@ bool Renderer::BeginRendering(const PassState& pass) {
+@@ -941,7 +1204,7 @@ bool Renderer::BeginRendering(const PassState& pass) {
    ri.pColorAttachments = color;
    ri.pDepthAttachment = pass.depth ? &depth : nullptr;
    ri.pStencilAttachment = pass.depth ? &depth : nullptr;
@@ -2764,7 +2804,7 @@ index 22736d5..a3c6d87 100644
    rendering_ = true;
    current_pass_ = pass;
    if (tracing_) {
-@@ -982,11 +1234,16 @@ Shader* Renderer::LoadShader(xenos::ShaderType type, const uint32_t* guest_be,
+@@ -982,11 +1245,16 @@ Shader* Renderer::LoadShader(xenos::ShaderType type, const uint32_t* guest_be,
      shader->ucode[i] = ByteSwap32(guest_be[i]);
    }
    shader->translated = TranslateShader(type, shader->ucode.data(), dword_count);
@@ -2781,7 +2821,7 @@ index 22736d5..a3c6d87 100644
    }
    Shader* raw = shader.get();
    shaders_.emplace(hash, std::move(shader));
-@@ -1079,12 +1336,12 @@ void Renderer::RecordWarmPipeline(const PipelineKey& key) {
+@@ -1079,12 +1347,12 @@ void Renderer::RecordWarmPipeline(const PipelineKey& key) {
    pipeline_cache_dirty_ = true;
  }
  
@@ -2796,7 +2836,7 @@ index 22736d5..a3c6d87 100644
      }
      warm_dirty_ = false;
      records = warm_records_;
-@@ -1096,12 +1353,25 @@ void Renderer::SaveWarmList() {
+@@ -1096,12 +1364,25 @@ void Renderer::SaveWarmList() {
      std::ofstream out(temp, std::ios::binary | std::ios::trunc);
      out.write(reinterpret_cast<const char*>(header), sizeof(header));
      out.write(reinterpret_cast<const char*>(records.data()), std::streamsize(records.size()));
@@ -2824,7 +2864,7 @@ index 22736d5..a3c6d87 100644
  }
  
  void Renderer::RunPipelineWarmup() {
-@@ -1226,10 +1496,16 @@ VkPipeline Renderer::GetPipeline(const PipelineKey& key) {
+@@ -1226,10 +1507,16 @@ VkPipeline Renderer::GetPipeline(const PipelineKey& key) {
    // Hashed as raw bytes: no padding allowed.
    static_assert(std::has_unique_object_representations_v<PipelineKey>);
    uint64_t hash = HashBytes(&key, sizeof(key));
@@ -2841,7 +2881,7 @@ index 22736d5..a3c6d87 100644
        return it->second;  // VK_NULL_HANDLE while a worker is still building it
      }
      if (!pipeline_workers_.empty()) {
-@@ -1254,6 +1530,7 @@ VkPipeline Renderer::GetPipeline(const PipelineKey& key) {
+@@ -1254,6 +1541,7 @@ VkPipeline Renderer::GetPipeline(const PipelineKey& key) {
      pipelines_.emplace(hash, pipeline);
    }
    pipeline_cache_dirty_ = true;
@@ -2849,7 +2889,7 @@ index 22736d5..a3c6d87 100644
    return pipeline;
  }
  
-@@ -1294,8 +1571,11 @@ void Renderer::SavePipelineCacheIfDue(double min_interval) {
+@@ -1294,8 +1582,11 @@ void Renderer::SavePipelineCacheIfDue(double min_interval) {
    }
    pipeline_cache_dirty_ = false;
    pipeline_cache_saved_at_ = now;
@@ -2863,7 +2903,7 @@ index 22736d5..a3c6d87 100644
  }
  
  VkPipeline Renderer::BuildPipeline(const PipelineKey& key, VkPipelineLayout layout) {
-@@ -1527,7 +1807,11 @@ void Renderer::ComputeViewport(const RegisterFile& regs, uint32_t rt_width, uint
+@@ -1527,7 +1818,11 @@ void Renderer::ComputeViewport(const RegisterFile& regs, uint32_t rt_width, uint
    if (res_scale_ != 1.0f) {
      // Guest pixels to host pixels; the NDC transform above is scale-free.
      const float s = res_scale_;
@@ -2876,7 +2916,7 @@ index 22736d5..a3c6d87 100644
      int32_t max_x = int32_t(Scaled(rt_width)), max_y = int32_t(Scaled(rt_height));
      int32_t hx0 = std::min(int32_t(std::floor(x0 * s)), max_x);
      int32_t hy0 = std::min(int32_t(std::floor(y0 * s)), max_y);
-@@ -1537,8 +1821,8 @@ void Renderer::ComputeViewport(const RegisterFile& regs, uint32_t rt_width, uint
+@@ -1537,8 +1832,8 @@ void Renderer::ComputeViewport(const RegisterFile& regs, uint32_t rt_width, uint
      if (y1 == y0) hy1 = hy0;
      scissor = {{hx0, hy0}, {uint32_t(hx1 - hx0), uint32_t(hy1 - hy0)}};
      // Param gen positions stay in guest pixels.
@@ -2887,7 +2927,7 @@ index 22736d5..a3c6d87 100644
      return;
    }
    scissor = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
-@@ -1547,6 +1831,8 @@ void Renderer::ComputeViewport(const RegisterFile& regs, uint32_t rt_width, uint
+@@ -1547,6 +1842,8 @@ void Renderer::ComputeViewport(const RegisterFile& regs, uint32_t rt_width, uint
  namespace {
  constexpr uint32_t kArenaPageBytes = 16 * 1024;
  constexpr uint8_t kArenaMaxInterval = 4;
@@ -2896,7 +2936,7 @@ index 22736d5..a3c6d87 100644
  }  // namespace
  
  bool Renderer::CreateVertexArena() {
-@@ -1559,7 +1845,7 @@ bool Renderer::CreateVertexArena() {
+@@ -1559,7 +1856,7 @@ bool Renderer::CreateVertexArena() {
    arena_size_ = std::min<VkDeviceSize>(arena_size_, 0x7FFFFFF0u);
    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
    bci.size = arena_size_;
@@ -2905,7 +2945,7 @@ index 22736d5..a3c6d87 100644
    VmaAllocationCreateInfo aci = {};
    aci.usage = VMA_MEMORY_USAGE_AUTO;
    aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-@@ -1573,6 +1859,7 @@ bool Renderer::CreateVertexArena() {
+@@ -1573,6 +1870,7 @@ bool Renderer::CreateVertexArena() {
      return true;
    }
    arena_mapped_ = static_cast<uint8_t*>(info.pMappedData);
@@ -2913,7 +2953,7 @@ index 22736d5..a3c6d87 100644
    return true;
  }
  
-@@ -1583,10 +1870,14 @@ bool Renderer::ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_
+@@ -1583,10 +1881,14 @@ bool Renderer::ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_
    if (!arena_buffer_ || !size || size > arena_size_ / 4) {
      return false;
    }
@@ -2930,7 +2970,7 @@ index 22736d5..a3c6d87 100644
        auto ch = arena_changes_.find(key);
        if (ch != arena_changes_.end() && ch->second >= 3) {
          return false;  // rewritten too often to be worth caching
-@@ -1596,42 +1887,42 @@ bool Renderer::ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_
+@@ -1596,42 +1898,42 @@ bool Renderer::ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_
          arena_reset_pending_ = true;
          return false;
        }
@@ -2986,7 +3026,7 @@ index 22736d5..a3c6d87 100644
        return true;
      }
      // The buffer was rewritten. Frames in flight may still read the old copy, so
-@@ -1639,7 +1930,8 @@ bool Renderer::ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_
+@@ -1639,7 +1941,8 @@ bool Renderer::ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_
      // buffers that keep changing).
      uint8_t& count = arena_changes_[key];
      if (count < 255) ++count;
@@ -2996,7 +3036,7 @@ index 22736d5..a3c6d87 100644
      if (count >= 3) {
        return false;
      }
-@@ -1647,16 +1939,76 @@ bool Renderer::ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_
+@@ -1647,16 +1950,82 @@ bool Renderer::ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_
    return false;
  }
  
@@ -3063,7 +3103,8 @@ index 22736d5..a3c6d87 100644
 +}
 +
  bool Renderer::SetupVertexData(const RegisterFile& regs, Shader* vs, DrawConstants& c,
-                                const VertexRange& range) {
+-                               const VertexRange& range) {
++                               const VertexRange& range, VkDeviceSize tail_bytes) {
    const TranslatedShader& t = vs->translated;
    const bool use_ranges = REXCVAR_GET(carbon_gpu_vertex_ranges);
 -  for (uint32_t i = 0; i < 96; ++i) {
@@ -3072,6 +3113,12 @@ index 22736d5..a3c6d87 100644
 -    if (!(t.vfetch_used[i >> 5] & (1u << (i & 31)))) {
 -      continue;
 -    }
++  struct PendingVertex {
++    uint64_t key;
++    uint32_t address, size, slot, endian;
++  };
++  PendingVertex pending[96];
++  uint32_t pending_count = 0;
 +  std::memset(c.vfetch, 0, sizeof(c.vfetch));
 +  for (uint32_t word = 0; word < 3; ++word)
 +  for (uint32_t bits = t.vfetch_used[word]; bits; bits &= bits - 1) {
@@ -3079,7 +3126,24 @@ index 22736d5..a3c6d87 100644
      xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(i);
      uint32_t address = fetch.address << 2;
      uint32_t size = fetch.size << 2;
-@@ -1678,7 +2030,12 @@ bool Renderer::SetupVertexData(const RegisterFile& regs, Shader* vs, DrawConstan
+@@ -1670,74 +2039,142 @@ bool Renderer::SetupVertexData(const RegisterFile& regs, Shader* vs, DrawConstan
+     if (size) {
+       uint32_t lo = 0, hi = size;
+       uint32_t stride = t.vfetch_stride[i];
+-      if (use_ranges && range.known && stride && !(t.vfetch_computed[i >> 5] & (1u << (i & 31)))) {
+-        uint64_t lo64 = uint64_t(range.min_index) * stride * 4;
+-        uint64_t hi64 = (uint64_t(range.max_index) * stride +
++      // The shader wraps after adding the index offset, then clamps. A range
++      // crossing the wrap point is not contiguous: copy the whole buffer.
++      if (use_ranges && range.known && stride &&
++          (range.min_index >> 24) == (range.max_index >> 24) &&
++          !(t.vfetch_computed[i >> 5] & (1u << (i & 31)))) {
++        const uint32_t first = std::clamp(range.min_index & 0xFFFFFF, c.vtx[2], c.vtx[3]);
++        const uint32_t last = std::clamp(range.max_index & 0xFFFFFF, c.vtx[2], c.vtx[3]);
++        uint64_t lo64 = uint64_t(first) * stride * 4;
++        uint64_t hi64 = (uint64_t(last) * stride +
+                          std::max<uint32_t>(stride, t.vfetch_extent[i])) * 4;
+         lo = uint32_t(std::min<uint64_t>(lo64, size));
          hi = uint32_t(std::min<uint64_t>(hi64, size));
        }
        uint32_t arena_dwords;
@@ -3093,15 +3157,80 @@ index 22736d5..a3c6d87 100644
          c.vfetch[i * 2] = arena_dwords;
          c.vfetch[i * 2 + 1] = uint32_t(fetch.endian) | 0x80000000u;
          ++stats_.arena_draws;
-@@ -1686,6 +2043,7 @@ bool Renderer::SetupVertexData(const RegisterFile& regs, Shader* vs, DrawConstan
+         continue;
        }
      }
++    pending[pending_count++] = {key, address, size, i, uint32_t(fetch.endian)};
++  }
++
++  if (vertex_upload_cache_chunk_ != current_chunk_) {
++    vertex_upload_cache_.clear();
++    vertex_upload_cache_chunk_ = current_chunk_;
++  }
++  // Budget only actual arena fallbacks, counting aliases once. At most 96
++  // slots: a bounded scan avoids allocating a second hash table per draw.
++  VkDeviceSize all_bytes = tail_bytes, uncached_bytes = tail_bytes;
++  for (uint32_t i = 0; i < pending_count; ++i) {
++    const auto& p = pending[i];
++    bool duplicate = false;
++    for (uint32_t j = 0; j < i; ++j) duplicate |= pending[j].key == p.key;
++    if (duplicate) continue;
++    VkDeviceSize bytes = std::max<uint32_t>(p.size, 16) + 15;
++    all_bytes += bytes;
++    if (!vertex_upload_cache_.contains(p.key)) uncached_bytes += bytes;
++  }
++  const uint32_t previous_chunk = current_chunk_;
++  if (!ReserveUpload(uncached_bytes)) return false;
++  if (current_chunk_ != previous_chunk) {
++    // A fresh chunk cannot reuse offsets from the previous one.
++    if (!ReserveUpload(all_bytes)) return false;
++    vertex_upload_cache_.clear();
++    vertex_upload_cache_chunk_ = current_chunk_;
++  }
++  for (uint32_t i = 0; i < pending_count; ++i) {
++    const auto& p = pending[i];
      ++stats_.chunk_vertex_draws;
+-    if (vertex_upload_cache_chunk_ != current_chunk_) {
+-      vertex_upload_cache_.clear();
+-      vertex_upload_cache_chunk_ = current_chunk_;
+-    }
+-    auto it = vertex_upload_cache_.find(key);
 +    auto chunk_timed = SubTime(DrawSubStage::kVtxChunk);
-     if (vertex_upload_cache_chunk_ != current_chunk_) {
-       vertex_upload_cache_.clear();
-       vertex_upload_cache_chunk_ = current_chunk_;
-@@ -1719,25 +2077,56 @@ bool Renderer::SetupVertexData(const RegisterFile& regs, Shader* vs, DrawConstan
++    auto it = vertex_upload_cache_.find(p.key);
+     uint32_t dword_offset;
+     if (it != vertex_upload_cache_.end()) {
+       dword_offset = it->second;
+     } else {
+-      UploadAllocation a = Upload(std::max<uint32_t>(size, 16), 16);
++      UploadAllocation a = Upload(std::max<uint32_t>(p.size, 16), 16);
++      if (!a.ptr) return false;
+       if (a.chunk != vertex_upload_cache_chunk_) {
+-        // A new chunk was started: the set 0 of this draw must use it, and
+-        // anything uploaded before is in the old chunk. Callers reserve
+-        // enough space up front, so this is rare; redo the whole draw setup.
++        // Never publish offsets across chunks, even if a future caller
++        // underestimates the reserved tail.
+         vertex_upload_cache_.clear();
+         vertex_upload_cache_chunk_ = a.chunk;
+         return false;
+       }
+-      if (size) {
+-        std::memcpy(a.ptr, physical_base_ + (address & 0x1FFFFFFF), size);
++      if (p.size) {
++        std::memcpy(a.ptr, physical_base_ + (p.address & 0x1FFFFFFF), p.size);
+       } else {
+         std::memset(a.ptr, 0, 16);
+       }
+       dword_offset = uint32_t(a.offset / 4);
+-      vertex_upload_cache_.emplace(key, dword_offset);
++      vertex_upload_cache_.emplace(p.key, dword_offset);
+     }
+-    c.vfetch[i * 2] = dword_offset;
+-    c.vfetch[i * 2 + 1] = uint32_t(fetch.endian);
++    c.vfetch[p.slot * 2] = dword_offset;
++    c.vfetch[p.slot * 2 + 1] = p.endian;
+   }
+   return true;
  }
  
  void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const DrawInfo& info) {
@@ -3167,7 +3296,7 @@ index 22736d5..a3c6d87 100644
    auto edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
    if (edram_mode != xenos::EdramMode::kColorDepth && edram_mode != xenos::EdramMode::kDepthOnly) {
      Skip(kSkipEdramMode);
-@@ -1971,6 +2360,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -1971,6 +2408,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
    }
  
    // Shaders.
@@ -3175,7 +3304,7 @@ index 22736d5..a3c6d87 100644
    auto program_cntl = regs.Get<reg::SQ_PROGRAM_CNTL>();
    uint32_t interpolators = std::min<uint32_t>(16, program_cntl.vs_export_count + 1);
    if (ps) {
-@@ -2091,6 +2481,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2091,6 +2529,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
    }
  
    // ---- Uploads (all in one chunk) ----
@@ -3183,25 +3312,26 @@ index 22736d5..a3c6d87 100644
    // Only the header is cleared: the per-fetch arrays are written for the entries
    // the shaders use, and only those entries are uploaded.
    DrawConstants consts;
-@@ -2119,7 +2510,8 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2118,17 +2557,8 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+     return;
    }
  
-   // Estimate the upload size so the draw fits in one chunk.
+-  // Estimate the upload size so the draw fits in one chunk.
 -  VkDeviceSize estimate = 4096 * 2 + sizeof(DrawConstants) + 3 * 256;
-+  // Alignment slack: up to 2 x 4 constant blocks plus 3 other allocations, each aligned to 256.
-+  VkDeviceSize estimate = 4096 * 2 + sizeof(DrawConstants) + (3 + 2 * kConstantBlocks) * 256;
-   for (uint32_t i = 0; i < 96; ++i) {
-     if (!arena_buffer_ && (vs->translated.vfetch_used[i >> 5] & (1u << (i & 31)))) {
-       estimate += (VkDeviceSize(regs.GetVertexFetch(i).size) << 2) + 32;
-@@ -2129,6 +2521,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
-   ReserveUpload(std::min(estimate, chunk_size_ - 2048));
- 
+-  for (uint32_t i = 0; i < 96; ++i) {
+-    if (!arena_buffer_ && (vs->translated.vfetch_used[i >> 5] & (1u << (i & 31)))) {
+-      estimate += (VkDeviceSize(regs.GetVertexFetch(i).size) << 2) + 32;
+-    }
+-  }
+-  estimate += VkDeviceSize(info.index_count) * 8 + 64;
+-  ReserveUpload(std::min(estimate, chunk_size_ - 2048));
+-
    // Textures (may record uploads in the upload command buffer).
 +  draw_stages.Next(DrawStage::kTextures);
    VkDescriptorSet vs_set = VK_NULL_HANDLE, ps_set = VK_NULL_HANDLE;
    BindTextures(regs, vs, 1, consts, vs_set);
    if (ps) {
-@@ -2136,6 +2529,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2136,6 +2566,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
    }
  
    // Indices.
@@ -3209,7 +3339,7 @@ index 22736d5..a3c6d87 100644
    uint32_t host_count = info.index_count;
    bool host_indexed = false;
    VkIndexType index_type = VK_INDEX_TYPE_UINT32;
-@@ -2169,24 +2563,51 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2169,24 +2600,52 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
    bool indices_done = false;
    const uint32_t index_offset_v = regs[XE_GPU_REG_VGT_INDX_OFFSET] & 0xFFFFFF;
    if (info.indexed && expand == Expand::kNone && count) {
@@ -3255,6 +3385,7 @@ index 22736d5..a3c6d87 100644
 +      } else {
 +        ++stats_.index_conversions;
 +        UploadAllocation a = Upload(VkDeviceSize(count) * (is16 ? 2 : 4) + 4, 16);
++        if (!a.ptr) { Skip(kSkipUpload); return; }
 +        if (is16) {
 +          bool swap = info.index_endian == xenos::Endian::k8in16 ||
 +                      info.index_endian == xenos::Endian::k8in32;
@@ -3275,23 +3406,69 @@ index 22736d5..a3c6d87 100644
      host_indexed = true;
      host_count = count;
      indices_done = true;
-@@ -2215,6 +2636,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2215,13 +2674,32 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
        vertex_range.max_index = hi_i + index_offset_v;
      }
    }
+-  if (!SetupVertexData(regs, vs, consts, vertex_range)) {
+-    // Chunk switched mid-way; retry once in the fresh chunk.
+-    if (!SetupVertexData(regs, vs, consts, vertex_range)) {
+-      Skip(kSkipVertices);
+-      return;
 +  draw_stages.Next(DrawStage::kVertices);
-   if (!SetupVertexData(regs, vs, consts, vertex_range)) {
-     // Chunk switched mid-way; retry once in the fresh chunk.
-     if (!SetupVertexData(regs, vs, consts, vertex_range)) {
-@@ -2222,6 +2644,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
-       return;
++  // Textures and independent index buffers are uploaded already. Keep the
++  // remaining indices and constants in the same chunk as fallback vertices.
++  VkDeviceSize index_bytes = 0;
++  if (!indices_done) {
++    switch (expand) {
++      case Expand::kRectList:
++        if (info.indexed) index_bytes = VkDeviceSize(count / 3) * 12 + 16;
++        break;
++      case Expand::kQuadList: index_bytes = VkDeviceSize(count / 4) * 24; break;
++      case Expand::kTriangleFan: index_bytes = count >= 3 ? VkDeviceSize(count - 2) * 12 : 0; break;
++      case Expand::kLineLoop: index_bytes = count ? (VkDeviceSize(count) + 1) * 4 : 0; break;
++      case Expand::kNone:
++        if (info.indexed) index_bytes = VkDeviceSize(count) *
++            (info.index_format == xenos::IndexFormat::kInt16 ? 2 : 4) + 4;
++        break;
      }
    }
++  const VkDeviceSize tail_bytes = 8192 + sizeof(DrawConstants) +
++      (3 + 2 * kConstantBlocks) * (ubo_alignment_ - 1) + index_bytes + 15;
++  if (!SetupVertexData(regs, vs, consts, vertex_range, tail_bytes)) {
++    Skip(kSkipVertices);
++    return;
++  }
++  const uint32_t draw_chunk = current_chunk_;
 +  draw_stages.Next(DrawStage::kIndices);
    if (indices_done) {
      // Already converted above.
    } else if (expand == Expand::kRectList) {
-@@ -2292,18 +2715,61 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2229,6 +2707,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+     host_count = rects * 6;
+     if (info.indexed) {
+       UploadAllocation a = Upload(VkDeviceSize(rects) * 3 * 4 + 16, 16);
++      if (!a.ptr) { Skip(kSkipUpload); return; }
+       uint32_t* dst = reinterpret_cast<uint32_t*>(a.ptr);
+       for (uint32_t i = 0; i < rects * 3; ++i) dst[i] = read_index(i);
+       consts.vtx2[0] = uint32_t(a.offset / 4);
+@@ -2259,6 +2738,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+     host_count = uint32_t(out.size());
+     if (host_count) {
+       UploadAllocation a = Upload(VkDeviceSize(host_count) * 4, 16);
++      if (!a.ptr) { Skip(kSkipUpload); return; }
+       std::memcpy(a.ptr, out.data(), size_t(host_count) * 4);
+       index_buffer = a.buffer;
+       index_offset = a.offset;
+@@ -2268,6 +2748,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+     host_count = count;
+     bool is16 = info.index_format == xenos::IndexFormat::kInt16;
+     UploadAllocation a = Upload(VkDeviceSize(count) * (is16 ? 2 : 4) + 4, 16);
++    if (!a.ptr) { Skip(kSkipUpload); return; }
+     if (is16) {
+       uint16_t* dst = reinterpret_cast<uint16_t*>(a.ptr);
+       for (uint32_t i = 0; i < count; ++i) {
+@@ -2292,18 +2773,63 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
    }
  
    // Constants.
@@ -3321,6 +3498,7 @@ index 22736d5..a3c6d87 100644
 +          continue;
 +        }
 +        UploadAllocation a = Upload(kConstantBlockBytes, ubo_alignment_);
++        if (!a.ptr) { Skip(kSkipUpload); return; }
 +        std::memcpy(a.ptr, &regs.values[kRegFloatConstants + stage * 1024 + b * kConstantsPerBlock * 4],
 +                    size_t(count) * 16);
 +        offset = uint32_t(a.offset);
@@ -3348,13 +3526,33 @@ index 22736d5..a3c6d87 100644
      }
 +    ++stats_.float_constant_uploads;
      UploadAllocation a = Upload(4096, ubo_alignment_);
++    if (!a.ptr) { Skip(kSkipUpload); return; }
      if (n) {
        std::memcpy(a.ptr, &regs.values[kRegFloatConstants + stage * 1024], size_t(n) * 16);
 +      stats_.float_constant_bytes += size_t(n) * 16;
      }
      dyn_offsets[stage] = uint32_t(a.offset);
      last_constant_offset_[stage] = a.offset;
-@@ -2352,6 +2818,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2313,6 +2839,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+   }
+   {
+     UploadAllocation a = Upload(sizeof(DrawConstants), ubo_alignment_);
++    if (!a.ptr) { Skip(kSkipUpload); return; }
+     const uint8_t* src = reinterpret_cast<const uint8_t*>(&consts);
+     constexpr size_t kHead = offsetof(DrawConstants, vfetch);
+     std::memcpy(a.ptr, src, kHead);
+@@ -2342,6 +2869,10 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+     dyn_offsets[2] = uint32_t(a.offset);
+   }
+ 
++  if (current_chunk_ != draw_chunk) {
++    Skip(kSkipUpload);
++    return;
++  }
+   if (tracing_) {
+     REXGPU_WARN(
+         "[carbon-gpu] trace: draw prim {:02X} count {} indexed {} vs {:016X} ps {:016X} "
+@@ -2352,6 +2883,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
          consts.ndc_scale[1], consts.ndc_offset[0], consts.ndc_offset[1]);
    }
    // ---- Record ----
@@ -3362,7 +3560,7 @@ index 22736d5..a3c6d87 100644
    bool same_pass = rendering_;
    if (same_pass) {
      for (uint32_t i = 0; i < 4; ++i) same_pass &= current_pass_.color[i] == pass.color[i];
-@@ -2362,10 +2829,8 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2362,10 +2894,8 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
      EndRendering();
      BeginRendering(pass);
    }
@@ -3374,7 +3572,7 @@ index 22736d5..a3c6d87 100644
      cmd_.pipeline = pipeline;
    }
    ++pass_draws_;
-@@ -2378,8 +2843,6 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2378,8 +2908,6 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
    pass_vs_hash_ = vs->hash;
    VkPipelineLayout layout = GetPipelineLayout(key.vs_textures, key.ps_textures);
    VkDescriptorSet set0 = upload_chunks_[current_chunk_].set0;
@@ -3383,7 +3581,7 @@ index 22736d5..a3c6d87 100644
    // Texture sets stay bound while the set layouts they sit under are unchanged.
    if (cmd_.layout != layout) {
      if (cmd_.vs_textures != key.vs_textures) {
-@@ -2391,23 +2854,37 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2391,23 +2919,37 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
      cmd_.vs_textures = key.vs_textures;
      cmd_.ps_textures = key.ps_textures;
    }
@@ -3431,7 +3629,7 @@ index 22736d5..a3c6d87 100644
      cmd_.scissor = scissor;
      cmd_.scissor_valid = true;
    }
-@@ -2423,7 +2900,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2423,7 +2965,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
        offset *= float(1 << 24);
      }
      if (!cmd_.depth_bias_valid || cmd_.depth_bias[0] != offset || cmd_.depth_bias[1] != scale) {
@@ -3440,7 +3638,7 @@ index 22736d5..a3c6d87 100644
        cmd_.depth_bias[0] = offset;
        cmd_.depth_bias[1] = scale;
        cmd_.depth_bias_valid = true;
-@@ -2433,7 +2910,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2433,7 +2975,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
      float blend[4] = {regs.GetFloat(XE_GPU_REG_RB_BLEND_RED), regs.GetFloat(XE_GPU_REG_RB_BLEND_GREEN),
                        regs.GetFloat(XE_GPU_REG_RB_BLEND_BLUE), regs.GetFloat(XE_GPU_REG_RB_BLEND_ALPHA)};
      if (!cmd_.blend_valid || std::memcmp(cmd_.blend, blend, sizeof(blend)) != 0) {
@@ -3449,7 +3647,7 @@ index 22736d5..a3c6d87 100644
        std::memcpy(cmd_.blend, blend, sizeof(blend));
        cmd_.blend_valid = true;
      }
-@@ -2446,12 +2923,12 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2446,12 +2988,12 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
      uint32_t st[6] = {ref.stencilref,       ref_bf.stencilref,       ref.stencilmask,
                        ref_bf.stencilmask,   ref.stencilwritemask,    ref_bf.stencilwritemask};
      if (!cmd_.stencil_valid || std::memcmp(cmd_.stencil, st, sizeof(st)) != 0) {
@@ -3468,7 +3666,7 @@ index 22736d5..a3c6d87 100644
        std::memcpy(cmd_.stencil, st, sizeof(st));
        cmd_.stencil_valid = true;
      }
-@@ -2459,14 +2936,14 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2459,14 +3001,14 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
    if (host_indexed) {
      if (cmd_.index_buffer != index_buffer || cmd_.index_offset != index_offset ||
          cmd_.index_type != index_type) {
@@ -3486,7 +3684,7 @@ index 22736d5..a3c6d87 100644
    }
  }
  
-@@ -2603,6 +3080,7 @@ void main() {
+@@ -2603,6 +3145,7 @@ void main() {
  void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t source_width,
                               uint32_t source_height, float source_scale, VkImage dest, VkImageView dest_view,
                               uint32_t width, uint32_t height, bool dest_written_before, bool swap_rb) {
@@ -3494,7 +3692,7 @@ index 22736d5..a3c6d87 100644
    const auto& dfn = vulkan_device_->functions();
    VkImageLayout dest_layout = dest_written_before
                                    ? rex::ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout
-@@ -2620,7 +3098,7 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
+@@ -2620,7 +3163,7 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
    ri.layerCount = 1;
    ri.colorAttachmentCount = 1;
    ri.pColorAttachments = &att;
@@ -3503,7 +3701,7 @@ index 22736d5..a3c6d87 100644
    if (source) {
      VkDescriptorSet set = AllocateDescriptorSet(present_set_layout_);
      VkDescriptorImageInfo ii = {linear_sampler_, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-@@ -2637,9 +3115,9 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
+@@ -2637,9 +3180,9 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
      w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
      w[1].pBufferInfo = &bi;
      dfn.vkUpdateDescriptorSets(vk_device_, 2, w, 0, nullptr);
@@ -3516,7 +3714,7 @@ index 22736d5..a3c6d87 100644
      struct {
        float scale[2];
        uint32_t use_gamma;
-@@ -2648,14 +3126,14 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
+@@ -2648,14 +3191,14 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
      // The guest output may be smaller than the source image (padded resolves).
      pc.scale[0] = source_scale / float(source_width);
      pc.scale[1] = source_scale / float(source_height);
@@ -3536,7 +3734,7 @@ index 22736d5..a3c6d87 100644
    TransitionImage(cb, dest, VK_IMAGE_ASPECT_COLOR_BIT, dest_layout,
                    rex::ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
  }
-@@ -2669,6 +3147,11 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2669,6 +3212,11 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
      std::this_thread::sleep_for(std::chrono::milliseconds(50));
      cap_next_ = 0.0;
    }
@@ -3548,7 +3746,7 @@ index 22736d5..a3c6d87 100644
    // Re-read fps_cap_ each frame so runtime cvar changes take effect immediately.
    fps_cap_ = REXCVAR_GET(carbon_gpu_fps_cap);
    skip_redundant_resolves_ = REXCVAR_GET(carbon_gpu_skip_redundant_resolves);
-@@ -2763,8 +3246,8 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2763,8 +3311,8 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
        VkBufferImageCopy region = {};
        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
        region.imageExtent = {front->width, front->height, 1};
@@ -3559,7 +3757,7 @@ index 22736d5..a3c6d87 100644
        TransitionImage(cb, front->image, VK_IMAGE_ASPECT_COLOR_BIT, front->layout,
                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
      }
-@@ -2844,6 +3327,15 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2844,6 +3392,15 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
          frame_texture_s_ * 1000.0, frame_pipeline_builds_, frame_idle_s_ * 1000.0,
          frame_wait_s_ * 1000.0);
    }
@@ -3575,7 +3773,7 @@ index 22736d5..a3c6d87 100644
    frame_idle_s_ = frame_wait_s_ = frame_texture_s_ = frame_draw_s_ = 0;
    frame_textures_ = frame_pipeline_builds_ = 0;
    if (overlay_last_swap_ > 0.0) {
-@@ -2870,21 +3362,26 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2870,24 +3427,29 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
      overlay_worst_ms_ = 0.0;
    }
    if (now - stats_start_ >= 5.0) {
@@ -3606,8 +3804,12 @@ index 22736d5..a3c6d87 100644
 +    if (REXCVAR_GET(carbon_gpu_stats) && full && stats_.draws_skipped) {
        static const char* kNames[kSkipReasonCount] = {
            "no-vs", "edram-mode", "ps-failed", "memexport", "primitive", "no-pitch", "no-output",
-           "modules", "cull-all", "pipeline", "scissor", "vertices", "no-indices"};
-@@ -2905,22 +3402,115 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+-          "modules", "cull-all", "pipeline", "scissor", "vertices", "no-indices"};
++          "modules", "cull-all", "pipeline", "scissor", "vertices", "no-indices", "upload"};
+       std::string reasons;
+       double frames = double(std::max<uint64_t>(stats_frames_, 1));
+       for (uint32_t i = 0; i < kSkipReasonCount; ++i) {
+@@ -2905,22 +3467,115 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
            debug_mode_, (now - stats_start_) * 1000.0 / frames, stats_.worst_ms, stats_.slow25, stats_.slow34,
            stats_.slow50, stats_.draw_s * 1000.0 / frames, stats_.resolve_s * 1000.0 / frames,
            stats_.swap_s * 1000.0 / frames, stats_.fence_s * 1000.0 / frames);
@@ -3726,7 +3928,7 @@ index 22736d5..a3c6d87 100644
          double g = double(stats_.gpu_frames);
          {
            auto pct = [](std::vector<float>& v, double p) {
-@@ -2943,7 +3533,7 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2943,7 +3598,7 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
              stats_.gpu_tag_s[kTagEnd] * 1000.0 / g, stats_.gpu_passes / g);
        }
      }
@@ -3735,7 +3937,7 @@ index 22736d5..a3c6d87 100644
        double f = double(std::max<uint64_t>(stats_frames_, 1));
        REXGPU_INFO(
            "[carbon-gpu] resolves per frame: copied {:.1f}, skipped as redundant {:.1f} | pixels "
-@@ -2957,7 +3547,7 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2957,7 +3612,7 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
            stats_.resolves_dead / f, double(stats_.resolve_px_dead) / f / 1e3,
            double(stats_.resolve_bytes_dead) / f / (1024.0 * 1024.0));
      }
@@ -3744,7 +3946,7 @@ index 22736d5..a3c6d87 100644
        std::vector<const DestAgg*> top;
        for (auto& kv : dest_agg_) top.push_back(&kv.second);
        std::sort(top.begin(), top.end(), [](const DestAgg* a, const DestAgg* b) {
-@@ -2973,10 +3563,15 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2973,10 +3628,15 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
              d.base, d.w, d.h, d.fmt, d.src_pitch, d.src_fmt, d.resolves / f, d.dead / f);
        }
      }
@@ -3761,7 +3963,7 @@ index 22736d5..a3c6d87 100644
      stats_frames_ = 0;
      stats_start_ = now;
 diff --git a/renderer/src/renderer.h b/renderer/src/renderer.h
-index 7b7f187..453b119 100644
+index 7b7f187..608a972 100644
 --- a/renderer/src/renderer.h
 +++ b/renderer/src/renderer.h
 @@ -7,13 +7,16 @@
@@ -3882,8 +4084,12 @@ index 7b7f187..453b119 100644
      VkCommandBuffer upload_cb = VK_NULL_HANDLE;  // texture uploads, before draws
      VkCommandBuffer cb = VK_NULL_HANDLE;
      VkFence fence = VK_NULL_HANDLE;
-@@ -210,7 +254,15 @@ class Renderer {
-   void ReserveUpload(VkDeviceSize bytes);
+@@ -207,10 +251,18 @@ class Renderer {
+   Frame& frame() { return frames_[frame_index_]; }
+   bool AcquireChunk();
+   // Ensures `bytes` fit in the current chunk (so one draw stays in one chunk).
+-  void ReserveUpload(VkDeviceSize bytes);
++  bool ReserveUpload(VkDeviceSize bytes);
    UploadAllocation Upload(VkDeviceSize size, VkDeviceSize alignment);
    VkDescriptorSet AllocateDescriptorSet(VkDescriptorSetLayout layout);
 -  void DeferDestroy(std::function<void()> fn) { frame().deferred_destroy.push_back(std::move(fn)); }
@@ -3915,7 +4121,7 @@ index 7b7f187..453b119 100644
  
    // ---- Resolves (render_targets.cpp) ----
    bool CreateResolvePipelines();
-@@ -249,6 +310,14 @@ class Renderer {
+@@ -249,13 +310,21 @@ class Renderer {
  
    // ---- Textures (textures.cpp) ----
    Texture* GetTexture(const GuestTexture& guest, bool allow_upload);
@@ -3930,6 +4136,14 @@ index 7b7f187..453b119 100644
    Texture* FindResolvedTexture(uint32_t base_address, uint32_t width, uint32_t height);
    // `y_offset` receives the first row of the resolve in the returned texture
    // (non-zero for tiles resolved into a texture that starts above them).
+   Texture* GetOrCreateResolveTexture(uint32_t base_address, uint32_t width, uint32_t height,
+                                      xenos::TextureFormat format, uint32_t& y_offset);
+   bool CreateTextureImage(Texture& t, VkImageUsageFlags extra_usage);
+-  void UploadTexture(Texture& t);
++  bool UploadTexture(Texture& t);
+   VkImageView GetTextureView(Texture& t, uint32_t swizzle, bool use_signed,
+                              VkImageViewType view_type);
+   VkSampler GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch, const TextureBinding& binding,
 @@ -292,7 +361,7 @@ class Renderer {
    VkShaderModule ModuleForKey(uint64_t key);
    void RecordWarmPipeline(const PipelineKey& key);
@@ -3948,7 +4162,13 @@ index 7b7f187..453b119 100644
  
    // ---- Draw helpers ----
    struct VertexRange {
-@@ -330,21 +399,26 @@ class Renderer {
+@@ -325,26 +394,31 @@ class Renderer {
+     uint32_t min_index = 0, max_index = 0;  // vertex indices, after the index offset
+   };
+   bool SetupVertexData(const RegisterFile& regs, Shader* vs, DrawConstants& constants,
+-                       const VertexRange& range);
++                       const VertexRange& range, VkDeviceSize tail_bytes);
+   // Persistent copy of guest vertex buffers, refreshed by page hash.
    bool CreateVertexArena();
    bool ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_t lo, uint32_t hi,
                    uint32_t& dword_offset);
@@ -4067,7 +4287,12 @@ index 7b7f187..453b119 100644
    VkDeviceSize last_constant_offset_[2] = {};
    uint32_t last_constant_chunk_[2] = {UINT32_MAX, UINT32_MAX};
    uint32_t last_constant_count_[2] = {};
-@@ -524,6 +636,25 @@ class Renderer {
+@@ -520,10 +632,30 @@ class Renderer {
+     kSkipScissor,
+     kSkipVertices,
+     kSkipNoIndices,
++    kSkipUpload,
+     kSkipReasonCount,
    };
    struct Stats {
      uint32_t draws = 0, draws_skipped = 0, resolves = 0, passes = 0, pipelines_created = 0;
@@ -4093,7 +4318,7 @@ index 7b7f187..453b119 100644
      // Resolves that copied texels, and redundant ones skipped (same source contents,
      // same rectangle and parameters, destination region untouched since).
      uint32_t resolves_copied = 0, resolves_skipped = 0;
-@@ -534,8 +665,13 @@ class Renderer {
+@@ -534,8 +666,13 @@ class Renderer {
      uint64_t resolve_px_dead = 0, resolve_bytes_dead = 0;
      uint32_t textures_uploaded = 0, shaders_compiled = 0;
      uint64_t upload_bytes = 0, arena_bytes = 0, arena_draws = 0, chunk_vertex_draws = 0;
@@ -4107,7 +4332,7 @@ index 7b7f187..453b119 100644
      double gpu_total_s = 0, gpu_tag_s[5] = {};
      uint32_t gpu_frames = 0, gpu_passes = 0;
      uint32_t slow25 = 0, slow34 = 0, slow50 = 0;
-@@ -567,6 +703,12 @@ class Renderer {
+@@ -567,6 +704,12 @@ class Renderer {
    bool skip_redundant_resolves_ = true;
    // Frame and GPU times of the current stats window, for percentiles.
    std::vector<float> frame_ms_hist_, gpu_ms_hist_;
@@ -4628,7 +4853,7 @@ index 0000000..43b09f1
 +
 +}  // namespace carbon::gpu
 diff --git a/renderer/src/textures.cpp b/renderer/src/textures.cpp
-index 441ae5b..40ae2b2 100644
+index 441ae5b..6f8f41c 100644
 --- a/renderer/src/textures.cpp
 +++ b/renderer/src/textures.cpp
 @@ -13,6 +13,15 @@
@@ -4647,7 +4872,38 @@ index 441ae5b..40ae2b2 100644
  namespace carbon::gpu {
  
  namespace {
-@@ -214,12 +223,27 @@ void Renderer::UploadTexture(Texture& t) {
+@@ -170,7 +179,7 @@ bool Renderer::CreateTextureImage(Texture& t, VkImageUsageFlags extra_usage) {
+   return true;
+ }
+ 
+-void Renderer::UploadTexture(Texture& t) {
++bool Renderer::UploadTexture(Texture& t) {
+   auto now = []() {
+     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+   };
+@@ -187,7 +196,7 @@ void Renderer::UploadTexture(Texture& t) {
+   std::vector<HostTextureRegion> regions;
+   uint64_t size = GetHostTextureSize(t.guest, t.format, regions);
+   if (!size || regions.empty()) {
+-    return;
++    return false;
+   }
+   const auto& dfn = vulkan_device_->functions();
+   uint8_t* dst;
+@@ -195,6 +204,7 @@ void Renderer::UploadTexture(Texture& t) {
+   VkDeviceSize base_offset;
+   if (size <= chunk_size_ / 2) {
+     UploadAllocation a = Upload(size, 16);
++    if (!a.ptr) return false;
+     dst = a.ptr;
+     buffer = a.buffer;
+     base_offset = a.offset;
+@@ -210,16 +220,31 @@ void Renderer::UploadTexture(Texture& t) {
+     VmaAllocation allocation;
+     VmaAllocationInfo info;
+     if (vmaCreateBuffer(allocator_, &bci, &aci, &buffer, &allocation, &info) != VK_SUCCESS) {
+-      return;
++      return false;
      }
      dst = static_cast<uint8_t*>(info.pMappedData);
      base_offset = 0;
@@ -4676,7 +4932,15 @@ index 441ae5b..40ae2b2 100644
    }
    std::vector<VkBufferImageCopy> copies;
    copies.reserve(regions.size());
-@@ -262,6 +286,8 @@ Texture* Renderer::FindResolvedTexture(uint32_t base_address, uint32_t width, ui
+@@ -243,6 +268,7 @@ void Renderer::UploadTexture(Texture& t) {
+   TransitionImage(cb, t.image, VK_IMAGE_ASPECT_COLOR_BIT, t.layout,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+   ++stats_.textures_uploaded;
++  return true;
+ }
+ 
+ Texture* Renderer::FindResolvedTexture(uint32_t base_address, uint32_t width, uint32_t height) {
+@@ -262,6 +288,8 @@ Texture* Renderer::FindResolvedTexture(uint32_t base_address, uint32_t width, ui
  Texture* Renderer::GetOrCreateResolveTexture(uint32_t base_address, uint32_t width,
                                               uint32_t height, xenos::TextureFormat format,
                                               uint32_t& y_offset) {
@@ -4685,7 +4949,7 @@ index 441ae5b..40ae2b2 100644
    base_address &= 0x1FFFFFFF;
    y_offset = 0;
    // Predicated tiling resolves each screen tile to the address of its first
-@@ -325,22 +351,14 @@ Texture* Renderer::GetOrCreateResolveTexture(uint32_t base_address, uint32_t wid
+@@ -325,22 +353,14 @@ Texture* Renderer::GetOrCreateResolveTexture(uint32_t base_address, uint32_t wid
  
  Texture* Renderer::GetTexture(const GuestTexture& guest, bool allow_upload) {
    uint32_t key = (guest.base_address ? guest.base_address : guest.mip_address) & 0x1FFFFFFF;
@@ -4715,7 +4979,7 @@ index 441ae5b..40ae2b2 100644
    }
    if (!t) {
      if (!allow_upload) {
-@@ -360,29 +378,67 @@ Texture* Renderer::GetTexture(const GuestTexture& guest, bool allow_upload) {
+@@ -360,29 +380,70 @@ Texture* Renderer::GetTexture(const GuestTexture& guest, bool allow_upload) {
        return nullptr;
      }
      created->extent = GetGuestTextureExtent(guest);
@@ -4723,7 +4987,12 @@ index 441ae5b..40ae2b2 100644
      created->content_hash = HashExtent(physical_base_, created->extent);
 +    stats_.texture_hash_bytes += uint64_t(created->extent.base_size) + created->extent.mip_size;
      created->last_hash_frame = frame_number_;
-     UploadTexture(*created);
+-    UploadTexture(*created);
++    if (!UploadTexture(*created)) {
++      texture_bytes_ -= created->memory_bytes;
++      vmaDestroyImage(allocator_, created->image, created->allocation);
++      return nullptr;
++    }
      t = created.get();
      textures_.emplace(key, std::move(created));
 -  } else if (frame_number_ - t->last_hash_frame >= t->hash_interval &&
@@ -4758,9 +5027,8 @@ index 441ae5b..40ae2b2 100644
 +  ++stats_.texture_hash_checks;
 +  if (hash != t.content_hash) {
 +    ++stats_.texture_hash_changed;
-+    t.content_hash = hash;
 +    t.hash_interval = 1;
-+    UploadTexture(t);
++    if (UploadTexture(t)) t.content_hash = hash;
 +  } else {
 +    t.hash_interval = std::min(t.hash_interval * 2, kMaxHashInterval);
 +  }
@@ -4790,7 +5058,7 @@ index 441ae5b..40ae2b2 100644
  VkImageView Renderer::GetTextureView(Texture& t, uint32_t swizzle, bool use_signed,
                                       VkImageViewType view_type) {
    uint64_t key = uint64_t(swizzle & 0xFFF) | (uint64_t(use_signed) << 12) |
-@@ -435,8 +491,9 @@ VkSampler Renderer::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
+@@ -435,8 +496,9 @@ VkSampler Renderer::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
    VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
    sci.magFilter = mag == xenos::TextureFilter::kLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
    sci.minFilter = min == xenos::TextureFilter::kLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
@@ -4802,7 +5070,7 @@ index 441ae5b..40ae2b2 100644
    auto address = [&](xenos::ClampMode m) {
      VkSamplerAddressMode a = ToAddressMode(m);
      if (a == VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE && !props.samplerMirrorClampToEdge) {
-@@ -448,6 +505,9 @@ VkSampler Renderer::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
+@@ -448,6 +510,9 @@ VkSampler Renderer::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
    sci.addressModeV = address(fetch.clamp_y);
    sci.addressModeW = address(fetch.clamp_z);
    sci.mipLodBias = float(int32_t(lod_bias << 22) >> 22) * (1.0f / 32.0f);
@@ -4812,7 +5080,7 @@ index 441ae5b..40ae2b2 100644
    // Render-to-texture sources (post-process, blurs) are never worth anisotropic
    // taps; other textures are capped for the GPU's sake.
    if (!render_source && aniso != xenos::AnisoFilter::kDisabled && props.samplerAnisotropy &&
-@@ -472,12 +532,24 @@ VkSampler Renderer::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
+@@ -472,12 +537,24 @@ VkSampler Renderer::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
  
  void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t set_index,
                              DrawConstants& c, VkDescriptorSet& set_out) {
@@ -4838,7 +5106,7 @@ index 441ae5b..40ae2b2 100644
    constexpr uint32_t kMaxDescriptors = 64;
    const uint32_t descriptor_count = std::min(ts.texture_descriptor_count, kMaxDescriptors);
    VkDescriptorImageInfo infos[kMaxDescriptors];
-@@ -487,10 +559,17 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
+@@ -487,10 +564,17 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
      GuestTexture g;
      Texture* t = nullptr;
      if (GuestTextureFromFetch(fetch, g)) {
@@ -4857,7 +5125,7 @@ index 441ae5b..40ae2b2 100644
      // Per-fetch-constant parameters for the shader.
      uint32_t signs_in[4] = {uint32_t(fetch.sign_x), uint32_t(fetch.sign_y), uint32_t(fetch.sign_z),
                              uint32_t(fetch.sign_w)};
-@@ -553,7 +632,11 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
+@@ -553,7 +637,11 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
          default:
            break;
        }
@@ -4870,7 +5138,7 @@ index 441ae5b..40ae2b2 100644
      };
      switch (b.dimension) {
        case xenos::FetchOpDimension::k1D:
-@@ -580,14 +663,16 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
+@@ -580,14 +668,16 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
      }
    }
    // Draws that bind the same textures and samplers share one descriptor set.
@@ -4888,7 +5156,7 @@ index 441ae5b..40ae2b2 100644
    if (!set) {
      return;
    }
-@@ -603,13 +688,18 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
+@@ -603,13 +693,18 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
    vulkan_device_->functions().vkUpdateDescriptorSets(vk_device_, descriptor_count, writes, 0,
                                                       nullptr);
    texture_set_cache_.emplace(cache_key, set);
@@ -4908,7 +5176,7 @@ index 441ae5b..40ae2b2 100644
  
    // Render targets that nothing has drawn to or resolved from for a while.
    for (auto it = render_targets_.begin(); it != render_targets_.end();) {
-@@ -626,6 +716,7 @@ void Renderer::EvictResources() {
+@@ -626,6 +721,7 @@ void Renderer::EvictResources() {
          vmaDestroyImage(allocator_, image, allocation);
        });
        it = render_targets_.erase(it);
@@ -4916,7 +5184,7 @@ index 441ae5b..40ae2b2 100644
        ++stats_.evicted;
      } else {
        ++it;
-@@ -646,7 +737,7 @@ void Renderer::EvictResources() {
+@@ -646,7 +742,7 @@ void Renderer::EvictResources() {
    std::sort(candidates.begin(), candidates.end(),
              [](const Texture* a, const Texture* b) { return a->last_used_frame < b->last_used_frame; });
    for (Texture* t : candidates) {
@@ -4925,7 +5193,7 @@ index 441ae5b..40ae2b2 100644
      if (!stale && !(trimming && texture_bytes_ > target)) {
        break;
      }
-@@ -655,6 +746,7 @@ void Renderer::EvictResources() {
+@@ -655,6 +751,7 @@ void Renderer::EvictResources() {
      std::vector<VkImageView> views;
      for (auto& v : t->views) views.push_back(v.second);
      texture_bytes_ -= std::min(texture_bytes_, t->memory_bytes);
