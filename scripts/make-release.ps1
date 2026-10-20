@@ -50,7 +50,7 @@ foreach ($item in $include) {
 }
 # Stamp the banner with this release's version (the dev copy keeps whatever it had).
 $svg = "$out/src/docs/banner.svg"
-if (Test-Path $svg) { $t = (Get-Content $svg -Raw -Encoding utf8) -replace '(fill="#ff8a5c">)[^<]*<', "`${1}BETA  $([char]0xB7)  v$Version<" ; [IO.File]::WriteAllText($svg, $t, (New-Object Text.UTF8Encoding($false))) }
+if (Test-Path $svg) { $t = (Get-Content $svg -Raw -Encoding utf8) -replace '(fill="#ff8a5c">)[^<]*<', "`${1}v$Version<" ; [IO.File]::WriteAllText($svg, $t, (New-Object Text.UTF8Encoding($false))) }
 Remove-Item -Force -ErrorAction SilentlyContinue "$out/src/scripts/setup-claude-lane.ps1", "$out/src/scripts/allow-claude-push.ps1", "$out/src/scripts/push-private.ps1", "$out/src/scripts/make-public-branch.ps1"
 # The committed .gitignore, without local additions.
 git show HEAD:.gitignore | Set-Content "$out/src/.gitignore" -Encoding ascii
