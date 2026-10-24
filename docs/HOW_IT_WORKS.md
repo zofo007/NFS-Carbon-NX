@@ -57,6 +57,16 @@ frame rate by more than a few percent.
   the 5.33 ms available. When it cannot keep up the output runs dry. A higher CPU clock is the only thing that fixed
   it completely; shaving small pieces off the mixer helped little because its cost is spread over many functions.
 
+### The audio output queue
+
+The game renders one 256-sample frame (5.33 ms at 48 kHz) each time the output asks for it. The output thread asks once
+per tick and keeps up to 32 frames queued before the device (about 170 ms). Earlier builds asked for exactly one frame per
+tick, which only replaces what the device consumes: after any gap the queue stayed near empty and every later mixer
+hiccup was heard as silence. It now asks for extra frames while the queue is below its target, so a heavy block of
+mixing is absorbed by the queue. The queue depth is counted from the output thread (which does not write the log) and
+appears in `rex_perfil.log` as `audio queue`.
+
+The game's mixer thread (`RWAudioCore Dac`) runs at Horizon priority 0x2A, above the XMA decoder and the GPU ring thread.
 ## 5. Cutscenes
 
 Movies are WMV3. The game's own decoder is the recompiled Xbox code and reached about 22 FPS here, so the picture fell

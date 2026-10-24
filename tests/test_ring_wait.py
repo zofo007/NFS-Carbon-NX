@@ -37,7 +37,8 @@ class RingWaitTests(unittest.TestCase):
         self.assertRegex(hook, r"ArbitrationType_WaitIfEqual,\s+int32_t\(before\), 1'000'000\)")
         self.assertIn("KERNELRESULT(TimedOut)", hook)
         self.assertIn("KERNELRESULT(InvalidState)", hook)
-        self.assertTrue(hook.rstrip().endswith("__imp__sub_826E0250(ctx, base);\n}"))
+        self.assertTrue(hook.rstrip().endswith("RING_WAIT_WATCHDOG_IMPL(ctx, base);\n}"))
+        self.assertIn("#define RING_WAIT_WATCHDOG_IMPL __imp__sub_826E0250", hook)
 
     def test_native_activation_wake_and_counter_contract(self):
         hook = (CARBON / "src/ring_wait_hook.cpp").read_text(encoding="utf-8")
@@ -50,7 +51,8 @@ class RingWaitTests(unittest.TestCase):
         wake = cp[cp.index("void WakeRptrWaiters()"):cp.index("}  // namespace")]
         self.assertLess(wake.index("fetch_add(1, std::memory_order_release)"), wake.index("svcSignalToAddress"))
         self.assertIn("SignalType_Signal, 0, -1", wake)
-        self.assertIn("NFSCARBON_STATIC_CARBON_GPU=1)\n        target_sources(nfscarbon PRIVATE src/ring_wait_hook.cpp)", cmake)
+        self.assertIn("NFSCARBON_STATIC_CARBON_GPU=1)", cmake)
+        self.assertIn("NFSCARBON_STATIC_CARBON_GPU=1)\n        # Shared by both editions; the hook picks its addresses from NFSCARBON_COLLECTORS.\n        target_sources(nfscarbon PRIVATE src/ring_wait_hook.cpp)", cmake)
         counters = {int(i): op for op, i in re.findall(r"RexSwitchPerf(Add|Max)\((\d+),", hook)}
         self.assertEqual(counters, {37: "Add", 38: "Add", 39: "Add", 40: "Max", 41: "Add"})
         self.assertGreater(int(re.search(r"kCounterCount = (\d+)", report)[1]), max(counters))

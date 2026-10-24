@@ -6,6 +6,23 @@ from scripts.validate_build import validate_elf, validate_nro
 
 
 class ValidationTests(unittest.TestCase):
+    def test_editions_reject_each_others_executable(self):
+        for edition, media, version, entry in (
+                ("standard", 0x51D2B53F, 1, 0x829446E0),
+                ("collectors", 0x1F8BEB88, 7, 0x82944510)):
+            data = bytearray(128)
+            data[:4] = b"XEX2"
+            struct.pack_into(">I", data, 20, 3)
+            for i, pair in enumerate(((0x40006, 64), (0x10201, 0x82000000), (0x10100, entry))):
+                struct.pack_into(">II", data, 24 + i * 8, *pair)
+            struct.pack_into(">IIII", data, 64, media, version, 0, 0x454107EC)
+            self.assertEqual(xex_identity(data, edition)["media_id"], f"{media:08X}")
+            other = "collectors" if edition == "standard" else "standard"
+            with self.assertRaisesRegex(ValueError, "edition"):
+                xex_identity(data, other)
+        with self.assertRaises(ValueError):
+            xex_identity(data, "unknown")
+
     def test_archive_bounds_and_empty_terminal_archive(self):
         index = struct.pack("<6I", 123, 10, 0, 0, 0, 0)
         self.assertEqual(check_archive_index(index, {10: 0}), 1)

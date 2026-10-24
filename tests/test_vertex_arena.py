@@ -16,9 +16,10 @@ class VertexArenaTests(unittest.TestCase):
             self.assertNotIn(old, fetch)
         for check in (
             "if (page.checked == frame_number_) continue;",
-            "if (page.hash && frame_number_ < page.checked + page.interval) continue;",
+            "if (page.hash && frame_number_ < page.checked + page.interval) {",
+            "if (!REXCVAR_GET(carbon_gpu_cache_verify)) continue;",  # default: skip, as before
             "else if (h != page.hash)",
-            "page.interval = std::min<uint8_t>(page.interval * 2, kArenaMaxInterval);",
+            "page.interval = uint8_t(std::min<int32_t>(page.interval * 2, REXCVAR_GET(carbon_gpu_arena_max_interval)));",
             "page.checked = frame_number_;",
             "if (count >= 3)",
             "arena_reset_pending_ = true;",

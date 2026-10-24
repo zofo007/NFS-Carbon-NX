@@ -104,6 +104,9 @@ class ContentInstallTests(unittest.TestCase):
     def test_enumeration_recovers_without_original_package(self):
         self.run_case("recovery_without_source")
 
+    def test_journal_whose_installed_copy_was_deleted_does_not_block_installs(self):
+        self.run_case("journal_orphan")
+
     def test_journal_write_failure_does_not_block_retry(self):
         self.run_case("journal_error")
 

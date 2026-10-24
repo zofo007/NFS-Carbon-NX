@@ -4,7 +4,10 @@ $compiler = "$Workspace/toolchains/msys64/mingw64/bin/g++.exe"
 $testDir = "$Workspace/build/tests/audio-resampler"
 New-Item -ItemType Directory -Force $testDir | Out-Null
 # Generate a private fixture from the current guest output; never commit it.
-$generated = Get-Content "$Workspace/carbon-source/generated/default/nfscarbon_recomp.136.cpp" -Raw
+$partition = Get-Content "$Workspace/carbon-source/generated/default/codegen.partition.json" -Raw | ConvertFrom-Json
+$bucket = $partition.assignments.'826CB1D8'
+if ($null -eq $bucket) { throw 'Missing 826CB1D8 partition.' }
+$generated = Get-Content "$Workspace/carbon-source/generated/default/nfscarbon_recomp.$bucket.cpp" -Raw
 $match = [regex]::Match($generated, '(?s)DEFINE_REX_FUNC\(sub_826CB1D8\) \{.*?(?=\r?\nDEFINE_REX_FUNC|\z)')
 if (-not $match.Success -or $match.Value -notmatch 'loc_826CB24C:') { throw 'Resampler reference not found.' }
 $reference = $match.Value.Replace('DEFINE_REX_FUNC(sub_826CB1D8)', 'void ReferenceResample(PPCContext& __restrict ctx, uint8_t* base)')

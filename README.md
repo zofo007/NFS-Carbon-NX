@@ -1,74 +1,92 @@
 <div align="center">
 
-<img src="docs/banner.svg" alt="NFS Carbon NX" width="70%">
-
-![status](https://img.shields.io/badge/status-beta-orange) ![platform](https://img.shields.io/badge/platform-Nintendo%20Switch%20(ARM64)-lightgrey) ![license](https://img.shields.io/badge/license-GPL--3.0-blue) [![Support me on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20me-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/ojojoj)
-
-[Status](#status) · [Install](#install) · [Overclocking](#overclocking) · [Known issues](#known-issues) · [Send logs](#help-improve-it-send-your-logs) · [Docs](#documentation) · [Credits](#credits)
-
-</div>
+<img src="docs/banner/carbon-x-collectors-beta.png" alt="Need for Speed Carbon X Collector's Edition (Beta)" width="80%">
 
 # NFS Carbon NX
 
-Need for Speed: Carbon (Xbox 360, 2006) running natively on the Nintendo Switch.
+**Need for Speed: Carbon on the Nintendo Switch. Translated, not emulated.**
 
-This is not an emulator. The PowerPC code of the game's `default.xex` is translated to C++ with
-[ReXGlue](https://github.com/rexglue/rexglue-sdk) and compiled for the Switch. The game's GPU commands are drawn
-by a native Vulkan renderer running on NVK (Mesa). It runs the **Xbox 360 release** of the game, not the original
-Xbox version. You need your own copy of the Xbox 360 game.
+![Standard Edition](https://img.shields.io/badge/Standard%20Edition-v1.0.0-brightgreen) ![Collector's Edition](https://img.shields.io/badge/Collector's%20Edition-v1.0.0--collectors--beta.1-orange) ![Platform](https://img.shields.io/badge/platform-Nintendo%20Switch%20(ARM64)-lightgrey) ![License](https://img.shields.io/badge/license-GPL--3.0-blue) [![Support me on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20me-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/ojojoj)
 
-> [!WARNING]
-> **Beta, and it needs an overclock.** It boots, plays and saves. At stock handheld clocks it is too slow and the audio
-> stutters. At the reference overclock (CPU 1428 MHz, GPU 768 MHz, memory 1600 MHz) it plays at about 30 FPS or better.
-> Read [Overclocking](#overclocking) and [Known issues](#known-issues) first.
+[Overview](#overview) · [Screenshots](#screenshots) · [Install](#install) · [Performance](#performance) · [What's new](#whats-new-in-100) · [Known issues](#known-issues) · [Report a problem](#report-a-problem) · [Docs](#documentation) · [Credits](#credits)
 
-## Status
+</div>
 
-| Area | State |
-|---|---|
-| Boot, menus, career, saves | Work (saves persist across launches) |
-| Races | Playable. Two measured sessions at CPU 1428 / GPU 768 / RAM 1600 MHz (scene at 90%, plain scaling): median 32 and 38 FPS, 53% and 93% of the time at 30 FPS or more ([details](docs/PERFORMANCE.md)). The densest scenes fall to the low 20s. With the new default (80% with FSR upscaling, quiet log) a 15-minute session at the same clocks ran at a median of 40.8 FPS, 95% of the time at 30 FPS or more (different scenes, so not a strict comparison) |
-| Cutscenes | Work, decoded with FFmpeg and checked against the game's own decoder at the start of each movie |
-| Audio | Almost clean at the reference clocks. Not perfect: see Known issues |
-| Controller rumble | On by default (`input_vibracion`) |
-| Long sessions | Fixed in 0.1.0-beta.7: texture memory is now capped, so a 90-minute session no longer runs out of memory |
-| DLC packages | **Can be loaded**: put the packages in `dlc/` and the game reads them (see DLC) |
-| Achievements | Not confirmed to work |
-| Other editions / regions | Not supported. Only one edition has been tested (see below) |
+## Overview
 
-The numbers above were measured at CPU 1428 MHz, GPU 768 MHz, memory 1600 MHz. Stock handheld clocks are CPU 1020 MHz
-and GPU 460 MHz. See the next section.
+NFS Carbon NX runs the **Xbox 360 release** of Need for Speed: Carbon natively on the Nintendo Switch. The PowerPC code of
+the game's `default.xex` is translated to C++ with [ReXGlue](https://github.com/rexglue/rexglue-sdk) and compiled for the
+Switch's ARM64 cores; the game's GPU commands are drawn by a purpose-built **Vulkan renderer** running on NVK (Mesa).
+There is no emulation layer between the game and the hardware. You need your own copy of the game.
 
-## Overclocking
+| | Standard Edition | Collector's Edition |
+|---|---|---|
+| Release | **1.0.0**, the first non-beta release | **1.0.0-collectors-beta.1**, beta |
+| Boot, menus, career, saves | Work | Work, fewer hours of testing |
+| Heaviest races (13 to 16 cars) | median **31 FPS**, 62% of the time at 30 FPS or more | **24 to 30 FPS** |
+| Open roads, lighter races | 40 to 55 FPS | 45 to 55 FPS |
+| Cutscenes | Work (FFmpeg, verified against the game's own decoder) | Not covered by testing yet |
+| Audio | Clean in most windows; a heavy race start can still crackle | Same code, slightly worse in the heaviest races |
+| DLC | Up to 30 packs | Up to 30 packs |
+| Install folder | `switch/nfscarbon/` | `switch/nfscarbon-collectors/` |
 
-The game's code runs on three Switch cores and the CPU is the limit, so this port **is meant to be used with a CPU
-overclock**. The reference settings are CPU 1428 MHz, GPU 768 MHz and memory 1600 MHz. In the maintainer's tests with them:
+Measured on a Switch in handheld mode at CPU 1428 MHz, GPU 768 MHz, memory 1600 MHz, scene drawn at 80% and upscaled with
+FSR. Stock clocks are CPU 1020 MHz and GPU 460 MHz.
 
-- one measured session at 1428 MHz (scene resolution 90%, plain scaling) ran at a median of 38 FPS with 93% of the time at 30 FPS
-  or more, and audio drop-outs were rare ([docs/PERFORMANCE.md](docs/PERFORMANCE.md));
-- a longer 22-minute session ran at a median of 32 FPS, with 53% of the time at 30 FPS or more and 2% under 25;
-- open roads run 40-50 FPS, the densest city scenes about 20-30;
-- with the beta.7 defaults (80% with FSR) a 15-minute session ran at a median of 40.8 FPS, 84 of 88 windows at 30 FPS
-  or more, lowest 21.3 ([docs/PERFORMANCE.md](docs/PERFORMANCE.md));
-- audio drop-outs are rare, but they still happen around the start of a race (see Known issues).
+> [!IMPORTANT]
+> **It is meant to be used with a CPU overclock.** The game's code runs on three Switch cores and the CPU is the limit. At stock
+> handheld clocks it is too slow and the audio stutters. Read [Overclocking](#overclocking) and [Known issues](#known-issues)
+> before you start.
 
-Use a clock manager of your choice (for example Horizon OC or sys-clk) and set the profile for the game you launch it
-from. Overclocking is at your own risk: it can make the console unstable, hot, or corrupt data. Back up your SD card
-and NAND, start with small steps and test stability. This project does not provide overclocking tools.
+### Highlights
 
-## What you need
+- **Native renderer.** Xenos GPU commands become Vulkan draws; shaders are translated (microcode to GLSL to SPIR-V) and cached on the SD card.
+- **FSR upscaling, bloom, 4x anisotropic filtering** on by default; every quality switch is in `nfscarbon.toml` ([settings](docs/CONFIG.md)).
+- **Audio that holds up.** The output refills its cushion after a hiccup instead of going silent, and the game's mixer runs above the decoder and GPU threads.
+- **Hand-written fast paths** where profiling showed the translated code is slow: mixer helpers (some NEON), cutscene decoding, texture untiling, vertex and constant uploads. Each has an off-switch.
+- **DLC packages** load from a `dlc/` folder (up to 30).
+- **Two editions, one runtime.** Collector's support shares the renderer, kernel and hooks; per-edition addresses live in one table.
+- **Measured, not guessed.** Built-in statistics (`nfscarbon.report.toml`) produce the numbers on this page; every claim here comes from hardware logs.
 
-- A Switch running custom firmware (Atmosphere) that can launch homebrew with title override.
-- The Xbox 360 files of the game, extracted: `default.xex`, `NFS/` and `Movies/`. The tested edition has
-  `default.xex` SHA-256 `947f95c7306eabf5bc72972938df57a922798bafbc02edf1a9107f0462c721e1`
-  (title 454107EC, media 51D2B53F). Other editions may crash or misbehave.
-- The release zip from the Releases page.
+## Screenshots
 
-The game files are not included and never will be. Use dumps of original discs you own.
+Captured on a Switch in handheld mode at the reference clocks. The number in the corner is the FPS at that moment.
+
+<table>
+<tr>
+<td width="50%"><img src="docs/screenshots/standard-freeroam-chinatown-60fps.jpg" alt="Standard Edition, free roam in Historic Chinatown, 60 FPS"><br><sub>Standard Edition: free roam, Historic Chinatown (60 FPS)</sub></td>
+<td width="50%"><img src="docs/screenshots/standard-race-skyline-32fps.jpg" alt="Standard Edition, race on the mountain road at 219 km/h, 32 FPS"><br><sub>Standard Edition: race at 219 km/h (32 FPS)</sub></td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/screenshots/standard-race-aston-43fps.jpg" alt="Standard Edition, night race with motion blur, 43 FPS"><br><sub>Standard Edition: night race with the speed effects (43 FPS)</sub></td>
+<td width="50%"><img src="docs/screenshots/standard-career-menu.jpg" alt="Standard Edition, career menu in the garage"><br><sub>Standard Edition: career menu</sub></td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/screenshots/collectors-race-old-quarter-25fps.jpg" alt="Collector's Edition beta, race in the Old Quarter, 25 FPS"><br><sub>Collector's Edition (beta): race in the Old Quarter (25 FPS, one of the heavy scenes)</sub></td>
+<td width="50%"><img src="docs/screenshots/collectors-freeroam-night-43fps.jpg" alt="Collector's Edition beta, free roam at night, 43 FPS"><br><sub>Collector's Edition (beta): free roam at night (43 FPS)</sub></td>
+</tr>
+</table>
 
 ## Install
 
-Extract the zip so that the SD card looks like this:
+### What you need
+
+- A Switch running custom firmware (Atmosphere) that can launch homebrew with title override.
+- The Xbox 360 files of the game, extracted: `default.xex`, `NFS/` and `Movies/`, from a disc you own. Tested editions:
+
+  | Edition | `default.xex` SHA-256 | Title / media |
+  |---|---|---|
+  | Standard | `947f95c7306eabf5bc72972938df57a922798bafbc02edf1a9107f0462c721e1` | 454107EC / 51D2B53F |
+  | Collector's | `922c7a1a2fc77405c43aac5159ad67fb0414c872084abc3335c68dbb4bec1815` | 454107EC / 1F8BEB88 (version 7) |
+
+  Other editions may crash or misbehave.
+- The release files from the [Releases](../../releases) page: loose `.nro` and `.toml` files, no archive.
+
+The game files are not included and never will be.
+
+### SD card layout
+
+**Standard Edition**
 
 ```text
 sdmc:/switch/nfscarbon/
@@ -79,64 +97,111 @@ sdmc:/switch/nfscarbon/
     default.xex
     NFS/
     Movies/
-  dlc/                (optional, see DLC)
+  dlc/                    (optional, see DLC)
 ```
 
-Launch it with **title override**: hold **R** while starting an installed game, and pick a game that leaves the
-application about 3.2 GB of memory (the log prints `proceso X/Y MB` and `[limits]` at startup; a host that gives less
-makes cutscene threads fail).
+**Collector's Edition (beta)** goes in its own folder, so both editions can be installed side by side (saves are separate;
+use a fresh `user/` folder for the first test):
 
-**Forwarder:** a forwarder made with [Sphaira](https://github.com/NaGaa95/sphaira) works. When you generate it,
-set the address space to **39-bit**: the default is too small and the game aborts while creating threads. Use the
-forwarder's own settings for launching; nothing else changes. Keep in mind that a forwarder gets its own memory
-budget, so check the `[limits]` lines in the log after the first run.
+```text
+sdmc:/switch/nfscarbon-collectors/
+  nfscarbon-collectors.nro
+  nfscarbon.toml
+  nfscarbon.report.toml
+  game-data/              (the Collector's Edition dump)
+  dlc/                    (optional, see DLC)
+```
+
+### Launching
+
+Launch with **title override**: hold **R** while starting an installed game, and pick a game that leaves the application
+about 3.2 GB of memory (the log prints `proceso X/Y MB` and `[limits]` at startup; a host that gives less makes cutscene
+threads fail).
+
+A forwarder made with [Sphaira](https://github.com/NaGaa95/sphaira) works too. Generate it with the address space set to
+**39-bit** (the default is too small and the game aborts while creating threads), and check the `[limits]` lines in the
+log after the first run, because a forwarder gets its own memory budget.
 
 The first time you play, shaders and pipelines are compiled as they are needed and cached on the SD card, so the first
 races can stutter for a few seconds. Do not delete `user/cache`.
 
-## Controls
+### Overclocking
 
-Each Switch button acts as the Xbox 360 button with the same letter. `+` is Start, `-` is Back, ZL/ZR are the
-triggers, L/R the bumpers. Set `input_xbox_layout = true` in `nfscarbon.toml` to swap the face buttons by position.
-Controller rumble is on; set `input_vibracion = false` to turn it off.
+The reference settings are CPU 1428 MHz, GPU 768 MHz and memory 1600 MHz. Use a clock manager of your choice (for example
+Horizon OC or sys-clk) and set the profile for the game you launch it from. Overclocking is at your own risk: it can make
+the console unstable, hot, or corrupt data. Back up your SD card and NAND, start with small steps and test stability.
+This project does not provide overclocking tools.
 
-Shortcuts (hold **L + R** and press):
+### Controls
 
-| Button | Action |
+Each Switch button acts as the Xbox 360 button with the same letter. `+` is Start, `-` is Back, ZL/ZR are the triggers,
+L/R the bumpers. Set `input_xbox_layout = true` in `nfscarbon.toml` to swap the face buttons by position. Controller
+rumble is on; set `input_vibracion = false` to turn it off.
+
+| Hold **L + R** and press | Action |
 |---|---|
 | Up | Debug overlay (FPS and counters) |
 | Right | Settings overlay |
 | Left | Achievements list |
 
-## Settings
+### Settings
 
-`nfscarbon.toml` next to the NRO holds the settings. The ones that matter are described in
-[docs/CONFIG.md](docs/CONFIG.md), including the quality switches (render scale, upscaling filter, texture detail,
-anisotropic filtering, bloom). Every setting has a default; the file only lists what differs.
+`nfscarbon.toml` next to the NRO holds the settings; every setting has a default and the file only lists what differs. The
+ones that matter are in [docs/CONFIG.md](docs/CONFIG.md): render scale, upscaling filter, texture detail, anisotropic
+filtering, bloom. The shipped file is **quiet**: it logs warnings only and statistics are off, because logging costs frame
+rate (most at the race start). `carbon_gpu_bloom = false` saves about 4 ms of GPU time per frame in a crowded race.
 
-The shipped file is **quiet**: it logs warnings only and the statistics are off, because logging costs frame rate
-(most at the race start). The scene is drawn at 80% and upscaled with FSR; set `present_effect = "bilinear"` and
-`carbon_gpu_render_scale = 90` for the older plain scaling.
+## Performance
+
+Handheld, 1428 / 768 / 1600 MHz, 80% with FSR, bloom on, 30 DLC packs installed. A window is the 5 seconds between two
+statistics lines of the renderer; "heavy" means race wars (13 to 16 cars, about 1900 draws per frame).
+
+| Windows with more than 300 draws | Standard | Collector's (beta) |
+|---|---|---|
+| FPS median / 10th / 90th percentile | 31.5 / 26.8 / 38.0 | 26.3 / 20.3 / 46.6 |
+| Lowest | 18.7 | 15.5 |
+| At 30 FPS or more | 62% | 29% |
+| Under 25 FPS | 8% | 42% |
+
+In the heaviest races the Standard Edition holds about 30 FPS; open roads and lighter races run 40 to 55 FPS. The Collector's
+Edition is slower there because its translated game code keeps registers in memory between calls. Audio requests that found no
+data per 10 seconds went from 50 to 410 in nearly every race window to none in most windows. The full measurements, what was
+tried and did not help, and the older sessions are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+## What's new in 1.0.0
+
+Changes since 0.1.0-beta.8 (full list in [CHANGELOG.md](CHANGELOG.md)):
+
+- **Collector's Edition support (beta).** Its own folder and NRO; the scheduling and audio hooks of the standard edition were
+  ported with every address checked against the Collector's code, and the same renderer is used.
+- **Much less audio stutter.** The output asked the game for exactly one frame per 5.3 ms, so once its 32-frame cushion emptied it
+  never refilled and every small hiccup of the mixer became silence. It refills now, and the mixer thread runs above the XMA and
+  GPU threads.
+- **Bloom on by default**, and the pause menu background works with bloom off.
+- **Car reflection pass refreshed every 30 frames** instead of being skipped for good.
+- **DLC that survives interrupted installs.** A stale install journal used to make every install fail and hide all DLC; duplicate
+  packs install once, install work folders are cleaned up with a fallback that works on the SD card, and at most 30 packs are
+  listed to the game because 36 and 52 crashed the profile load.
+- **New diagnostics** for performance reports: per-pass render timings and audio queue statistics, only in `nfscarbon.report.toml`.
+
+Tried and dropped because they did not help: running the audio mixer at 44.1 kHz, skipping silent voices (about 7% of the
+mixing) and lowering the model detail of the other racers.
 
 ## DLC
 
-Put Xbox 360 DLC packages (the STFS files) anywhere under `sdmc:/switch/nfscarbon/dlc/`. At startup they are
-extracted into the content folder and the game finds them through its normal content API. The log shows
-`[dlc] N package(s) installed`. DLC can be loaded this way; tell us which packs you tried and what showed up in the
-game, so the list of working packs can grow.
+Put Xbox 360 DLC packages (the STFS files) anywhere under `dlc/`. At startup they are extracted into the content folder and the
+game finds them through its normal content API. The log shows `[dlc] N package(s) installed, M failed`. The same file in two
+folders is installed once.
 
-Removing a source package from `dlc/` does **not** uninstall its extracted copy in `user/`.
-When changing packs, back up `user/` and follow the cleanup steps below to avoid mixing old and new installations.
-Beta.8 checks and stages replacement installs, but does not add automatic DLC removal or verify large pack sets.
+**Keep to 30 packs or fewer.** 30 packs ran a long session without a crash; 36 and 52 crashed while the profile loaded (a call
+to the garbage address `0xEEEEEEEE` right after the last pack's token file was read). The game is shown at most 30
+(`content_max_marketplace_items`) and logs a warning when it drops some. Which items a pack unlocks is mostly untested.
 
-**DLC may have a limit that is not verified yet.** One run with many packs (36 extracted DLC folders, some of them
-leftovers of packages that had been removed or installed twice) crashed while loading the profiles. After the extracted
-folders were deleted and re-created from the same `dlc/` files, the game loaded again. We do not know yet whether the
-cause is the number of packs or the stale leftovers, so treat large DLC sets as untested.
+<details>
+<summary>Packages verified working, and what to do if the profile crashes</summary>
 
-Packages verified working on the Switch port. All 11 were installed together and a 57-minute career session ran on
-them (boss races, cutscenes, saves) without a DLC-related crash. "Token" is the file the game opens inside the pack,
-seen in the log:
+All 11 of these were installed together and a 57-minute career session ran on them (boss races, cutscenes, saves) without a
+DLC-related crash. "Token" is the file the game opens inside the pack, seen in the log:
 
 | Package (folder name in `dlc/`) | Token the game opened | Status |
 |---|---|---|
@@ -152,77 +217,81 @@ seen in the log:
 | Exotic Base Car Bundle | `snips.txt`, `william.txt` (shared with the next row) | Verified working |
 | Need for Speed Carbon CE Bundle | `snips.txt`, `william.txt` (shared with the previous row) | Verified working |
 
-Verified means the pack loaded and the game ran; it does not mean every item inside the pack was checked in the game.
-Other packs (muscle and tuner kits, parts, vinyls, more cars) are untested: a run with a much larger set crashed while
-the profiles loaded. Add packs a few at a time and tell us what happens.
+Verified means the pack loaded and the game ran; it does not mean every item inside the pack was checked in the game. A later
+30-pack run also loaded more bundles (performance tiers, custom and base car bundles, the Maximum Carbon Bundle) and ran fine.
+Removing a package from `dlc/` does **not** uninstall its extracted copy in `user/`.
 
 **If the game crashes while loading the profile after you changed your DLC** (the log ends right after a line like
 `[dlc] el juego abre 'save:\...'`, and `rex_crash.log` reports a call to an invalid guest address):
 
 1. Back up `sdmc:/switch/nfscarbon/user/` first.
-2. Delete everything inside these two folders (only the extracted DLC, never the other folders in `user/`, those hold
-   your profile and saves):
+2. Delete everything inside these three folders (only the extracted DLC and its install work data, never the other folders in
+   `user/`, those hold your profile and saves):
    - `sdmc:/switch/nfscarbon/user/0000000000000000/454107EC/00000002/`
    - `sdmc:/switch/nfscarbon/user/0000000000000000/454107EC/Headers/00000002/`
-3. Start the game. The packages in `dlc/` are extracted again at launch. If it still crashes, move most packages out of
-   `dlc/` and add them back a few at a time.
+   - `sdmc:/switch/nfscarbon/user/0000000000000000/454107EC/.dlc-install/`
+3. Start the game. The packages in `dlc/` are extracted again at launch. If it still crashes, move most packages out of `dlc/`
+   and add them back a few at a time (30 at most).
+
+</details>
 
 ## Known issues
 
-- **Below the reference clocks**, audio drop-outs and low frame rates are likely: the game's software mixer needs more
-  CPU than three slow cores give.
-- **Audio is not perfect.** At the reference clocks it is clean most of the time, but the race start still stutters: in the
-  latest 15-minute session 7 windows of 10 seconds around a race start had audio requests without data (up to 482
-  per 10 s in the worst one, 0 in the median window) while the CPU was saturated. Close packs of cars can do it too. The game ties its sound updates to the frame rate, so when
-  the frame rate dips the sound can stutter with it. Menus are normally fine.
-- **Frame rate** falls to about 20-25 FPS in the densest scenes (about 4000 draws per frame), with single windows lower.
-  Open roads run much better.
-- **Black flashes** of the car shadows for a frame, now and then. Cause unknown.
+- **Below the reference clocks**, audio drop-outs and low frame rates are likely: the game's software mixer needs more CPU than
+  three slow cores give.
+- **Audio is much better but not perfect.** A heavy race start can still crackle for a few seconds: in the latest runs 4 of 23
+  busy windows of 10 seconds had more than 50 audio requests without data (worst 135, median 1). The mixer needs about 3.8 ms of
+  CPU per 5.3 ms block there, with no headroom, and the CPU is saturated.
+- **Frame rate** in race wars is about 30 FPS on the Standard Edition and 24 to 30 on the Collector's beta.
+- **Flashing shadows.** For a few frames, car shadows can turn into black patches next to a washed-out white road. It appears
+  only while the motion blur or tunnel vision effect is on, at speed (around 120 to 150 km/h) with strong light and many cars.
+  It is not caused by bloom or by the car reflection pass (both tested). Cause still unknown.
+- **Collector's Edition is a beta**: slower, and with fewer hours of testing.
 - **Achievements** are not confirmed. The SDK handles the unlock call, but no unlock has been seen in the logs.
-- A forwarder needs the 39-bit address space option (see Install). Without it the game aborts while creating threads.
-- Only one edition is tested. A title-override host with a small memory budget can still make a cutscene fail (the
-  game then waits for a thread that was never created and appears frozen); pick a host that leaves about 3.2 GB.
+- A title-override host with a small memory budget can make a cutscene fail (the game waits for a thread that was never created
+  and appears frozen); pick a host that leaves about 3.2 GB.
 
-More detail in [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) and the measurements in
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+More detail in [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
 
-## How it works
+## Report a problem
 
-- **Translated, not emulated.** ReXGlue turns every function of `default.xex` into C++ and gives the game the Xbox
-  360 kernel, files, audio and controllers it expects. This project adds the Switch side: memory, threads, clocks,
-  audio output and presenting frames.
-- **Native renderer.** The game's GPU command stream is read and drawn with Vulkan (`renderer/`), with its own shader
-  translation (Xenos microcode to GLSL to SPIR-V) cached on disk.
-- **Driver.** Vulkan comes from NVK, via [mesa-switch](https://github.com/danfromtico/mesa-switch).
-- **Upscaling.** The scene is drawn at 80% of 1280x720 and scaled up with FSR (or CAS or bilinear, your choice).
-- **Hand-written fast paths** where profiling showed the recompiled code is slow: audio mixer helpers (some with
-  NEON), the cutscene decoder (FFmpeg WMV3, verified against the game's own output), texture untiling, vertex
-  and constant uploads. Each one has an off-switch in `nfscarbon.toml`.
+**If you send an issue report, I will address it.** This is a one-person project, so a good report is the fastest way to get
+something fixed, and where it runs well and where it does not depends on the console, the clocks and the scene. To report one:
 
-## Help improve it: send your logs
-
-Where it runs well and where it does not depends on the console, the clocks and the scene, and every run teaches us
-something. Higher frame rates (60 FPS is the long-term wish, but it is far away) will come from finding what
-limits real setups. If you play it, please send a report in the same shape every time:
-
-0. The default `nfscarbon.toml` is quiet (it logs warnings only) because statistics cost frame rate. For a report,
-   copy `nfscarbon.report.toml` over `nfscarbon.toml` for one session, then put your normal file back.
-1. Play for at least one race and note the clocks you used.
-2. Copy `sdmc:/switch/nfscarbon/logs/` to your PC.
-3. Run `powershell -File scripts/pack-logs.ps1 -Logs <that folder>`. It writes a zip and prints the summary
-   (FPS spread, draws, GPU time, audio drop-outs, clocks).
-4. Open an issue with the **Performance / audio report** template and attach the zip.
+1. Play for at least one race and note the edition, the clocks you used and what went wrong.
+2. For performance and audio problems, copy `nfscarbon.report.toml` over `nfscarbon.toml` for one session (it logs everything; put your normal file back afterwards).
+3. Copy `sdmc:/switch/nfscarbon/logs/` (or `nfscarbon-collectors/logs/`) to your PC and run
+   `powershell -File scripts/pack-logs.ps1 -Logs <that folder>`. It writes a zip and prints a summary (FPS spread, draws, GPU
+   time, audio drop-outs, clocks).
+4. [Open an issue](../../issues/new/choose) with the **Performance / audio report** template and attach the zip. For a crash,
+   include `logs/rex/rex_crash.log`.
 
 The logs contain your save profile names and SD paths; remove what you do not want to share. Never attach game files.
 
+## How it works
+
+- **Translated, not emulated.** ReXGlue turns every function of `default.xex` into C++ and gives the game the Xbox 360
+  kernel, files, audio and controllers it expects. This project adds the Switch side: memory, threads, clocks, audio output
+  and presenting frames.
+- **Native renderer.** The game's GPU command stream is read and drawn with Vulkan (`renderer/`), with its own shader
+  translation cached on disk. Vulkan comes from NVK, via [mesa-switch](https://github.com/danfromtico/mesa-switch).
+- **Upscaling.** The scene is drawn at 80% of 1280x720 and scaled up with FSR (or CAS or bilinear, your choice).
+- **Hand-written fast paths** where profiling showed the recompiled code is slow: audio mixer helpers (some with NEON), the
+  cutscene decoder (FFmpeg WMV3, verified against the game's own output), texture untiling, vertex and constant uploads.
+- **Two editions, one runtime.** The Collector's Edition is translated from its own `default.xex`; the hooks take their
+  addresses from a per-edition table (`src/edition.h`).
+
+The whole path from `default.xex` to a frame is in [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md).
+
 ## Documentation
 
-- [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md): the whole path from `default.xex` to a frame, in order.
-- [docs/PERFORMANCE.md](docs/PERFORMANCE.md): a measured session, explained.
+- [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md): from `default.xex` to a frame, in order.
+- [docs/PERFORMANCE.md](docs/PERFORMANCE.md): measured sessions, explained.
 - [docs/CONFIG.md](docs/CONFIG.md): every setting.
 - [docs/BUILD.md](docs/BUILD.md): building from source.
-- `scripts/summarize_run.py <logs folder>`: turns your logs into FPS, draws, GPU time and audio drop-out numbers
-  for a bug report.
+- [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md): problems we know about, and what was fixed.
+- [CHANGELOG.md](CHANGELOG.md): what changed in each version.
+- `scripts/summarize_run.py <logs folder>`: turns your logs into FPS, draws, GPU time and audio drop-out numbers.
 
 ## Building
 
@@ -232,7 +301,9 @@ upstream source trees are kept as patches in `patches/`. The verified host is Wi
 
 ## Support
 
-This is a free-time project. Testing on real hardware takes many hours, and the AI assistants used for development are not free. If you like the work, you can kindly leave a tip on [Ko-fi](https://ko-fi.com/ojojoj). It is never required, and the port stays free.
+This is a free-time project. Testing on real hardware takes many hours, and the AI assistants used for development are not
+free. If you like the work, you can kindly leave a tip on [Ko-fi](https://ko-fi.com/ojojoj). It is never required, and the
+port stays free.
 
 [![Support me on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20me-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/ojojoj)
 
@@ -263,20 +334,19 @@ This is a free-time project. Testing on real hardware takes many hours, and the 
   [codepdbh/nfsmw-android](https://github.com/codepdbh/nfsmw-android): Carbon and Most Wanted for Android, from the
   same family of recompilation projects. Nothing from them is used here.
 
-Development used AI coding assistants (OpenAI Codex and Anthropic Claude Code) under the maintainer's direction;
-hardware testing and every release decision are the maintainer's.
+Development used AI coding assistants (OpenAI Codex and Anthropic Claude Code) under the maintainer's direction; hardware
+testing and every release decision are the maintainer's.
 
 ## Legal
 
-**This project does not modify any game files.** It reads your game files and never writes to them: saves, caches
-and installed DLC go to separate folders (`user/`). It is meant to be used **only with dumps of original game discs
-that you own**, made by you. It is not a way to obtain the game: do not
-ask for game files and do not share them.
+**This project does not modify any game files.** It reads your game files and never writes to them: saves, caches and
+installed DLC go to separate folders (`user/`). It is meant to be used **only with dumps of original game discs that you own**,
+made by you. It is not a way to obtain the game: do not ask for game files and do not share them.
 
-This repository contains no code or assets from the original game: no executable, archives, movies, shaders or
-generated guest code. You must supply your own legally obtained copy. "Need for Speed" is a trademark of Electronic
-Arts Inc.; Nintendo Switch is a trademark of Nintendo; Xbox 360 is a trademark of Microsoft. This project is not
-affiliated with or endorsed by any of them. Running homebrew needs custom firmware, which Nintendo's terms forbid and
-which can get a console banned. Use it at your own risk.
+This repository contains no code or assets from the original game: no executable, archives, movies, shaders or generated guest
+code. You must supply your own legally obtained copy. "Need for Speed" is a trademark of Electronic Arts Inc.; Nintendo Switch
+is a trademark of Nintendo; Xbox 360 is a trademark of Microsoft. This project is not affiliated with or endorsed by any of
+them. Running homebrew needs custom firmware, which Nintendo's terms forbid and which can get a console banned. Use it at your
+own risk.
 
 License: see [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
