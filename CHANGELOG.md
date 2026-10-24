@@ -51,7 +51,7 @@ First release of the Collector's Edition port. Beta. It uses the same renderer, 
 1.0.0 above (everything under "Added", "Fixed" and "Changed" there applies), with these differences:
 
 - Own install folder `switch/nfscarbon-collectors/` and own NRO `nfscarbon-collectors.nro`; saves are separate from the
-  standard edition's. `default.xex` SHA-256 `922c7a1a2fc77405c43aac5159ad67fb0414c872084abc3335c68dbb4bec1815`.
+  standard edition's. `default.xex` SHA-256 `922c7a1a2fc77405c43aac5159ad67fb0414c872084abc3335c68dbb4bec1815` (USA / NTSC-U release; the standard edition tested is the USA release too).
 - Slower than 1.0.0: its translated game code keeps every register in memory between calls. At the reference clocks race
   wars run at 24 to 30 FPS (about 31 on the standard edition), lighter scenes at 45 to 55. A faster register-local
   translation exists but has not been run on hardware, so it is not part of this release.
