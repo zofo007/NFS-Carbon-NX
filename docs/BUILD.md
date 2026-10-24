@@ -72,7 +72,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-switch.ps1 -Ed
 ```
 
 The accepted CE executable has SHA-256 `922c7a1a2fc77405c43aac5159ad67fb0414c872084abc3335c68dbb4bec1815`
-(media `1F8BEB88`, version 7). The script uses the existing host code generator; it does not build a Windows game.
+(media `1F8BEB88`, version 7, USA / NTSC-U). The script uses the existing host code generator; it does not build a Windows game.
 Generated code, CMake glue, build files and artifacts are separate from standard edition output.
 The renderer and runtime source are shared. Plain `build-switch.ps1` still builds the standard edition.
 Re-run the edition's build script after updates; it also runs the required code generation.

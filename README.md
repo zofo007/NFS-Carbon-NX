@@ -63,7 +63,7 @@ Captured on a Switch in handheld mode at the reference clocks. The number in the
 </tr>
 <tr>
 <td width="50%"><img src="docs/screenshots/collectors-race-old-quarter-25fps.jpg" alt="Collector's Edition beta, race in the Old Quarter, 25 FPS"><br><sub>Collector's Edition (beta): race in the Old Quarter (25 FPS, one of the heavy scenes)</sub></td>
-<td width="50%"><img src="docs/screenshots/collectors-freeroam-night-43fps.jpg" alt="Collector's Edition beta, free roam at night, 43 FPS"><br><sub>Collector's Edition (beta): free roam at night (43 FPS)</sub></td>
+<td width="50%"><img src="docs/screenshots/collectors-canyon-race-night-43fps.jpg" alt="Collector's Edition beta, canyon race at night, 43 FPS"><br><sub>Collector's Edition (beta): canyon race at night (43 FPS)</sub></td>
 </tr>
 </table>
 
@@ -74,12 +74,13 @@ Captured on a Switch in handheld mode at the reference clocks. The number in the
 - A Switch running custom firmware (Atmosphere) that can launch homebrew with title override.
 - The Xbox 360 files of the game, extracted: `default.xex`, `NFS/` and `Movies/`, from a disc you own. Tested editions:
 
-  | Edition | `default.xex` SHA-256 | Title / media |
-  |---|---|---|
-  | Standard | `947f95c7306eabf5bc72972938df57a922798bafbc02edf1a9107f0462c721e1` | 454107EC / 51D2B53F |
-  | Collector's | `922c7a1a2fc77405c43aac5159ad67fb0414c872084abc3335c68dbb4bec1815` | 454107EC / 1F8BEB88 (version 7) |
+  | Edition | `default.xex` SHA-256 | Title / media | Region |
+  |---|---|---|---|
+  | Standard | `947f95c7306eabf5bc72972938df57a922798bafbc02edf1a9107f0462c721e1` | 454107EC / 51D2B53F | NTSC-U (USA) |
+  | Collector's | `922c7a1a2fc77405c43aac5159ad67fb0414c872084abc3335c68dbb4bec1815` | 454107EC / 1F8BEB88 (version 7) | NTSC-U (USA) |
 
-  Other editions may crash or misbehave.
+  Both tested dumps are the **USA (NTSC-U)** releases: the region flags in their executables are `0x000000FF`. Other
+  editions and regions (PAL, NTSC-J) have not been tested and may crash or misbehave.
 - The release files from the [Releases](../../releases) page: loose `.nro` and `.toml` files, no archive.
 
 The game files are not included and never will be.
