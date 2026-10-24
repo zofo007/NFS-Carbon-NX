@@ -81,11 +81,14 @@ Captured on a Switch in handheld mode at the reference clocks. The number in the
 
   Both tested dumps are the **USA (NTSC-U)** releases: the region flags in their executables are `0x000000FF`. Other
   editions and regions (PAL, NTSC-J) have not been tested and may crash or misbehave.
-- The release files from the [Releases](../../releases) page: loose `.nro` and `.toml` files, no archive.
+- The release zip from the [Releases](../../releases) page: `nfscarbon-1.0.0.zip` for the Standard Edition,
+  `nfscarbon-collectors-1.0.0-beta.1.zip` for the Collector's Edition. Each contains the folder layout below.
 
 The game files are not included and never will be.
 
 ### SD card layout
+
+Extract the zip at the **root of the SD card**; it creates the folders below. Then copy your own game files into `game-data/`.
 
 **Standard Edition**
 
