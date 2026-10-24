@@ -63,7 +63,7 @@ Captured on a Switch in handheld mode at the reference clocks. The number in the
 </tr>
 <tr>
 <td width="50%"><img src="docs/screenshots/collectors-race-old-quarter-25fps.jpg" alt="Collector's Edition beta, race in the Old Quarter, 25 FPS"><br><sub>Collector's Edition (beta): race in the Old Quarter (25 FPS, one of the heavy scenes)</sub></td>
-<td width="50%"><img src="docs/screenshots/collectors-freeroam-night-43fps.jpg" alt="Collector's Edition beta, free roam at night, 43 FPS"><br><sub>Collector's Edition (beta): free roam at night (43 FPS)</sub></td>
+<td width="50%"><img src="docs/screenshots/collectors-canyon-race-night-43fps.jpg" alt="Collector's Edition beta, canyon race at night, 43 FPS"><br><sub>Collector's Edition (beta): canyon race at night (43 FPS)</sub></td>
 </tr>
 </table>
 
