@@ -1,4 +1,5 @@
-#include "../carbon-source/generated/default/nfscarbon_pch.h"
+#include "edition.h"
+#include CARBON_GUEST_PCH
 #include "audio_filter_8bb0.h"
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -32,7 +33,7 @@ void Callback(PPCContext& ctx, uint8_t* base) {
   const uint32_t node = ctx.r3.u32;
   const uint64_t result = REX_LOAD_U64(node + 8);
   const uint32_t object = REX_LOAD_U32(node + 16);
-  assert(ctx.r7.u64 == 0xA5 && ctx.lr == 0x826C8BF4);
+  assert(ctx.r7.u64 == 0xA5 && ctx.lr == kFilter8BB0Lr2);
   REX_STORE_U32(object + 32, 0x3F000000);
   REX_STORE_U32(ctx.r6.u32, 0x3F000000);
   ctx.r4.u64 = 0xAB12345600000001; ctx.r5.u64 = 0xBC12345600000002;

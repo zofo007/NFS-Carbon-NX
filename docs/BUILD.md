@@ -63,6 +63,36 @@ The result is `artifacts/nfscarbon.nro`. Raise `-Jobs` if you have the memory; t
 Copy `nfscarbon.nro` and `config/nfscarbon.release.toml` (as `nfscarbon.toml`) to `sdmc:/switch/nfscarbon/`, together
 with your `game-data/` folder. See the README for launching.
 
+### Optional: Collector's Edition (beta)
+
+Put your Collector's Edition dump in `game-data-collectors/` (`default.xex`, `NFS/`, `Movies/`), then run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-switch.ps1 -Edition collectors -Jobs 4
+```
+
+The accepted CE executable has SHA-256 `922c7a1a2fc77405c43aac5159ad67fb0414c872084abc3335c68dbb4bec1815`
+(media `1F8BEB88`, version 7). The script uses the existing host code generator; it does not build a Windows game.
+Generated code, CMake glue, build files and artifacts are separate from standard edition output.
+The renderer and runtime source are shared. Plain `build-switch.ps1` still builds the standard edition.
+Re-run the edition's build script after updates; it also runs the required code generation.
+
+Output: `artifacts/collectors/nfscarbon-collectors.nro` and `artifacts/collectors/nfscarbon.toml`.
+Install both in `sdmc:/switch/nfscarbon-collectors/`, with the CE dump in that folder's `game-data/`.
+Use a fresh, separate `user/` folder for the first test. The standard installation stays in `switch/nfscarbon/`.
+
+The normal Collector's build uses context-preserving translated guest routines (every register lives in the guest
+context between calls), which is why its game code is about 25 to 35% slower than the standard edition's. It shares the
+standard edition's native hooks: the GPU ring-space wait, the frame hand-off, the audio helpers, the render-pass timers
+and cube refresh, the audio server wait and the car-detail hook. Every address in the Collector's branches of those hooks
+was matched instruction for instruction against the standard edition (`src/edition.h`; the tests in
+`tests/test_editions.py` re-check them against the generated code), and the audio helpers have differential tests
+(`tests/check_audio_collectors.ps1`).
+
+`-Edition collectors-rl` builds an experimental register-local Collector's NRO (`artifacts/collectors-rl/`), translated
+the way the standard edition is. It needs the list of functions that read each other's registers
+(`config/collectors_rl_share_registers.txt`; `scripts/check_register_sharing.py` checks it). It is smaller and should be
+faster, but it has not been run on hardware yet; a crash reports the guest address that needs a new entry.
 ### Optional: DLC
 
 Copy your Xbox 360 DLC packages (the STFS files, from your own copy of the game) into

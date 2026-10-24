@@ -1,13 +1,19 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 2f69162..8862fa9 100644
+index 2f69162..ba25d62 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -8,6 +8,16 @@ project(nfscarbon LANGUAGES CXX)
+@@ -8,7 +8,31 @@ project(nfscarbon LANGUAGES CXX)
  set(CMAKE_CXX_STANDARD 23)
  set(CMAKE_CXX_STANDARD_REQUIRED ON)
  
+-include(generated/rexglue.cmake)
 +set(REXGLUE_HOST_REXGLUE_TOOL "" CACHE FILEPATH "Native host code generator for cross builds")
-+if(REXGLUE_PLATFORM_SWITCH)
++# Collector's Edition comes in two codegen flavors: "collectors" (context-preserving, the safe baseline) and
++# "collectors-rl" (register-local codegen like the standard edition, experimental).
++if(NFSCARBON_EDITION STREQUAL "collectors" OR NFSCARBON_EDITION STREQUAL "collectors-rl")
++    set(NFSCARBON_IS_CE ON)
++endif()
++if(REXGLUE_PLATFORM_SWITCH AND NOT NFSCARBON_IS_CE)
 +    if(NOT EXISTS "${REXGLUE_HOST_REXGLUE_TOOL}")
 +        message(FATAL_ERROR "Switch builds require REXGLUE_HOST_REXGLUE_TOOL (build the host SDK first)")
 +    endif()
@@ -16,47 +22,86 @@ index 2f69162..8862fa9 100644
 +        IMPORTED_LOCATION "${REXGLUE_HOST_REXGLUE_TOOL}")
 +endif()
 +
- include(generated/rexglue.cmake)
++set(NFSCARBON_EDITION "standard" CACHE STRING "Game edition: standard or collectors")
++if(NFSCARBON_EDITION STREQUAL "collectors")
++    include(generated/collectors/rexglue.cmake)
++elseif(NFSCARBON_EDITION STREQUAL "collectors-rl")
++    include(generated/collectors-rl/rexglue.cmake)
++elseif(NFSCARBON_EDITION STREQUAL "standard")
++    include(generated/rexglue.cmake)
++else()
++    message(FATAL_ERROR "Unknown NFSCARBON_EDITION: ${NFSCARBON_EDITION}")
++endif()
  
  # Cross-compiling (Android): codegen runs at build time, so it must execute on
-@@ -23,6 +33,7 @@ endif()
+ # the host. Point the imported rexglue target at a native build.
+@@ -22,8 +46,11 @@ endif()
+ # Sources
  set(NFSCARBON_SOURCES
      src/main.cpp
-     src/dispatch_tolerance.cpp
+-    src/dispatch_tolerance.cpp
 +    src/dlc_install.cpp
  )
++if(NOT NFSCARBON_IS_CE)
++    list(APPEND NFSCARBON_SOURCES src/dispatch_tolerance.cpp)
++endif()
  
  if(WIN32)
-@@ -76,6 +87,37 @@ option(NFSCARBON_BUILD_CARBON_GPU "Build the rexgpu-carbon native renderer plugi
+     list(APPEND NFSCARBON_SOURCES src/crash_diag.cpp)
+@@ -76,6 +103,61 @@ option(NFSCARBON_BUILD_CARBON_GPU "Build the rexgpu-carbon native renderer plugi
  if(NFSCARBON_BUILD_CARBON_GPU)
      add_subdirectory(renderer)
      add_dependencies(nfscarbon rexgpu-carbon)
 +    if(REXGLUE_PLATFORM_SWITCH)
 +        target_link_libraries(nfscarbon PRIVATE rexgpu-carbon)
 +        target_compile_definitions(nfscarbon PRIVATE NFSCARBON_STATIC_CARBON_GPU=1)
++        # Shared by both editions; the hook picks its addresses from NFSCARBON_COLLECTORS.
 +        target_sources(nfscarbon PRIVATE src/ring_wait_hook.cpp)
 +    endif()
 +endif()
 +
 +if(REXGLUE_PLATFORM_SWITCH)
 +    # GCC spends minutes optimizing 72k startup-only registration calls; guest code stays optimized.
-+    set_source_files_properties(generated/default/nfscarbon_register.cpp PROPERTIES
++    set_source_files_properties(${REXGLUE_ENTRYPOINT_INCLUDE_DIR}/nfscarbon_register.cpp PROPERTIES
 +        COMPILE_OPTIONS "-O0" SKIP_PRECOMPILE_HEADERS ON)
-+    target_sources(nfscarbon PRIVATE src/audio_resampler_hook.cpp src/render_pass_profile_hook.cpp
-+                   src/frame_handoff_hook.cpp src/audio_server_wait_hook.cpp
-+                   src/switch_limits_log.cpp src/video_hook.cpp src/video_wmv3.cpp src/lod_bias_hook.cpp src/audio_mixer_diag.cpp)
-+    target_link_libraries(nfscarbon PRIVATE libavcodec libavutil)
++    target_sources(nfscarbon PRIVATE src/switch_limits_log.cpp)
++    if(NFSCARBON_EDITION STREQUAL "standard")
++        target_sources(nfscarbon PRIVATE src/audio_resampler_hook.cpp src/render_pass_profile_hook.cpp
++                       src/frame_handoff_hook.cpp src/audio_server_wait_hook.cpp src/audio_rate_hook.cpp
++                       src/video_hook.cpp src/video_wmv3.cpp src/lod_bias_hook.cpp src/audio_mixer_diag.cpp src/car_lod_hook.cpp)
++        target_link_libraries(nfscarbon PRIVATE libavcodec libavutil)
++    else()
++        # Collector's Edition shares only the verified scheduling and audio hooks (addresses in src/edition.h,
++        # ring_wait_hook.cpp and frame_handoff_hook.cpp). Video, LOD and mixer-diagnostic hooks stay standard-only.
++        target_sources(nfscarbon PRIVATE src/frame_handoff_hook.cpp src/audio_resampler_hook.cpp
++                       src/audio_server_wait_hook.cpp src/audio_rate_hook.cpp src/render_pass_profile_hook.cpp
++                       src/car_lod_hook.cpp)
++    endif()
 +    # NFSCARBON_ICON: 256x256 JPEG made from local game data; empty keeps the devkitPro default.
 +    # Version = top heading of the workspace CHANGELOG.md, so a release bump reaches the NRO and the log.
++    # The standard edition takes the first numbered heading; the Collector's editions the first one with "-collectors"
++    # in it (for example "## 1.0.0-collectors-beta.1"), so the two releases carry their own version.
 +    set(NFSCARBON_VERSION "0.1.0-dev")
++    set(_nfs_heading_regex "^## [0-9][^ ]*")
++    if(NFSCARBON_IS_CE)
++        set(_nfs_heading_regex "^## [0-9][^ ]*-collectors[^ ]*")
++    endif()
 +    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../CHANGELOG.md")
-+        file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/../CHANGELOG.md" _nfs_heading REGEX "^## [0-9][^ ]*" LIMIT_COUNT 1)
++        file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/../CHANGELOG.md" _nfs_heading REGEX "${_nfs_heading_regex}" LIMIT_COUNT 1)
 +        if(_nfs_heading MATCHES "^## ([^ ]+)")
 +            set(NFSCARBON_VERSION "${CMAKE_MATCH_1}")
 +        endif()
 +    endif()
 +    target_compile_definitions(nfscarbon PRIVATE NFSCARBON_VERSION="${NFSCARBON_VERSION}")
-+    rexglue_switch_add_nro(nfscarbon NAME "NFS Carbon NX" AUTHOR "zofo007" VERSION "${NFSCARBON_VERSION}"
++    set(NFSCARBON_DISPLAY_NAME "NFS Carbon NX")
++    if(NFSCARBON_IS_CE)
++        target_compile_definitions(nfscarbon PRIVATE NFSCARBON_COLLECTORS=1)
++        if(NFSCARBON_EDITION STREQUAL "collectors-rl")
++            target_compile_definitions(nfscarbon PRIVATE NFSCARBON_COLLECTORS_RL=1)
++        endif()
++        set(NFSCARBON_DISPLAY_NAME "NFS Carbon NX Collector's Edition")
++    endif()
++    rexglue_switch_add_nro(nfscarbon NAME "${NFSCARBON_DISPLAY_NAME}" AUTHOR "zofo007" VERSION "${NFSCARBON_VERSION}"
 +        ICON "${NFSCARBON_ICON}")
 +    if(NFSCARBON_ICON)
 +        # The NRO is packed after linking; relink so a new icon alone repackages it.
@@ -1802,10 +1847,10 @@ index 288c609..423e926 100644
      T value;
 diff --git a/renderer/src/index_cache.h b/renderer/src/index_cache.h
 new file mode 100644
-index 0000000..e1fa133
+index 0000000..4cde10c
 --- /dev/null
 +++ b/renderer/src/index_cache.h
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,49 @@
 +// Carbon native renderer: converted guest index ranges kept in the vertex arena.
 +#pragma once
 +
@@ -1839,8 +1884,15 @@ index 0000000..e1fa133
 +// every max_interval frames, and never twice in one frame. Returns false when the guest
 +// bytes changed (the caller copies them into fresh arena space).
 +template <typename HashGuest>
-+bool IndexCacheFresh(IndexCacheEntry& e, uint64_t frame, uint8_t max_interval, HashGuest&& hash_guest) {
-+  if (e.checked == frame || frame < e.checked + e.interval) return true;
++bool IndexCacheFresh(IndexCacheEntry& e, uint64_t frame, uint8_t max_interval, HashGuest&& hash_guest,
++                    bool verify = false, bool* stale = nullptr) {
++  if (e.checked == frame) return true;
++  if (frame < e.checked + e.interval) {
++    // verify: look anyway; a difference here is data the interval would have let through.
++    if (!verify || hash_guest() == e.hash) return true;
++    if (stale) *stale = true;
++    return false;
++  }
 +  if (hash_guest() != e.hash) return false;
 +  e.checked = frame;
 +  e.interval = uint8_t(std::min<uint32_t>(uint32_t(e.interval) * 2, max_interval));
@@ -2160,7 +2212,7 @@ index d413fc5..3639e9f 100644
      }
      EndRendering();
 diff --git a/renderer/src/renderer.cpp b/renderer/src/renderer.cpp
-index 22736d5..2049779 100644
+index 22736d5..702d9bb 100644
 --- a/renderer/src/renderer.cpp
 +++ b/renderer/src/renderer.cpp
 @@ -3,6 +3,7 @@
@@ -2171,7 +2223,7 @@ index 22736d5..2049779 100644
  #include <algorithm>
  #include <cstddef>
  #include <atomic>
-@@ -31,13 +32,42 @@
+@@ -31,13 +32,54 @@
  #include <xxhash.h>
  
  #include "gpu_system.h"
@@ -2199,7 +2251,19 @@ index 22736d5..2049779 100644
 +                    "Keep texture descriptor sets across frames (own pool, dropped whenever a view may be "
 +                    "destroyed); false = rebuild them every frame")
 +    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-+REXCVAR_DEFINE_BOOL(carbon_gpu_vertex_memo, true, "CarbonGPU",
++REXCVAR_DEFINE_BOOL(carbon_gpu_cache_verify, false, "CarbonDebug",
++                    "Diagnostic and safe mode: re-hash cached vertex pages, index ranges and textures even when their "
++                    "recheck interval says they are unchanged, use the fresh data, and count how often a skipped check "
++                    "would have drawn stale data (stats line 'cache verify')");
++REXCVAR_DEFINE_INT32(carbon_gpu_arena_max_interval, 4, "CarbonGPU",
++                     "Longest gap in frames between hash checks of an unchanged vertex arena page (1 = every frame)")
++    .range(1, 16);
++REXCVAR_DEFINE_INT32(carbon_gpu_index_max_interval, 2, "CarbonGPU",
++                     "Longest gap in frames between hash checks of an unchanged cached index range (1 = every frame)")
++    .range(1, 8);
++REXCVAR_DEFINE_INT32(carbon_gpu_texture_max_interval, 32, "CarbonGPU",
++                     "Longest gap in frames between content checks of an unchanged guest texture (1 = every frame)")
++    .range(1, 64);REXCVAR_DEFINE_BOOL(carbon_gpu_vertex_memo, true, "CarbonGPU",
 +                    "Vertex fetches of a buffer already validated this frame over a covering range reuse its arena "
 +                    "offset without the lookup and page walk (same result); false = full check every fetch")
 +    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -2214,7 +2278,7 @@ index 22736d5..2049779 100644
  REXCVAR_DEFINE_INT32(carbon_gpu_trace_frame, 0, "CarbonGPU",
                       "Log every pass, draw and resolve of this frame number (0 = off)");
  REXCVAR_DEFINE_INT32(carbon_gpu_dump_frame_interval, 0, "CarbonGPU",
-@@ -51,10 +81,31 @@ REXCVAR_DEFINE_BOOL(carbon_gpu_skip_redundant_resolves, true, "CarbonGPU",
+@@ -51,10 +93,31 @@ REXCVAR_DEFINE_BOOL(carbon_gpu_skip_redundant_resolves, true, "CarbonGPU",
                      "previous resolve into the same destination region (false = always copy)");
  REXCVAR_DEFINE_BOOL(carbon_gpu_vertex_ranges, true, "CarbonGPU",
                      "Copy only the part of a vertex buffer the draw's indices reach");
@@ -2246,7 +2310,7 @@ index 22736d5..2049779 100644
  #else
  REXCVAR_DEFINE_INT32(carbon_gpu_texture_budget_mb, 3072, "CarbonGPU",
                       "Texture memory above which least recently used textures are freed")
-@@ -72,10 +123,19 @@ REXCVAR_DEFINE_INT32(carbon_gpu_max_anisotropy, 16, "CarbonGPU",
+@@ -72,11 +135,33 @@ REXCVAR_DEFINE_INT32(carbon_gpu_max_anisotropy, 16, "CarbonGPU",
  REXCVAR_DEFINE_INT32(carbon_gpu_fps_cap, 0, "CarbonGPU",
                       "Frame rate cap applied when the guest presents (0 = none)")
      .range(0, 240);
@@ -2266,9 +2330,23 @@ index 22736d5..2049779 100644
 -REXCVAR_DEFINE_BOOL(carbon_gpu_mirror_half_rate, false, "CarbonGPU",
 +REXCVAR_DEFINE_BOOL(carbon_gpu_mirror_half_rate, CARBON_MIRROR_HALF_RATE_DEFAULT, "CarbonGPU",
                      "Redraw the rear-view mirror every other frame");
++REXCVAR_DEFINE_BOOL(carbon_gpu_bloom_skip, false, "CarbonGPU",
++                    "With carbon_gpu_bloom = false: skip the blur draws outright (cheapest, but the blur targets keep stale or "
++                    "aliased contents; suspected cause of dark intros and black textures in cutscenes) instead of drawing black");
++namespace {
++// Blur-shader draws seen per stats window (command-processor thread only).
++struct BloomDiagEntry {
++  uint64_t hash = 0;
++  uint32_t pitch = 0, w = 0, h = 0, blend = 0, mask = 0, count = 0;
++};
++BloomDiagEntry g_bloom_diag[48];
++}  // namespace
++REXCVAR_DEFINE_BOOL(carbon_gpu_bloom_black_f84b, false, "CarbonGPU",
++                    "With carbon_gpu_bloom = false: also draw blur shader F84B05E7 (pitch <= 640) as black (experiment; ~3 ms GPU in a race)");
  REXCVAR_DEFINE_BOOL(carbon_gpu_bloom, true, "CarbonGPU",
                      "Run the game's bloom blur passes (very heavy on phone GPUs)");
-@@ -109,7 +169,7 @@ namespace carbon::gpu {
+ REXCVAR_DEFINE_BOOL(carbon_gpu_async_pipelines, true, "CarbonGPU",
+@@ -109,7 +194,7 @@ namespace carbon::gpu {
  using rex::ui::vulkan::VulkanDevice;
  
  constexpr uint32_t kWarmMagic = 0x4C575043;  // "CPWL"
@@ -2277,7 +2355,7 @@ index 22736d5..2049779 100644
  
  uint64_t HashBytes(const void* data, size_t size, uint64_t seed) {
    return XXH3_64bits_withSeed(data, size, seed);
-@@ -318,9 +378,13 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
+@@ -318,9 +403,13 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
      bc_supported_ = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
    }
  
@@ -2293,7 +2371,7 @@ index 22736d5..2049779 100644
      for (uint32_t i = 0; i < 3; ++i) {
        b[i].binding = i;
        b[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-@@ -333,13 +397,19 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
+@@ -333,13 +422,19 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
      b[3].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
      b[4] = b[3];
      b[4].binding = 4;
@@ -2315,7 +2393,7 @@ index 22736d5..2049779 100644
                                       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512}};
      VkDescriptorPoolCreateInfo pci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
      pci.maxSets = 256;
-@@ -358,19 +428,23 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
+@@ -358,19 +453,23 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
      VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
      pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
      pci.queueFamilyIndex = vulkan_device_->queue_family_graphics_compute();
@@ -2346,7 +2424,7 @@ index 22736d5..2049779 100644
      VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
      if (dfn.vkCreateFence(vk_device_, &fci, nullptr, &f.fence) != VK_SUCCESS) {
        return false;
-@@ -391,7 +465,10 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
+@@ -391,7 +490,10 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
      const auto& ifn = vulkan_device_->vulkan_instance()->functions();
      VkPhysicalDeviceProperties pdp = {};
      ifn.vkGetPhysicalDeviceProperties(vulkan_device_->physical_device(), &pdp);
@@ -2358,7 +2436,7 @@ index 22736d5..2049779 100644
      pfn_write_timestamp_ = reinterpret_cast<PFN_vkCmdWriteTimestamp>(
          ifn.vkGetDeviceProcAddr(vk_device_, "vkCmdWriteTimestamp"));
      pfn_get_query_results_ = reinterpret_cast<PFN_vkGetQueryPoolResults>(
-@@ -416,6 +493,9 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
+@@ -416,11 +518,15 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
        pipeline_workers_.emplace_back([this]() { PipelineWorker(); });
      }
    }
@@ -2368,7 +2446,13 @@ index 22736d5..2049779 100644
  
    compiler_ = std::make_unique<ShaderCompiler>();
    texture_set_layouts_.assign(65, VK_NULL_HANDLE);
-@@ -534,37 +614,47 @@ void Renderer::InitAdpf() {
+ 
+   null_ps_module_ = CreateModuleFromGlsl(BuildNullPixelShaderGlsl(), false, "null PS");
++  black_ps_module_ = CreateModuleFromGlsl(BuildBlackPixelShaderGlsl(), false, "black PS");  // optional: bloom off
+   if (!null_ps_module_) {
+     return false;
+   }
+@@ -534,37 +640,47 @@ void Renderer::InitAdpf() {
  }
  #endif
  
@@ -2423,7 +2507,7 @@ index 22736d5..2049779 100644
    if (!vk_device_) {
      return;
    }
-@@ -590,12 +680,44 @@ void Renderer::Shutdown() {
+@@ -590,12 +706,44 @@ void Renderer::Shutdown() {
    // The process is exiting; the device and allocator die with the provider.
  }
  
@@ -2469,7 +2553,7 @@ index 22736d5..2049779 100644
  }
  
  // ---------------------------------------------------------------------------
-@@ -606,6 +728,11 @@ bool Renderer::BeginFrame() {
+@@ -606,6 +754,11 @@ bool Renderer::BeginFrame() {
    if (frame_open_) {
      return true;
    }
@@ -2481,7 +2565,7 @@ index 22736d5..2049779 100644
    const auto& dfn = vulkan_device_->functions();
    Frame& f = frame();
    if (f.submitted) {
-@@ -617,17 +744,37 @@ bool Renderer::BeginFrame() {
+@@ -617,17 +770,37 @@ bool Renderer::BeginFrame() {
      ReadGpuStamps(frame_index_);
    }
    if (arena_reset_pending_) {
@@ -2521,7 +2605,7 @@ index 22736d5..2049779 100644
    }
    for (auto& fn : f.deferred_destroy) fn();
    f.deferred_destroy.clear();
-@@ -635,23 +782,32 @@ bool Renderer::BeginFrame() {
+@@ -635,23 +808,32 @@ bool Renderer::BeginFrame() {
      free_chunks_.push_back(c);
    }
    f.chunks.clear();
@@ -2556,7 +2640,7 @@ index 22736d5..2049779 100644
      GpuStamp(kTagStart);
    }
    f.number = frame_number_;
-@@ -669,6 +825,8 @@ bool Renderer::BeginFrame() {
+@@ -669,6 +851,8 @@ bool Renderer::BeginFrame() {
    vertex_upload_cache_.clear();
    vertex_upload_cache_chunk_ = UINT32_MAX;
    last_constant_chunk_[0] = last_constant_chunk_[1] = UINT32_MAX;
@@ -2565,7 +2649,7 @@ index 22736d5..2049779 100644
    return true;
  }
  
-@@ -682,8 +840,20 @@ void Renderer::EndFrame(bool present, const std::function<void(VkCommandBuffer)>
+@@ -682,8 +866,20 @@ void Renderer::EndFrame(bool present, const std::function<void(VkCommandBuffer)>
    if (present && present_fn) {
      present_fn(f.cb);
    }
@@ -2586,7 +2670,7 @@ index 22736d5..2049779 100644
    dfn.vkEndCommandBuffer(f.upload_cb);
    dfn.vkEndCommandBuffer(f.cb);
    VkCommandBuffer cbs[2] = {f.upload_cb, f.cb};
-@@ -717,8 +887,14 @@ bool Renderer::AcquireChunk() {
+@@ -717,8 +913,14 @@ bool Renderer::AcquireChunk() {
                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
      VmaAllocationCreateInfo aci = {};
      aci.usage = VMA_MEMORY_USAGE_AUTO;
@@ -2601,7 +2685,7 @@ index 22736d5..2049779 100644
      VmaAllocationInfo info = {};
      if (vmaCreateBuffer(allocator_, &bci, &aci, &chunk.buffer, &chunk.allocation, &info) !=
          VK_SUCCESS) {
-@@ -726,6 +902,11 @@ bool Renderer::AcquireChunk() {
+@@ -726,6 +928,11 @@ bool Renderer::AcquireChunk() {
        return false;
      }
      chunk.mapped = static_cast<uint8_t*>(info.pMappedData);
@@ -2613,7 +2697,7 @@ index 22736d5..2049779 100644
      // Descriptor set 0 over this chunk.
      const auto& dfn = vulkan_device_->functions();
      VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-@@ -733,6 +914,8 @@ bool Renderer::AcquireChunk() {
+@@ -733,6 +940,8 @@ bool Renderer::AcquireChunk() {
      dai.descriptorSetCount = 1;
      dai.pSetLayouts = &set0_layout_;
      if (dfn.vkAllocateDescriptorSets(vk_device_, &dai, &chunk.set0) != VK_SUCCESS) {
@@ -2622,7 +2706,7 @@ index 22736d5..2049779 100644
        return false;
      }
      VkDescriptorBufferInfo bufs[5] = {{chunk.buffer, 0, 4096},
-@@ -752,36 +935,108 @@ bool Renderer::AcquireChunk() {
+@@ -752,36 +961,108 @@ bool Renderer::AcquireChunk() {
        w[i].pBufferInfo = &bufs[i];
      }
      dfn.vkUpdateDescriptorSets(vk_device_, 5, w, 0, nullptr);
@@ -2656,10 +2740,10 @@ index 22736d5..2049779 100644
 +bool Renderer::ReserveUpload(VkDeviceSize bytes) {
 +  if (bytes > chunk_size_) {
 +    return false;
-+  }
+   }
 +  if (current_chunk_ == UINT32_MAX || bytes > chunk_size_ - chunk_offset_) {
 +    return AcquireChunk();
-   }
++  }
 +  return true;
  }
  
@@ -2738,7 +2822,7 @@ index 22736d5..2049779 100644
  VkDescriptorSet Renderer::AllocateDescriptorSet(VkDescriptorSetLayout layout) {
    const auto& dfn = vulkan_device_->functions();
    VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-@@ -811,8 +1066,14 @@ void Renderer::TransitionImage(VkCommandBuffer cb, VkImage image, VkImageAspectF
+@@ -811,8 +1092,14 @@ void Renderer::TransitionImage(VkCommandBuffer cb, VkImage image, VkImageAspectF
    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
    b.image = image;
    b.subresourceRange = {aspect, 0, levels, 0, layers};
@@ -2755,7 +2839,7 @@ index 22736d5..2049779 100644
    layout = new_layout;
  }
  
-@@ -824,11 +1085,13 @@ void Renderer::EndRendering() {
+@@ -824,11 +1111,13 @@ void Renderer::EndRendering() {
    if (!rendering_) {
      return;
    }
@@ -2770,7 +2854,7 @@ index 22736d5..2049779 100644
    info.ps_hash = pass_ps_hash_;
    info.vs_hash = pass_vs_hash_;
    info.depth = current_pass_.depth != nullptr;
-@@ -850,7 +1113,7 @@ void Renderer::GpuStamp(GpuTag tag, const StampInfo* info) {
+@@ -850,7 +1139,7 @@ void Renderer::GpuStamp(GpuTag tag, const StampInfo* info) {
    if (!pool || n >= kMaxStamps) {
      return;
    }
@@ -2779,7 +2863,7 @@ index 22736d5..2049779 100644
    ts_tag_[frame_index_][n] = tag;
    ts_info_[frame_index_][n] = info ? *info : StampInfo();
    ++n;
-@@ -887,6 +1150,7 @@ void Renderer::ReadGpuStamps(uint32_t slot) {
+@@ -887,6 +1176,7 @@ void Renderer::ReadGpuStamps(uint32_t slot) {
          a.info = si;
          a.seconds += dt;
          a.draws += si.draws;
@@ -2787,7 +2871,7 @@ index 22736d5..2049779 100644
          ++a.count;
        }
      }
-@@ -896,7 +1160,6 @@ void Renderer::ReadGpuStamps(uint32_t slot) {
+@@ -896,7 +1186,6 @@ void Renderer::ReadGpuStamps(uint32_t slot) {
  
  bool Renderer::BeginRendering(const PassState& pass) {
    cmd_ = CmdCache();
@@ -2795,7 +2879,7 @@ index 22736d5..2049779 100644
    VkCommandBuffer cb = frame().cb;
    VkRenderingAttachmentInfo color[4] = {};
    for (uint32_t i = 0; i < 4; ++i) {
-@@ -941,7 +1204,7 @@ bool Renderer::BeginRendering(const PassState& pass) {
+@@ -941,7 +1230,7 @@ bool Renderer::BeginRendering(const PassState& pass) {
    ri.pColorAttachments = color;
    ri.pDepthAttachment = pass.depth ? &depth : nullptr;
    ri.pStencilAttachment = pass.depth ? &depth : nullptr;
@@ -2804,7 +2888,7 @@ index 22736d5..2049779 100644
    rendering_ = true;
    current_pass_ = pass;
    if (tracing_) {
-@@ -982,11 +1245,16 @@ Shader* Renderer::LoadShader(xenos::ShaderType type, const uint32_t* guest_be,
+@@ -982,11 +1271,16 @@ Shader* Renderer::LoadShader(xenos::ShaderType type, const uint32_t* guest_be,
      shader->ucode[i] = ByteSwap32(guest_be[i]);
    }
    shader->translated = TranslateShader(type, shader->ucode.data(), dword_count);
@@ -2821,7 +2905,7 @@ index 22736d5..2049779 100644
    }
    Shader* raw = shader.get();
    shaders_.emplace(hash, std::move(shader));
-@@ -1079,12 +1347,12 @@ void Renderer::RecordWarmPipeline(const PipelineKey& key) {
+@@ -1079,12 +1373,12 @@ void Renderer::RecordWarmPipeline(const PipelineKey& key) {
    pipeline_cache_dirty_ = true;
  }
  
@@ -2836,7 +2920,7 @@ index 22736d5..2049779 100644
      }
      warm_dirty_ = false;
      records = warm_records_;
-@@ -1096,12 +1364,25 @@ void Renderer::SaveWarmList() {
+@@ -1096,12 +1390,25 @@ void Renderer::SaveWarmList() {
      std::ofstream out(temp, std::ios::binary | std::ios::trunc);
      out.write(reinterpret_cast<const char*>(header), sizeof(header));
      out.write(reinterpret_cast<const char*>(records.data()), std::streamsize(records.size()));
@@ -2864,7 +2948,7 @@ index 22736d5..2049779 100644
  }
  
  void Renderer::RunPipelineWarmup() {
-@@ -1226,10 +1507,16 @@ VkPipeline Renderer::GetPipeline(const PipelineKey& key) {
+@@ -1226,10 +1533,16 @@ VkPipeline Renderer::GetPipeline(const PipelineKey& key) {
    // Hashed as raw bytes: no padding allowed.
    static_assert(std::has_unique_object_representations_v<PipelineKey>);
    uint64_t hash = HashBytes(&key, sizeof(key));
@@ -2881,7 +2965,7 @@ index 22736d5..2049779 100644
        return it->second;  // VK_NULL_HANDLE while a worker is still building it
      }
      if (!pipeline_workers_.empty()) {
-@@ -1254,6 +1541,7 @@ VkPipeline Renderer::GetPipeline(const PipelineKey& key) {
+@@ -1254,6 +1567,7 @@ VkPipeline Renderer::GetPipeline(const PipelineKey& key) {
      pipelines_.emplace(hash, pipeline);
    }
    pipeline_cache_dirty_ = true;
@@ -2889,7 +2973,7 @@ index 22736d5..2049779 100644
    return pipeline;
  }
  
-@@ -1294,8 +1582,11 @@ void Renderer::SavePipelineCacheIfDue(double min_interval) {
+@@ -1294,8 +1608,11 @@ void Renderer::SavePipelineCacheIfDue(double min_interval) {
    }
    pipeline_cache_dirty_ = false;
    pipeline_cache_saved_at_ = now;
@@ -2903,7 +2987,7 @@ index 22736d5..2049779 100644
  }
  
  VkPipeline Renderer::BuildPipeline(const PipelineKey& key, VkPipelineLayout layout) {
-@@ -1527,7 +1818,11 @@ void Renderer::ComputeViewport(const RegisterFile& regs, uint32_t rt_width, uint
+@@ -1527,7 +1844,11 @@ void Renderer::ComputeViewport(const RegisterFile& regs, uint32_t rt_width, uint
    if (res_scale_ != 1.0f) {
      // Guest pixels to host pixels; the NDC transform above is scale-free.
      const float s = res_scale_;
@@ -2916,7 +3000,7 @@ index 22736d5..2049779 100644
      int32_t max_x = int32_t(Scaled(rt_width)), max_y = int32_t(Scaled(rt_height));
      int32_t hx0 = std::min(int32_t(std::floor(x0 * s)), max_x);
      int32_t hy0 = std::min(int32_t(std::floor(y0 * s)), max_y);
-@@ -1537,8 +1832,8 @@ void Renderer::ComputeViewport(const RegisterFile& regs, uint32_t rt_width, uint
+@@ -1537,8 +1858,8 @@ void Renderer::ComputeViewport(const RegisterFile& regs, uint32_t rt_width, uint
      if (y1 == y0) hy1 = hy0;
      scissor = {{hx0, hy0}, {uint32_t(hx1 - hx0), uint32_t(hy1 - hy0)}};
      // Param gen positions stay in guest pixels.
@@ -2927,16 +3011,15 @@ index 22736d5..2049779 100644
      return;
    }
    scissor = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
-@@ -1547,6 +1842,8 @@ void Renderer::ComputeViewport(const RegisterFile& regs, uint32_t rt_width, uint
+@@ -1546,7 +1867,6 @@ void Renderer::ComputeViewport(const RegisterFile& regs, uint32_t rt_width, uint
+ 
  namespace {
  constexpr uint32_t kArenaPageBytes = 16 * 1024;
- constexpr uint8_t kArenaMaxInterval = 4;
-+// Stale indices draw wrong triangles: re-check converted index ranges at least every other frame.
-+constexpr uint8_t kIndexMaxInterval = 2;
+-constexpr uint8_t kArenaMaxInterval = 4;
  }  // namespace
  
  bool Renderer::CreateVertexArena() {
-@@ -1559,7 +1856,7 @@ bool Renderer::CreateVertexArena() {
+@@ -1559,7 +1879,7 @@ bool Renderer::CreateVertexArena() {
    arena_size_ = std::min<VkDeviceSize>(arena_size_, 0x7FFFFFF0u);
    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
    bci.size = arena_size_;
@@ -2945,7 +3028,7 @@ index 22736d5..2049779 100644
    VmaAllocationCreateInfo aci = {};
    aci.usage = VMA_MEMORY_USAGE_AUTO;
    aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-@@ -1573,6 +1870,7 @@ bool Renderer::CreateVertexArena() {
+@@ -1573,6 +1893,7 @@ bool Renderer::CreateVertexArena() {
      return true;
    }
    arena_mapped_ = static_cast<uint8_t*>(info.pMappedData);
@@ -2953,7 +3036,7 @@ index 22736d5..2049779 100644
    return true;
  }
  
-@@ -1583,10 +1881,14 @@ bool Renderer::ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_
+@@ -1583,10 +1904,14 @@ bool Renderer::ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_
    if (!arena_buffer_ || !size || size > arena_size_ / 4) {
      return false;
    }
@@ -2970,7 +3053,7 @@ index 22736d5..2049779 100644
        auto ch = arena_changes_.find(key);
        if (ch != arena_changes_.end() && ch->second >= 3) {
          return false;  // rewritten too often to be worth caching
-@@ -1596,42 +1898,42 @@ bool Renderer::ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_
+@@ -1596,42 +1921,51 @@ bool Renderer::ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_
          arena_reset_pending_ = true;
          return false;
        }
@@ -2997,7 +3080,16 @@ index 22736d5..2049779 100644
 +      for (uint32_t p = first; p <= last && p < e.pages.size(); ++p) {
 +        VertexArenaPage& page = e.pages[p];
 +        if (page.checked == frame_number_) continue;
-+        if (page.hash && frame_number_ < page.checked + page.interval) continue;
++        if (page.hash && frame_number_ < page.checked + page.interval) {
++          if (!REXCVAR_GET(carbon_gpu_cache_verify)) continue;
++          uint32_t skipped_n = std::min(kArenaPageBytes, size - p * kArenaPageBytes);
++          if ((HashBytes(src + p * kArenaPageBytes, skipped_n, 0) | 1) != page.hash) {
++            ++stats_.stale_arena;  // the skipped check would have drawn old vertices
++            changed = true;
++            break;
++          }
++          continue;
++        }
          uint32_t page_start = p * kArenaPageBytes;
          uint32_t n = std::min(kArenaPageBytes, size - page_start);
          uint64_t h = HashBytes(src + page_start, n, 0) | 1;
@@ -3014,7 +3106,7 @@ index 22736d5..2049779 100644
            break;
          } else {
 -          e.page_interval[p] = std::min<uint8_t>(e.page_interval[p] * 2, kArenaMaxInterval);
-+          page.interval = std::min<uint8_t>(page.interval * 2, kArenaMaxInterval);
++          page.interval = uint8_t(std::min<int32_t>(page.interval * 2, REXCVAR_GET(carbon_gpu_arena_max_interval)));
          }
 -        e.page_checked[p] = frame_number_;
 +        page.checked = frame_number_;
@@ -3026,7 +3118,7 @@ index 22736d5..2049779 100644
        return true;
      }
      // The buffer was rewritten. Frames in flight may still read the old copy, so
-@@ -1639,7 +1941,8 @@ bool Renderer::ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_
+@@ -1639,7 +1973,8 @@ bool Renderer::ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_
      // buffers that keep changing).
      uint8_t& count = arena_changes_[key];
      if (count < 255) ++count;
@@ -3036,7 +3128,7 @@ index 22736d5..2049779 100644
      if (count >= 3) {
        return false;
      }
-@@ -1647,16 +1950,82 @@ bool Renderer::ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_
+@@ -1647,16 +1982,85 @@ bool Renderer::ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_
    return false;
  }
  
@@ -3056,13 +3148,16 @@ index 22736d5..2049779 100644
 +    if (!(e.key == key)) {
 +      return false;  // another range has the same map hash: not cached
 +    }
-+    if (IndexCacheFresh(e, frame_number_, kIndexMaxInterval, hash_guest)) {
++    bool stale = false;
++    if (IndexCacheFresh(e, frame_number_, uint8_t(REXCVAR_GET(carbon_gpu_index_max_interval)), hash_guest,
++                        REXCVAR_GET(carbon_gpu_cache_verify), &stale)) {
 +      offset = e.offset;
 +      lo = e.lo;
 +      hi = e.hi;
 +      ++stats_.index_cache_hits;
 +      return true;
 +    }
++    if (stale) ++stats_.stale_index;  // the skipped check would have drawn old indices
 +    // Rewritten. Frames in flight may still read the old copy: never overwrite it.
 +    uint8_t& changes = index_changes_[id];
 +    if (changes < 255) ++changes;
@@ -3126,7 +3221,7 @@ index 22736d5..2049779 100644
      xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(i);
      uint32_t address = fetch.address << 2;
      uint32_t size = fetch.size << 2;
-@@ -1670,74 +2039,142 @@ bool Renderer::SetupVertexData(const RegisterFile& regs, Shader* vs, DrawConstan
+@@ -1670,74 +2074,149 @@ bool Renderer::SetupVertexData(const RegisterFile& regs, Shader* vs, DrawConstan
      if (size) {
        uint32_t lo = 0, hi = size;
        uint32_t stride = t.vfetch_stride[i];
@@ -3271,6 +3366,13 @@ index 22736d5..2049779 100644
 +  sub_sampled_ = draw_stages.sampled();
 +  using namespace rex::graphics;
    ++stats_.draws;
++  if (info.primitive_type == xenos::PrimitiveType::kQuadList || info.primitive_type == xenos::PrimitiveType::kPointList) {
++    ++stats_.sprite_draws;
++    if (regs[XE_GPU_REG_RB_BLENDCONTROL0] != 0x00010001u) {
++      ++stats_.sprite_blended;
++      stats_.sprite_blended_indices += info.index_count;
++    }
++  }
    if (!vs || !vs->translated_ok || !info.index_count) {
      Skip(kSkipNoShader);
      return;
@@ -3296,7 +3398,79 @@ index 22736d5..2049779 100644
    auto edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
    if (edram_mode != xenos::EdramMode::kColorDepth && edram_mode != xenos::EdramMode::kDepthOnly) {
      Skip(kSkipEdramMode);
-@@ -1971,6 +2408,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -1805,19 +2284,66 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+ 
+   // The bloom blur chain is 6-8 full-screen passes of 8 scattered texture reads each;
+   // on phone GPUs they cost more than the whole scene for a subtle glow.
++  // carbon_gpu_bloom = false: the half-resolution blur chain (8 passes in a race, pixel shader 56B15EE1 at pitch 640)
++  // is drawn as black instead of blurred; its output is then defined and the compositor adds no glow. The same
++  // shader at full resolution and the other three blur variants (seen only outside races: cutscenes, menus) keep
++  // running: they may also serve motion blur, and skipping them (final1 build) is the suspected cause of dark
++  // intros and black textures in cutscenes: it leaves stale, EDRAM-aliased contents in the blur targets. carbon_gpu_bloom_skip restores the old skip of all four, cheaper but unsafe.
++  bool bloom_black = false;
++  if (ps && (ps->hash == 0x56B15EE1C23228EEull || ps->hash == 0xF84B05E744D442E8ull || ps->hash == 0x2047A91B3C7E8F62ull ||
++             ps->hash == 0xA25318EF353C6AD7ull)) {
++    // Diagnostic for the pause menu, which builds its background with the blur chain: what each blur draw looks like.
++    const auto dtl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
++    const auto dbr = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
++    const uint32_t dpitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
++    const uint32_t dw = uint32_t(dbr.br_x) - uint32_t(dtl.tl_x), dh = uint32_t(dbr.br_y) - uint32_t(dtl.tl_y);
++    const uint32_t dblend = regs[XE_GPU_REG_RB_BLENDCONTROL0], dmask = regs[XE_GPU_REG_RB_COLOR_MASK];
++    BloomDiagEntry* slot = nullptr;
++    for (BloomDiagEntry& e : g_bloom_diag) {
++      if (e.count && e.hash == ps->hash && e.pitch == dpitch && e.w == dw && e.h == dh && e.blend == dblend && e.mask == dmask) {
++        slot = &e;
++        break;
++      }
++      if (!e.count && !slot) slot = &e;
++    }
++    if (slot) {
++      if (!slot->count) *slot = BloomDiagEntry{ps->hash, dpitch, dw, dh, dblend, dmask, 0};
++      ++slot->count;
++    }
++  }
+   if (!bloom_enabled_ && ps) {
++    const bool skip_all = REXCVAR_GET(carbon_gpu_bloom_skip);
+     switch (ps->hash) {
+-      case 0xF84B05E744D442E8ull:
+-      case 0x2047A91B3C7E8F62ull:
+       case 0x56B15EE1C23228EEull:
++        if (skip_all) {
++          Skip(kSkipNoTarget);
++          return;
++        }
++        // Pitch 320 is the race bloom chain (hardware log, bloom-diag). The pause menu builds its blurred background with the
++        // same shader at pitch 640 and 1280: drawing those black leaves the pause screen empty.
++        if (black_ps_module_ && regs.Get<reg::RB_SURFACE_INFO>().surface_pitch <= 320) bloom_black = true;
++        break;
++      case 0xF84B05E744D442E8ull:
++        if (skip_all) {
++          Skip(kSkipNoTarget);
++          return;
++        }
++        // 8-tap weighted blur, same single-texture shape as 56B15EE1; 6 passes at pitch 640 in a race.
++        if (REXCVAR_GET(carbon_gpu_bloom_black_f84b) && black_ps_module_ &&
++            regs.Get<reg::RB_SURFACE_INFO>().surface_pitch <= 640)
++          bloom_black = true;
++        break;
++      case 0x2047A91B3C7E8F62ull:  // two-texture dot3/max composite, not a blur: always runs
+       case 0xA25318EF353C6AD7ull:
+-        Skip(kSkipNoTarget);
+-        return;
++        if (skip_all) {
++          Skip(kSkipNoTarget);
++          return;
++        }
++        break;
+       default:
+         break;
+     }
+   }
+-
+   // Render targets.
+   auto surface = regs.Get<reg::RB_SURFACE_INFO>();
+   uint32_t pitch = surface.surface_pitch;
+@@ -1971,6 +2497,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
    }
  
    // Shaders.
@@ -3304,7 +3478,15 @@ index 22736d5..2049779 100644
    auto program_cntl = regs.Get<reg::SQ_PROGRAM_CNTL>();
    uint32_t interpolators = std::min<uint32_t>(16, program_cntl.vs_export_count + 1);
    if (ps) {
-@@ -2091,6 +2529,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -1996,6 +2523,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+                                      : 0;
+     ps_module = GetPixelShaderModule(ps, ps_variant);
+     if (debug_null_ps) ps_module = null_ps_module_;
++    if (bloom_black && !pass.color[1] && !pass.color[2] && !pass.color[3]) ps_module = black_ps_module_;
+   }
+   if (!vs_module || !ps_module) {
+     Skip(kSkipModules);
+@@ -2091,6 +2619,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
    }
  
    // ---- Uploads (all in one chunk) ----
@@ -3312,7 +3494,7 @@ index 22736d5..2049779 100644
    // Only the header is cleared: the per-fetch arrays are written for the entries
    // the shaders use, and only those entries are uploaded.
    DrawConstants consts;
-@@ -2118,17 +2557,8 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2118,17 +2647,8 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
      return;
    }
  
@@ -3331,7 +3513,7 @@ index 22736d5..2049779 100644
    VkDescriptorSet vs_set = VK_NULL_HANDLE, ps_set = VK_NULL_HANDLE;
    BindTextures(regs, vs, 1, consts, vs_set);
    if (ps) {
-@@ -2136,6 +2566,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2136,6 +2656,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
    }
  
    // Indices.
@@ -3339,7 +3521,7 @@ index 22736d5..2049779 100644
    uint32_t host_count = info.index_count;
    bool host_indexed = false;
    VkIndexType index_type = VK_INDEX_TYPE_UINT32;
-@@ -2169,24 +2600,52 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2169,24 +2690,52 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
    bool indices_done = false;
    const uint32_t index_offset_v = regs[XE_GPU_REG_VGT_INDX_OFFSET] & 0xFFFFFF;
    if (info.indexed && expand == Expand::kNone && count) {
@@ -3406,7 +3588,7 @@ index 22736d5..2049779 100644
      host_indexed = true;
      host_count = count;
      indices_done = true;
-@@ -2215,13 +2674,32 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2215,13 +2764,32 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
        vertex_range.max_index = hi_i + index_offset_v;
      }
    }
@@ -3444,7 +3626,7 @@ index 22736d5..2049779 100644
    if (indices_done) {
      // Already converted above.
    } else if (expand == Expand::kRectList) {
-@@ -2229,6 +2707,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2229,6 +2797,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
      host_count = rects * 6;
      if (info.indexed) {
        UploadAllocation a = Upload(VkDeviceSize(rects) * 3 * 4 + 16, 16);
@@ -3452,7 +3634,7 @@ index 22736d5..2049779 100644
        uint32_t* dst = reinterpret_cast<uint32_t*>(a.ptr);
        for (uint32_t i = 0; i < rects * 3; ++i) dst[i] = read_index(i);
        consts.vtx2[0] = uint32_t(a.offset / 4);
-@@ -2259,6 +2738,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2259,6 +2828,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
      host_count = uint32_t(out.size());
      if (host_count) {
        UploadAllocation a = Upload(VkDeviceSize(host_count) * 4, 16);
@@ -3460,7 +3642,7 @@ index 22736d5..2049779 100644
        std::memcpy(a.ptr, out.data(), size_t(host_count) * 4);
        index_buffer = a.buffer;
        index_offset = a.offset;
-@@ -2268,6 +2748,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2268,6 +2838,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
      host_count = count;
      bool is16 = info.index_format == xenos::IndexFormat::kInt16;
      UploadAllocation a = Upload(VkDeviceSize(count) * (is16 ? 2 : 4) + 4, 16);
@@ -3468,7 +3650,7 @@ index 22736d5..2049779 100644
      if (is16) {
        uint16_t* dst = reinterpret_cast<uint16_t*>(a.ptr);
        for (uint32_t i = 0; i < count; ++i) {
-@@ -2292,18 +2773,63 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2292,18 +2863,63 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
    }
  
    // Constants.
@@ -3533,7 +3715,7 @@ index 22736d5..2049779 100644
      }
      dyn_offsets[stage] = uint32_t(a.offset);
      last_constant_offset_[stage] = a.offset;
-@@ -2313,6 +2839,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2313,6 +2929,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
    }
    {
      UploadAllocation a = Upload(sizeof(DrawConstants), ubo_alignment_);
@@ -3541,7 +3723,7 @@ index 22736d5..2049779 100644
      const uint8_t* src = reinterpret_cast<const uint8_t*>(&consts);
      constexpr size_t kHead = offsetof(DrawConstants, vfetch);
      std::memcpy(a.ptr, src, kHead);
-@@ -2342,6 +2869,10 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2342,6 +2959,10 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
      dyn_offsets[2] = uint32_t(a.offset);
    }
  
@@ -3552,7 +3734,7 @@ index 22736d5..2049779 100644
    if (tracing_) {
      REXGPU_WARN(
          "[carbon-gpu] trace: draw prim {:02X} count {} indexed {} vs {:016X} ps {:016X} "
-@@ -2352,6 +2883,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2352,6 +2973,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
          consts.ndc_scale[1], consts.ndc_offset[0], consts.ndc_offset[1]);
    }
    // ---- Record ----
@@ -3560,7 +3742,7 @@ index 22736d5..2049779 100644
    bool same_pass = rendering_;
    if (same_pass) {
      for (uint32_t i = 0; i < 4; ++i) same_pass &= current_pass_.color[i] == pass.color[i];
-@@ -2362,10 +2894,8 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2362,10 +2984,8 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
      EndRendering();
      BeginRendering(pass);
    }
@@ -3572,7 +3754,7 @@ index 22736d5..2049779 100644
      cmd_.pipeline = pipeline;
    }
    ++pass_draws_;
-@@ -2378,8 +2908,6 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2378,8 +2998,6 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
    pass_vs_hash_ = vs->hash;
    VkPipelineLayout layout = GetPipelineLayout(key.vs_textures, key.ps_textures);
    VkDescriptorSet set0 = upload_chunks_[current_chunk_].set0;
@@ -3581,7 +3763,7 @@ index 22736d5..2049779 100644
    // Texture sets stay bound while the set layouts they sit under are unchanged.
    if (cmd_.layout != layout) {
      if (cmd_.vs_textures != key.vs_textures) {
-@@ -2391,23 +2919,37 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2391,23 +3009,37 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
      cmd_.vs_textures = key.vs_textures;
      cmd_.ps_textures = key.ps_textures;
    }
@@ -3629,7 +3811,7 @@ index 22736d5..2049779 100644
      cmd_.scissor = scissor;
      cmd_.scissor_valid = true;
    }
-@@ -2423,7 +2965,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2423,7 +3055,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
        offset *= float(1 << 24);
      }
      if (!cmd_.depth_bias_valid || cmd_.depth_bias[0] != offset || cmd_.depth_bias[1] != scale) {
@@ -3638,7 +3820,7 @@ index 22736d5..2049779 100644
        cmd_.depth_bias[0] = offset;
        cmd_.depth_bias[1] = scale;
        cmd_.depth_bias_valid = true;
-@@ -2433,7 +2975,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2433,7 +3065,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
      float blend[4] = {regs.GetFloat(XE_GPU_REG_RB_BLEND_RED), regs.GetFloat(XE_GPU_REG_RB_BLEND_GREEN),
                        regs.GetFloat(XE_GPU_REG_RB_BLEND_BLUE), regs.GetFloat(XE_GPU_REG_RB_BLEND_ALPHA)};
      if (!cmd_.blend_valid || std::memcmp(cmd_.blend, blend, sizeof(blend)) != 0) {
@@ -3647,7 +3829,7 @@ index 22736d5..2049779 100644
        std::memcpy(cmd_.blend, blend, sizeof(blend));
        cmd_.blend_valid = true;
      }
-@@ -2446,12 +2988,12 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2446,12 +3078,12 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
      uint32_t st[6] = {ref.stencilref,       ref_bf.stencilref,       ref.stencilmask,
                        ref_bf.stencilmask,   ref.stencilwritemask,    ref_bf.stencilwritemask};
      if (!cmd_.stencil_valid || std::memcmp(cmd_.stencil, st, sizeof(st)) != 0) {
@@ -3666,7 +3848,7 @@ index 22736d5..2049779 100644
        std::memcpy(cmd_.stencil, st, sizeof(st));
        cmd_.stencil_valid = true;
      }
-@@ -2459,14 +3001,14 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
+@@ -2459,14 +3091,14 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
    if (host_indexed) {
      if (cmd_.index_buffer != index_buffer || cmd_.index_offset != index_offset ||
          cmd_.index_type != index_type) {
@@ -3684,7 +3866,7 @@ index 22736d5..2049779 100644
    }
  }
  
-@@ -2603,6 +3145,7 @@ void main() {
+@@ -2603,6 +3235,7 @@ void main() {
  void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t source_width,
                               uint32_t source_height, float source_scale, VkImage dest, VkImageView dest_view,
                               uint32_t width, uint32_t height, bool dest_written_before, bool swap_rb) {
@@ -3692,7 +3874,7 @@ index 22736d5..2049779 100644
    const auto& dfn = vulkan_device_->functions();
    VkImageLayout dest_layout = dest_written_before
                                    ? rex::ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout
-@@ -2620,7 +3163,7 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
+@@ -2620,7 +3253,7 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
    ri.layerCount = 1;
    ri.colorAttachmentCount = 1;
    ri.pColorAttachments = &att;
@@ -3701,7 +3883,7 @@ index 22736d5..2049779 100644
    if (source) {
      VkDescriptorSet set = AllocateDescriptorSet(present_set_layout_);
      VkDescriptorImageInfo ii = {linear_sampler_, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-@@ -2637,9 +3180,9 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
+@@ -2637,9 +3270,9 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
      w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
      w[1].pBufferInfo = &bi;
      dfn.vkUpdateDescriptorSets(vk_device_, 2, w, 0, nullptr);
@@ -3714,7 +3896,7 @@ index 22736d5..2049779 100644
      struct {
        float scale[2];
        uint32_t use_gamma;
-@@ -2648,14 +3191,14 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
+@@ -2648,14 +3281,14 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
      // The guest output may be smaller than the source image (padded resolves).
      pc.scale[0] = source_scale / float(source_width);
      pc.scale[1] = source_scale / float(source_height);
@@ -3734,7 +3916,7 @@ index 22736d5..2049779 100644
    TransitionImage(cb, dest, VK_IMAGE_ASPECT_COLOR_BIT, dest_layout,
                    rex::ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
  }
-@@ -2669,6 +3212,11 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2669,6 +3302,11 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
      std::this_thread::sleep_for(std::chrono::milliseconds(50));
      cap_next_ = 0.0;
    }
@@ -3746,7 +3928,7 @@ index 22736d5..2049779 100644
    // Re-read fps_cap_ each frame so runtime cvar changes take effect immediately.
    fps_cap_ = REXCVAR_GET(carbon_gpu_fps_cap);
    skip_redundant_resolves_ = REXCVAR_GET(carbon_gpu_skip_redundant_resolves);
-@@ -2763,8 +3311,8 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2763,8 +3401,8 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
        VkBufferImageCopy region = {};
        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
        region.imageExtent = {front->width, front->height, 1};
@@ -3757,7 +3939,7 @@ index 22736d5..2049779 100644
        TransitionImage(cb, front->image, VK_IMAGE_ASPECT_COLOR_BIT, front->layout,
                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
      }
-@@ -2844,6 +3392,15 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2844,6 +3482,15 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
          frame_texture_s_ * 1000.0, frame_pipeline_builds_, frame_idle_s_ * 1000.0,
          frame_wait_s_ * 1000.0);
    }
@@ -3773,7 +3955,7 @@ index 22736d5..2049779 100644
    frame_idle_s_ = frame_wait_s_ = frame_texture_s_ = frame_draw_s_ = 0;
    frame_textures_ = frame_pipeline_builds_ = 0;
    if (overlay_last_swap_ > 0.0) {
-@@ -2870,24 +3427,29 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2870,24 +3517,29 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
      overlay_worst_ms_ = 0.0;
    }
    if (now - stats_start_ >= 5.0) {
@@ -3809,7 +3991,7 @@ index 22736d5..2049779 100644
        std::string reasons;
        double frames = double(std::max<uint64_t>(stats_frames_, 1));
        for (uint32_t i = 0; i < kSkipReasonCount; ++i) {
-@@ -2905,22 +3467,115 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2905,22 +3557,128 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
            debug_mode_, (now - stats_start_) * 1000.0 / frames, stats_.worst_ms, stats_.slow25, stats_.slow34,
            stats_.slow50, stats_.draw_s * 1000.0 / frames, stats_.resolve_s * 1000.0 / frames,
            stats_.swap_s * 1000.0 / frames, stats_.fence_s * 1000.0 / frames);
@@ -3861,6 +4043,19 @@ index 22736d5..2049779 100644
 +                  double(stats_.texture_hash_bytes) / frames / (1024.0 * 1024.0),
 +                  stats_.texture_hash_checks / frames, stats_.texture_hash_changed / frames,
 +                  stats_.texture_hash_async / frames);
++      for (BloomDiagEntry& e : g_bloom_diag) {
++        if (!e.count) continue;
++        REXGPU_INFO("[bloom-diag] ps {:016X} pitch {} scissor {}x{} blend {:08X} mask {:X}: {:.2f} draws/frame", e.hash, e.pitch,
++                    e.w, e.h, e.blend, e.mask, e.count / frames);
++        e = BloomDiagEntry{};
++      }
++      REXGPU_INFO("[carbon-gpu] sprite-type draws per frame: {:.1f} quad/point lists, {:.1f} of them blended ({:.0f} indices)",
++                  stats_.sprite_draws / frames, stats_.sprite_blended / frames, stats_.sprite_blended_indices / frames);
++      REXGPU_INFO("[carbon-gpu] cache verify {}: stale vertex pages {}, stale index ranges {}, stale textures {} | max "
++                  "intervals arena {} index {} texture {}",
++                  REXCVAR_GET(carbon_gpu_cache_verify) ? "on" : "off", stats_.stale_arena, stats_.stale_index,
++                  stats_.stale_texture, REXCVAR_GET(carbon_gpu_arena_max_interval),
++                  REXCVAR_GET(carbon_gpu_index_max_interval), REXCVAR_GET(carbon_gpu_texture_max_interval));
 +      REXGPU_INFO("[carbon-gpu] cp pacing: idle {:.2f} ms/frame, wait {:.2f} ms/frame, "
 +                  "{} polls, max wall {:.2f} ms, max requested {} ms",
 +                  stats_.cp_idle_s * 1000.0 / frames, stats_.cp_wait_s * 1000.0 / frames,
@@ -3928,7 +4123,7 @@ index 22736d5..2049779 100644
          double g = double(stats_.gpu_frames);
          {
            auto pct = [](std::vector<float>& v, double p) {
-@@ -2943,7 +3598,7 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2943,7 +3701,7 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
              stats_.gpu_tag_s[kTagEnd] * 1000.0 / g, stats_.gpu_passes / g);
        }
      }
@@ -3937,7 +4132,7 @@ index 22736d5..2049779 100644
        double f = double(std::max<uint64_t>(stats_frames_, 1));
        REXGPU_INFO(
            "[carbon-gpu] resolves per frame: copied {:.1f}, skipped as redundant {:.1f} | pixels "
-@@ -2957,7 +3612,7 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2957,7 +3715,7 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
            stats_.resolves_dead / f, double(stats_.resolve_px_dead) / f / 1e3,
            double(stats_.resolve_bytes_dead) / f / (1024.0 * 1024.0));
      }
@@ -3946,7 +4141,7 @@ index 22736d5..2049779 100644
        std::vector<const DestAgg*> top;
        for (auto& kv : dest_agg_) top.push_back(&kv.second);
        std::sort(top.begin(), top.end(), [](const DestAgg* a, const DestAgg* b) {
-@@ -2973,10 +3628,15 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2973,10 +3731,15 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
              d.base, d.w, d.h, d.fmt, d.src_pitch, d.src_fmt, d.resolves / f, d.dead / f);
        }
      }
@@ -3963,7 +4158,7 @@ index 22736d5..2049779 100644
      stats_frames_ = 0;
      stats_start_ = now;
 diff --git a/renderer/src/renderer.h b/renderer/src/renderer.h
-index 7b7f187..608a972 100644
+index 7b7f187..a740178 100644
 --- a/renderer/src/renderer.h
 +++ b/renderer/src/renderer.h
 @@ -7,13 +7,16 @@
@@ -4260,7 +4455,7 @@ index 7b7f187..608a972 100644
    std::vector<uint32_t> scratch_indices_;
    // Fused index conversion for plain indexed draws: converts into the upload
    // buffer and returns the range of vertex indices used.
-@@ -491,6 +593,7 @@ class Renderer {
+@@ -491,16 +593,27 @@ class Renderer {
    VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
    std::filesystem::path pipeline_cache_path_;
    std::unordered_map<uint64_t, VkPipeline> pipelines_;
@@ -4268,7 +4463,8 @@ index 7b7f187..608a972 100644
    std::unordered_map<uint64_t, std::unique_ptr<Shader>> shaders_;
    std::unique_ptr<ShaderCompiler> compiler_;
    VkShaderModule null_ps_module_ = VK_NULL_HANDLE;
-@@ -498,9 +601,18 @@ class Renderer {
++  VkShaderModule black_ps_module_ = VK_NULL_HANDLE;  // writes (0,0,0,0) to color 0: bloom off without stale targets
+ 
    // Per-frame upload dedupe: guest (address, size) -> dword offset in chunk.
    std::unordered_map<uint64_t, uint32_t> vertex_upload_cache_;
    uint32_t vertex_upload_cache_chunk_ = UINT32_MAX;
@@ -4287,7 +4483,7 @@ index 7b7f187..608a972 100644
    VkDeviceSize last_constant_offset_[2] = {};
    uint32_t last_constant_chunk_[2] = {UINT32_MAX, UINT32_MAX};
    uint32_t last_constant_count_[2] = {};
-@@ -520,10 +632,30 @@ class Renderer {
+@@ -520,10 +633,30 @@ class Renderer {
      kSkipScissor,
      kSkipVertices,
      kSkipNoIndices,
@@ -4318,12 +4514,14 @@ index 7b7f187..608a972 100644
      // Resolves that copied texels, and redundant ones skipped (same source contents,
      // same rectangle and parameters, destination region untouched since).
      uint32_t resolves_copied = 0, resolves_skipped = 0;
-@@ -534,8 +666,13 @@ class Renderer {
+@@ -534,8 +667,15 @@ class Renderer {
      uint64_t resolve_px_dead = 0, resolve_bytes_dead = 0;
      uint32_t textures_uploaded = 0, shaders_compiled = 0;
      uint64_t upload_bytes = 0, arena_bytes = 0, arena_draws = 0, chunk_vertex_draws = 0;
 +    uint64_t vertex_memo_hits = 0;
 +    uint64_t index_cache_hits = 0, index_cache_copies = 0, index_cache_bytes = 0;
++    uint32_t sprite_draws = 0, sprite_blended = 0, sprite_blended_indices = 0;  // quad-list / point-list draws (particles, flares)
++    uint32_t stale_arena = 0, stale_index = 0, stale_texture = 0;  // only counted with carbon_gpu_cache_verify
      uint32_t evicted = 0, throttled = 0;
      double draw_s = 0, resolve_s = 0, swap_s = 0, fence_s = 0, worst_ms = 0;
 +    double record_drain_s = 0;  // CP wait for the record thread at EndFrame
@@ -4332,7 +4530,7 @@ index 7b7f187..608a972 100644
      double gpu_total_s = 0, gpu_tag_s[5] = {};
      uint32_t gpu_frames = 0, gpu_passes = 0;
      uint32_t slow25 = 0, slow34 = 0, slow50 = 0;
-@@ -567,6 +704,12 @@ class Renderer {
+@@ -567,6 +707,12 @@ class Renderer {
    bool skip_redundant_resolves_ = true;
    // Frame and GPU times of the current stats window, for percentiles.
    std::vector<float> frame_ms_hist_, gpu_ms_hist_;
@@ -4346,7 +4544,7 @@ index 7b7f187..608a972 100644
  
  }  // namespace carbon::gpu
 diff --git a/renderer/src/shader_translator.cpp b/renderer/src/shader_translator.cpp
-index f01fd13..811567a 100644
+index f01fd13..4787f15 100644
 --- a/renderer/src/shader_translator.cpp
 +++ b/renderer/src/shader_translator.cpp
 @@ -12,6 +12,7 @@
@@ -4525,8 +4723,17 @@ index f01fd13..811567a 100644
    // Alpha test against color 0.
    g += R"(
    if (xe_draw.alpha_test.z != 0.0) {
+@@ -1393,5 +1417,8 @@ std::string BuildPixelShaderGlsl(const TranslatedShader& ps, const PixelShaderVa
+ }
+ 
+ std::string BuildNullPixelShaderGlsl() { return "#version 450\nvoid main() {}\n"; }
++std::string BuildBlackPixelShaderGlsl() {
++  return "#version 450\nlayout(location = 0) out vec4 out_color;\nvoid main() { out_color = vec4(0.0); }\n";
++}
+ 
+ }  // namespace carbon::gpu
 diff --git a/renderer/src/shader_translator.h b/renderer/src/shader_translator.h
-index 0328354..d592154 100644
+index 0328354..ba3edb1 100644
 --- a/renderer/src/shader_translator.h
 +++ b/renderer/src/shader_translator.h
 @@ -48,6 +48,10 @@ struct TranslatedShader {
@@ -4549,6 +4756,14 @@ index 0328354..d592154 100644
  };
  
  // `ucode` is the microcode in host byte order.
+@@ -83,6 +89,7 @@ std::string BuildVertexShaderGlsl(const TranslatedShader& vs, const VertexShader
+ std::string BuildPixelShaderGlsl(const TranslatedShader& ps, const PixelShaderVariant& variant);
+ // A pixel shader for depth-only draws (no guest pixel shader).
+ std::string BuildNullPixelShaderGlsl();
++std::string BuildBlackPixelShaderGlsl();
+ 
+ // Layout of the per-draw uniform block (set 0, binding 2), shared with the
+ // renderer. std140: everything is 16-byte aligned.
 diff --git a/renderer/src/texture_binding_cache.h b/renderer/src/texture_binding_cache.h
 new file mode 100644
 index 0000000..13142e9
@@ -4853,14 +5068,16 @@ index 0000000..43b09f1
 +
 +}  // namespace carbon::gpu
 diff --git a/renderer/src/textures.cpp b/renderer/src/textures.cpp
-index 441ae5b..6f8f41c 100644
+index 441ae5b..42847e6 100644
 --- a/renderer/src/textures.cpp
 +++ b/renderer/src/textures.cpp
-@@ -13,6 +13,15 @@
+@@ -13,11 +13,21 @@
  
  #include "renderer.h"
  
 +REXCVAR_DECLARE(bool, carbon_gpu_stats);  // renderer.cpp
++REXCVAR_DECLARE(bool, carbon_gpu_cache_verify);  // renderer.cpp
++REXCVAR_DECLARE(int32_t, carbon_gpu_texture_max_interval);  // renderer.cpp
 +REXCVAR_DEFINE_DOUBLE(carbon_gpu_texture_lod_bias, 0.0, "CarbonGPU",
 +                      "Quality/speed: added to the mip LOD bias of scene textures (0 = the game's; 1 = one mip lower, "
 +                      "blurrier and cheaper; render-to-texture sources are untouched)")
@@ -4872,7 +5089,12 @@ index 441ae5b..6f8f41c 100644
  namespace carbon::gpu {
  
  namespace {
-@@ -170,7 +179,7 @@ bool Renderer::CreateTextureImage(Texture& t, VkImageUsageFlags extra_usage) {
+ 
+-constexpr uint32_t kMaxHashInterval = 32;
+ 
+ VkComponentSwizzle SwizzleComponent(uint32_t s) {
+   switch (s) {
+@@ -170,7 +180,7 @@ bool Renderer::CreateTextureImage(Texture& t, VkImageUsageFlags extra_usage) {
    return true;
  }
  
@@ -4881,7 +5103,7 @@ index 441ae5b..6f8f41c 100644
    auto now = []() {
      return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
    };
-@@ -187,7 +196,7 @@ void Renderer::UploadTexture(Texture& t) {
+@@ -187,7 +197,7 @@ void Renderer::UploadTexture(Texture& t) {
    std::vector<HostTextureRegion> regions;
    uint64_t size = GetHostTextureSize(t.guest, t.format, regions);
    if (!size || regions.empty()) {
@@ -4890,7 +5112,7 @@ index 441ae5b..6f8f41c 100644
    }
    const auto& dfn = vulkan_device_->functions();
    uint8_t* dst;
-@@ -195,6 +204,7 @@ void Renderer::UploadTexture(Texture& t) {
+@@ -195,6 +205,7 @@ void Renderer::UploadTexture(Texture& t) {
    VkDeviceSize base_offset;
    if (size <= chunk_size_ / 2) {
      UploadAllocation a = Upload(size, 16);
@@ -4898,7 +5120,7 @@ index 441ae5b..6f8f41c 100644
      dst = a.ptr;
      buffer = a.buffer;
      base_offset = a.offset;
-@@ -210,16 +220,31 @@ void Renderer::UploadTexture(Texture& t) {
+@@ -210,16 +221,31 @@ void Renderer::UploadTexture(Texture& t) {
      VmaAllocation allocation;
      VmaAllocationInfo info;
      if (vmaCreateBuffer(allocator_, &bci, &aci, &buffer, &allocation, &info) != VK_SUCCESS) {
@@ -4932,7 +5154,7 @@ index 441ae5b..6f8f41c 100644
    }
    std::vector<VkBufferImageCopy> copies;
    copies.reserve(regions.size());
-@@ -243,6 +268,7 @@ void Renderer::UploadTexture(Texture& t) {
+@@ -243,6 +269,7 @@ void Renderer::UploadTexture(Texture& t) {
    TransitionImage(cb, t.image, VK_IMAGE_ASPECT_COLOR_BIT, t.layout,
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
    ++stats_.textures_uploaded;
@@ -4940,7 +5162,7 @@ index 441ae5b..6f8f41c 100644
  }
  
  Texture* Renderer::FindResolvedTexture(uint32_t base_address, uint32_t width, uint32_t height) {
-@@ -262,6 +288,8 @@ Texture* Renderer::FindResolvedTexture(uint32_t base_address, uint32_t width, ui
+@@ -262,6 +289,8 @@ Texture* Renderer::FindResolvedTexture(uint32_t base_address, uint32_t width, ui
  Texture* Renderer::GetOrCreateResolveTexture(uint32_t base_address, uint32_t width,
                                               uint32_t height, xenos::TextureFormat format,
                                               uint32_t& y_offset) {
@@ -4949,7 +5171,7 @@ index 441ae5b..6f8f41c 100644
    base_address &= 0x1FFFFFFF;
    y_offset = 0;
    // Predicated tiling resolves each screen tile to the address of its first
-@@ -325,22 +353,14 @@ Texture* Renderer::GetOrCreateResolveTexture(uint32_t base_address, uint32_t wid
+@@ -325,22 +354,14 @@ Texture* Renderer::GetOrCreateResolveTexture(uint32_t base_address, uint32_t wid
  
  Texture* Renderer::GetTexture(const GuestTexture& guest, bool allow_upload) {
    uint32_t key = (guest.base_address ? guest.base_address : guest.mip_address) & 0x1FFFFFFF;
@@ -4979,7 +5201,7 @@ index 441ae5b..6f8f41c 100644
    }
    if (!t) {
      if (!allow_upload) {
-@@ -360,29 +380,70 @@ Texture* Renderer::GetTexture(const GuestTexture& guest, bool allow_upload) {
+@@ -360,29 +381,78 @@ Texture* Renderer::GetTexture(const GuestTexture& guest, bool allow_upload) {
        return nullptr;
      }
      created->extent = GetGuestTextureExtent(guest);
@@ -5017,6 +5239,14 @@ index 441ae5b..6f8f41c 100644
      } else {
 -      t->hash_interval = std::min(t->hash_interval * 2, kMaxHashInterval);
 +      ApplyTextureHash(*t, HashExtent(physical_base_, t->extent));
++    }
++  }
++  else if (REXCVAR_GET(carbon_gpu_cache_verify) && !t->hash_job && t->last_used_frame != frame_number_) {
++    // Verify mode: the interval says unchanged, look anyway.
++    const uint64_t hash = HashExtent(physical_base_, t->extent);
++    if (hash != t->content_hash) {
++      ++stats_.stale_texture;  // the skipped check would have drawn the old texels
++      ApplyTextureHash(*t, hash);
      }
    }
    t->last_used_frame = frame_number_;
@@ -5030,7 +5260,7 @@ index 441ae5b..6f8f41c 100644
 +    t.hash_interval = 1;
 +    if (UploadTexture(t)) t.content_hash = hash;
 +  } else {
-+    t.hash_interval = std::min(t.hash_interval * 2, kMaxHashInterval);
++    t.hash_interval = std::min<uint32_t>(t.hash_interval * 2, uint32_t(REXCVAR_GET(carbon_gpu_texture_max_interval)));
 +  }
 +}
 +
@@ -5058,7 +5288,7 @@ index 441ae5b..6f8f41c 100644
  VkImageView Renderer::GetTextureView(Texture& t, uint32_t swizzle, bool use_signed,
                                       VkImageViewType view_type) {
    uint64_t key = uint64_t(swizzle & 0xFFF) | (uint64_t(use_signed) << 12) |
-@@ -435,8 +496,9 @@ VkSampler Renderer::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
+@@ -435,8 +505,9 @@ VkSampler Renderer::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
    VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
    sci.magFilter = mag == xenos::TextureFilter::kLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
    sci.minFilter = min == xenos::TextureFilter::kLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
@@ -5070,7 +5300,7 @@ index 441ae5b..6f8f41c 100644
    auto address = [&](xenos::ClampMode m) {
      VkSamplerAddressMode a = ToAddressMode(m);
      if (a == VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE && !props.samplerMirrorClampToEdge) {
-@@ -448,6 +510,9 @@ VkSampler Renderer::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
+@@ -448,6 +519,9 @@ VkSampler Renderer::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
    sci.addressModeV = address(fetch.clamp_y);
    sci.addressModeW = address(fetch.clamp_z);
    sci.mipLodBias = float(int32_t(lod_bias << 22) >> 22) * (1.0f / 32.0f);
@@ -5080,7 +5310,7 @@ index 441ae5b..6f8f41c 100644
    // Render-to-texture sources (post-process, blurs) are never worth anisotropic
    // taps; other textures are capped for the GPU's sake.
    if (!render_source && aniso != xenos::AnisoFilter::kDisabled && props.samplerAnisotropy &&
-@@ -472,12 +537,24 @@ VkSampler Renderer::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
+@@ -472,12 +546,24 @@ VkSampler Renderer::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
  
  void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t set_index,
                              DrawConstants& c, VkDescriptorSet& set_out) {
@@ -5106,7 +5336,7 @@ index 441ae5b..6f8f41c 100644
    constexpr uint32_t kMaxDescriptors = 64;
    const uint32_t descriptor_count = std::min(ts.texture_descriptor_count, kMaxDescriptors);
    VkDescriptorImageInfo infos[kMaxDescriptors];
-@@ -487,10 +564,17 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
+@@ -487,10 +573,17 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
      GuestTexture g;
      Texture* t = nullptr;
      if (GuestTextureFromFetch(fetch, g)) {
@@ -5125,7 +5355,7 @@ index 441ae5b..6f8f41c 100644
      // Per-fetch-constant parameters for the shader.
      uint32_t signs_in[4] = {uint32_t(fetch.sign_x), uint32_t(fetch.sign_y), uint32_t(fetch.sign_z),
                              uint32_t(fetch.sign_w)};
-@@ -553,7 +637,11 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
+@@ -553,7 +646,11 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
          default:
            break;
        }
@@ -5138,7 +5368,7 @@ index 441ae5b..6f8f41c 100644
      };
      switch (b.dimension) {
        case xenos::FetchOpDimension::k1D:
-@@ -580,14 +668,16 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
+@@ -580,14 +677,16 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
      }
    }
    // Draws that bind the same textures and samplers share one descriptor set.
@@ -5156,7 +5386,7 @@ index 441ae5b..6f8f41c 100644
    if (!set) {
      return;
    }
-@@ -603,13 +693,18 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
+@@ -603,13 +702,18 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
    vulkan_device_->functions().vkUpdateDescriptorSets(vk_device_, descriptor_count, writes, 0,
                                                       nullptr);
    texture_set_cache_.emplace(cache_key, set);
@@ -5176,7 +5406,7 @@ index 441ae5b..6f8f41c 100644
  
    // Render targets that nothing has drawn to or resolved from for a while.
    for (auto it = render_targets_.begin(); it != render_targets_.end();) {
-@@ -626,6 +721,7 @@ void Renderer::EvictResources() {
+@@ -626,6 +730,7 @@ void Renderer::EvictResources() {
          vmaDestroyImage(allocator_, image, allocation);
        });
        it = render_targets_.erase(it);
@@ -5184,7 +5414,7 @@ index 441ae5b..6f8f41c 100644
        ++stats_.evicted;
      } else {
        ++it;
-@@ -646,7 +742,7 @@ void Renderer::EvictResources() {
+@@ -646,7 +751,7 @@ void Renderer::EvictResources() {
    std::sort(candidates.begin(), candidates.end(),
              [](const Texture* a, const Texture* b) { return a->last_used_frame < b->last_used_frame; });
    for (Texture* t : candidates) {
@@ -5193,7 +5423,7 @@ index 441ae5b..6f8f41c 100644
      if (!stale && !(trimming && texture_bytes_ > target)) {
        break;
      }
-@@ -655,6 +751,7 @@ void Renderer::EvictResources() {
+@@ -655,6 +760,7 @@ void Renderer::EvictResources() {
      std::vector<VkImageView> views;
      for (auto& v : t->views) views.push_back(v.second);
      texture_bytes_ -= std::min(texture_bytes_, t->memory_bytes);
@@ -5259,23 +5489,104 @@ index 0000000..24d2ebd
 +}  // namespace carbon::gpu
 diff --git a/src/audio_filter_8bb0.h b/src/audio_filter_8bb0.h
 new file mode 100644
-index 0000000..3f58f48
+index 0000000..d8ce83d
 --- /dev/null
 +++ b/src/audio_filter_8bb0.h
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,150 @@
 +#pragma once
 +
-+#include "../generated/default/nfscarbon_pch.h"
++#include "edition.h"
++#include CARBON_GUEST_PCH
++
++// Guest register save/restore millicode that Collector's originals call (generated code; only referenced
++// from the kConservativeContext branches).
++extern "C" void __savegprlr_28(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void __restgprlr_28(PPCContext& __restrict ctx, uint8_t* base);
 +
 +#include <cmath>
 +
 +namespace carbon::audio {
 +
-+// Keep the callback/prologue and aliased filter accesses; only loop register traffic is removed.
-+inline void Filter8BB0(PPCContext& __restrict ctx, uint8_t* base) {
++// Collector's variant: the original saves r28-r31/lr through the generated helper, keeps its arguments in
++// r28-r31 and its flags in cr0/cr6/xer, all context fields; same operations, with only the loop in locals.
++inline void Filter8BB0Conservative(PPCContext& __restrict ctx, uint8_t* base) {
 +  REX_FUNC_PROLOGUE();
 +  ctx.r12.u64 = ctx.lr;
-+  ctx.lr = 0x826C8BB8;
++  ctx.lr = kFilter8BB0Lr1;
++  __savegprlr_28(ctx, base);
++  const uint32_t frame = ctx.r1.u32 - 128;
++  REX_STORE_U32(frame, ctx.r1.u32);
++  ctx.r1.u32 = frame;
++  ctx.r31.u64 = ctx.r3.u64;
++  ctx.r29.u64 = ctx.r4.u64;
++  ctx.r28.u64 = ctx.r5.u64;
++  ctx.r30.u64 = ctx.r6.u64;
++  ctx.r11.u64 = REX_LOAD_U32(ctx.r31.u32 + 8);
++  ctx.cr6.compare<uint32_t>(ctx.r11.u32, 0, ctx.xer);
++  if (!ctx.cr6.eq) {
++    ctx.r3.u64 = ctx.r11.u32;
++    ctx.r7.u64 = REX_LOAD_U8(ctx.r31.u32 + 26);
++    ctx.r6.u64 = ctx.r28.u64;
++    ctx.r5.u64 = ctx.r30.u64;
++    ctx.r11.u64 = REX_LOAD_U32(ctx.r3.u32);
++    ctx.ctr.u64 = ctx.r11.u64;
++    ctx.lr = kFilter8BB0Lr2;
++    REX_CALL_INDIRECT_FUNC(ctx.ctr.u32);
++    ctx.cr0.compare<int32_t>(ctx.r3.s32, 0, ctx.xer);
++    if (!ctx.cr0.gt) {
++      ctx.r1.s64 += 128;
++      __restgprlr_28(ctx, base);
++      return;
++    }
++  }
++  ctx.r9.s64 = ctx.r31.s64 + 28;
++  ctx.cr6.compare<int32_t>(ctx.r29.s32, 0, ctx.xer);
++  if (ctx.cr6.gt) {
++    const uint64_t state = ctx.r9.u64;
++    uint64_t destination = ctx.r30.u64, remaining = ctx.r29.u64;
++    const uint64_t difference = ctx.r28.u64 - ctx.r30.u64;
++    ctx.r8.u64 = difference;
++    ctx.fpscr.disableFlushMode();
++    PPCRegister bits{};
++    double value = 0, input = 0, input_gain = 0;
++    do {
++      bits.u32 = REX_LOAD_U32(uint32_t(state));
++      const double history = double(bits.f32);
++      --remaining;
++      bits.u32 = REX_LOAD_U32(uint32_t(state) + 4);
++      value = double(float(double(bits.f32) * history));
++      bits.u32 = REX_LOAD_U32(uint32_t(destination) + uint32_t(difference));
++      input = double(bits.f32);
++      bits.u32 = REX_LOAD_U32(uint32_t(state) + 8);
++      input_gain = double(bits.f32);
++      value = double(float(std::fma(input, input_gain, value)));
++      bits.f32 = float(value);
++      REX_STORE_U32(uint32_t(state), bits.u32);
++      REX_STORE_U32(uint32_t(destination), bits.u32);
++      destination += 4;
++    } while (uint32_t(remaining) != 0);
++    ctx.r10.u64 = remaining;
++    ctx.r11.u64 = destination;
++    // Last pass: carry from the nonzero counter before the decrement, then the zero counter's compare.
++    ctx.xer.ca = true;
++    ctx.cr0.compare<int32_t>(int32_t(remaining), 0, ctx.xer);
++    ctx.f0.f64 = value;
++    ctx.f12.f64 = input_gain;
++    ctx.f13.f64 = input;
++  }
++  ctx.r3.u64 = ctx.r29.u64;
++  ctx.r1.s64 += 128;
++  __restgprlr_28(ctx, base);
++}
++// Keep the callback/prologue and aliased filter accesses; only loop register traffic is removed.
++inline void Filter8BB0(PPCContext& __restrict ctx, uint8_t* base) {
++  if constexpr (kConservativeContext) {
++    Filter8BB0Conservative(ctx, base);
++    return;
++  }
++  REX_FUNC_PROLOGUE();
++  ctx.r12.u64 = ctx.lr;
++  ctx.lr = kFilter8BB0Lr1;
 +  const uint32_t frame = ctx.r1.u32 - 128;
 +  REX_STORE_U32(frame, ctx.r1.u32);
 +  ctx.r1.u32 = frame;
@@ -5289,7 +5600,7 @@ index 0000000..3f58f48
 +    ctx.r5.u64 = output;
 +    ctx.r11.u64 = REX_LOAD_U32(ctx.r3.u32);
 +    const uint32_t target = ctx.r11.u32;
-+    ctx.lr = 0x826C8BF4;
++    ctx.lr = kFilter8BB0Lr2;
 +    REX_CALL_INDIRECT_FUNC(target);
 +    if (ctx.r3.s32 <= 0) {
 +      ctx.r1.s64 += 128;
@@ -5334,13 +5645,19 @@ index 0000000..3f58f48
 +}  // namespace carbon::audio
 diff --git a/src/audio_filter_cca20.h b/src/audio_filter_cca20.h
 new file mode 100644
-index 0000000..c517381
+index 0000000..0f9ec05
 --- /dev/null
 +++ b/src/audio_filter_cca20.h
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,173 @@
 +#pragma once
 +
-+#include "../generated/default/nfscarbon_pch.h"
++#include "edition.h"
++#include CARBON_GUEST_PCH
++
++// Guest register save/restore millicode that Collector's originals call (generated code; only referenced
++// from the kConservativeContext branches).
++extern "C" void __savegprlr_28(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void __restgprlr_28(PPCContext& __restrict ctx, uint8_t* base);
 +
 +#include <bit>
 +#include <cmath>
@@ -5366,7 +5683,14 @@ index 0000000..c517381
 +    return uint64_t(uint32_t(int64_t(int32_t(uint32_t(stride))) * int32_t(uint32_t(channel))) << 2);
 +  };
 +  ctx.r12.u64 = ctx.lr;
-+  ctx.lr = 0x826CCA28;
++  ctx.lr = kFilterCCA20Lr;
++  if constexpr (kConservativeContext) {
++    // Collector's original saves r28-r31/lr through the generated helper and keeps r29/r30 as the descriptor
++    // slots; its non-volatile registers are context fields restored by the helper at the end.
++    __savegprlr_28(ctx, base);
++    ctx.r30.s64 = ctx.r4.s64 + 196608 + 16;
++    ctx.r29.s64 = ctx.r4.s64 + 196608 + 12;
++  }
 +  uint64_t r3 = ctx.r3.u64, r4 = ctx.r4.u64, r5 = ctx.r5.u64, r7 = ctx.r7.u64, r10, r11 = ctx.r11.u64;
 +  double f0 = ctx.f0.f64, f5 = ctx.f5.f64, f6 = ctx.f6.f64, f7 = ctx.f7.f64, f8 = ctx.f8.f64,
 +         f9 = ctx.f9.f64, f10 = ctx.f10.f64, f11 = ctx.f11.f64, f12 = ctx.f12.f64, f13 = ctx.f13.f64;
@@ -5490,6 +5814,11 @@ index 0000000..c517381
 +  ctx.r8.u64 = in_desc; ctx.r9.u64 = out_desc;
 +  ctx.f0.f64 = f0; ctx.f5.f64 = f5; ctx.f6.f64 = f6; ctx.f7.f64 = f7; ctx.f8.f64 = f8; ctx.f9.f64 = f9;
 +  ctx.f10.f64 = f10; ctx.f11.f64 = f11; ctx.f12.f64 = f12; ctx.f13.f64 = f13;
++  if constexpr (kConservativeContext) {
++    // Whichever pass ran last, the final compare is of equal counters (0 vs 0 without channels).
++    ctx.cr6.compare<uint32_t>(0, 0, ctx.xer);
++    __restgprlr_28(ctx, base);
++  }
 +}
 +
 +}  // namespace carbon::audio
@@ -5733,13 +6062,14 @@ index 0000000..b136948
 +extern "C" REX_FUNC(sub_826CDBA0) { Timed<__imp__sub_826CDBA0>(8, ctx, base); }
 diff --git a/src/audio_resampler.h b/src/audio_resampler.h
 new file mode 100644
-index 0000000..247c117
+index 0000000..4f08866
 --- /dev/null
 +++ b/src/audio_resampler.h
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,84 @@
 +#pragma once
 +
-+#include "../generated/default/nfscarbon_pch.h"
++#include "edition.h"
++#include CARBON_GUEST_PCH
 +
 +#include <cmath>
 +
@@ -5754,7 +6084,12 @@ index 0000000..247c117
 +  REX_FUNC_PROLOGUE();
 +  PPCXERRegister xer{};
 +  PPCCRRegister cr0{}, cr6{};
-+  REX_STORE_U64(ctx.r1.u32 - 8, uint64_t(0));
++  if constexpr (kConservativeContext) {
++    xer = ctx.xer;
++    cr0 = ctx.cr0;
++    cr6 = ctx.cr6;
++  }
++  REX_STORE_U64(ctx.r1.u32 - 8, kConservativeContext ? ctx.r31.u64 : uint64_t(0));
 +  uint64_t position = REX_LOAD_U32(ctx.r7.u32);
 +  cr6.compare<int32_t>(ctx.r4.s32, 0, xer);
 +  uint64_t fraction = REX_LOAD_U16(ctx.r8.u32);
@@ -5804,19 +6139,27 @@ index 0000000..247c117
 +  ctx.r11.u64 = uint32_t(fraction) << 16;
 +  REX_STORE_U32(ctx.r7.u32, ctx.r10.u32);
 +  REX_STORE_U32(ctx.r8.u32, ctx.r11.u32);
-+  (void)REX_LOAD_U64(ctx.r1.u32 - 8);  // the original reloads its local r31
++  const uint64_t saved_r31 = REX_LOAD_U64(ctx.r1.u32 - 8);  // the original reloads its r31
++  (void)saved_r31;
++  if constexpr (kConservativeContext) {
++    ctx.xer = xer;
++    ctx.cr0 = cr0;
++    ctx.cr6 = cr6;
++    ctx.r31.u64 = saved_r31;
++  }
 +}
 +
 +}  // namespace carbon::audio
 diff --git a/src/audio_resampler_15d0.h b/src/audio_resampler_15d0.h
 new file mode 100644
-index 0000000..28d2ab8
+index 0000000..57c2f1c
 --- /dev/null
 +++ b/src/audio_resampler_15d0.h
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,69 @@
 +#pragma once
 +
-+#include "../generated/default/nfscarbon_pch.h"
++#include "edition.h"
++#include CARBON_GUEST_PCH
 +
 +#include <cmath>
 +
@@ -5830,6 +6173,7 @@ index 0000000..28d2ab8
 +  uint64_t position = REX_LOAD_U16(ctx.r7.u32);
 +  uint64_t destination = ctx.r5.u64;
 +  uint32_t remaining = ctx.r3.u32;
++  if constexpr (kConservativeContext) ctx.cr6.compare<int32_t>(int32_t(remaining), 0, ctx.xer);
 +  REX_STORE_U32(ctx.r7.u32, uint32_t(position));
 +  if (int32_t(remaining) > 0) {
 +    ctx.fpscr.disableFlushMode();
@@ -5862,6 +6206,11 @@ index 0000000..28d2ab8
 +      REX_STORE_U16(ctx.r7.u32, uint16_t(0));
 +    } while (remaining != 0);
 +    ctx.r5.u64 = 0;
++    if constexpr (kConservativeContext) {
++      // The last pass leaves the counter at 0 (carry set by its nonzero value before the decrement).
++      ctx.xer.ca = true;
++      ctx.cr0.compare<int32_t>(0, 0, ctx.xer);
++    }
 +    ctx.f0.f64 = sample;
 +    ctx.f11.f64 = weight;
 +    ctx.f12.f64 = delta;
@@ -5878,22 +6227,25 @@ index 0000000..28d2ab8
 +}  // namespace carbon::audio
 diff --git a/src/audio_resampler_hook.cpp b/src/audio_resampler_hook.cpp
 new file mode 100644
-index 0000000..bea373c
+index 0000000..61d6b28
 --- /dev/null
 +++ b/src/audio_resampler_hook.cpp
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,172 @@
++#include "edition.h"
 +#include "audio_resampler.h"
 +#include "audio_resampler_15d0.h"
 +#include "audio_filter_8bb0.h"
 +#include "audio_filter_cca20.h"
 +#include "audio_unpack_fast.h"
 +#include "audio_gain_fast.h"
-+#include "../generated/default/native_leaf.h"  // scripts/localize_leaf.py, at build time
++#include CARBON_LEAF_HEADER  // scripts/localize_leaf.py, at build time
 +
 +#include <rex/cvar.h>
 +#include <rex/logging.h>
 +
 +#include <atomic>
++#include <chrono>
++#include <cmath>
 +
 +REXCVAR_DEFINE_BOOL(carbon_audio_native_resampler, true, "CarbonAudio",
 +                    "Run Carbon's scalar linear resampler with host-local register state");
@@ -5913,77 +6265,123 @@ index 0000000..bea373c
 +                    "826CD528 / 826CD8D0 (gain copy / gain-sum) aligned blocks through a NEON loop; anything else uses the register-local copies");
 +REXCVAR_DEFINE_BOOL(carbon_audio_neon_unpack_b56a8, true, "CarbonAudio",
 +                    "826B56A8 mode 1 (int16 -> float unpack) through a NEON loop; other cases use the register-local copy");
++REXCVAR_DEFINE_DOUBLE(carbon_audio_gain_cull_below, 0.0, "CarbonAudio",
++                      "826CD8D0 (out += in * gain): skip the mix when |gain| is below this (0 = only an exact zero gain, which changes nothing). 3e-5 is one 16-bit step of full scale");
 +REXCVAR_DEFINE_BOOL(carbon_audio_native_unpack_b56a8, true, "CarbonAudio",
 +                    "Run Carbon's 826B56A8 sample unpack with its registers in locals (scripts/localize_leaf.py)");
 +
-+extern "C" void __imp__sub_826CB1D8(PPCContext& __restrict ctx, uint8_t* base);
-+extern "C" void __imp__sub_826D15D0(PPCContext& __restrict ctx, uint8_t* base);
-+extern "C" void __imp__sub_826C8BB0(PPCContext& __restrict ctx, uint8_t* base);
-+extern "C" void __imp__sub_826CCA20(PPCContext& __restrict ctx, uint8_t* base);
-+extern "C" void __imp__sub_826D1678(PPCContext& __restrict ctx, uint8_t* base);
-+extern "C" void __imp__sub_826CD8D0(PPCContext& __restrict ctx, uint8_t* base);
-+extern "C" void __imp__sub_826CD528(PPCContext& __restrict ctx, uint8_t* base);
-+extern "C" void __imp__sub_826B56A8(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(AUDIO_FN_RESAMPLE)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(AUDIO_FN_RESAMPLE_15D0)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(AUDIO_FN_FILTER_8BB0)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(AUDIO_FN_FILTER_CCA20)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(AUDIO_FN_RAMP_1678)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(AUDIO_FN_MIX_CD8D0)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(AUDIO_FN_SCALE_CD528)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(AUDIO_FN_UNPACK_B56A8)(PPCContext& __restrict ctx, uint8_t* base);
 +
-+extern "C" REX_FUNC(sub_826CB1D8) {
++extern "C" REX_FUNC(AUDIO_FN_RESAMPLE) {
 +  if (REXCVAR_GET(carbon_audio_native_resampler)) {
 +    carbon::audio::Resample(ctx, base);
 +  } else {
-+    __imp__sub_826CB1D8(ctx, base);
++    CARBON_IMP(AUDIO_FN_RESAMPLE)(ctx, base);
 +  }
 +}
 +
-+extern "C" REX_FUNC(sub_826D15D0) {
++extern "C" REX_FUNC(AUDIO_FN_RESAMPLE_15D0) {
 +  if (REXCVAR_GET(carbon_audio_native_resampler_15d0)) {
 +    carbon::audio::Resample15D0(ctx, base);
 +  } else {
-+    __imp__sub_826D15D0(ctx, base);
++    CARBON_IMP(AUDIO_FN_RESAMPLE_15D0)(ctx, base);
 +  }
 +}
 +
-+extern "C" REX_FUNC(sub_826C8BB0) {
++extern "C" REX_FUNC(AUDIO_FN_FILTER_8BB0) {
 +  if (REXCVAR_GET(carbon_audio_native_filter_8bb0)) {
 +    carbon::audio::Filter8BB0(ctx, base);
 +  } else {
-+    __imp__sub_826C8BB0(ctx, base);
++    CARBON_IMP(AUDIO_FN_FILTER_8BB0)(ctx, base);
 +  }
 +}
 +
-+extern "C" REX_FUNC(sub_826CCA20) {
++extern "C" REX_FUNC(AUDIO_FN_FILTER_CCA20) {
 +  if (REXCVAR_GET(carbon_audio_native_filter_cca20)) {
 +    carbon::audio::FilterCCA20(ctx, base);
 +  } else {
-+    __imp__sub_826CCA20(ctx, base);
++    CARBON_IMP(AUDIO_FN_FILTER_CCA20)(ctx, base);
 +  }
 +}
 +
-+extern "C" REX_FUNC(sub_826D1678) {
++extern "C" REX_FUNC(AUDIO_FN_RAMP_1678) {
 +  if (REXCVAR_GET(carbon_audio_native_ramp_1678)) {
 +    carbon::leaf::Leaf1678(ctx, base);
 +  } else {
-+    __imp__sub_826D1678(ctx, base);
++    CARBON_IMP(AUDIO_FN_RAMP_1678)(ctx, base);
 +  }
 +}
 +
-+extern "C" REX_FUNC(sub_826CD8D0) {
++namespace {
++// Gain-sum calls by gain, logged every 10 s: how much of the mixing is for voices that cannot be heard.
++struct GainStats {
++  std::atomic<uint64_t> calls{0}, zero{0}, tiny{0}, floats{0}, skipped_floats{0};
++  std::atomic<int64_t> next_report_ms{0};
++};
++GainStats g_gain_stats;
++
++int64_t NowMs() {
++  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++void CountGain(float gain, uint32_t floats, bool skipped) {
++  GainStats& s = g_gain_stats;
++  s.calls.fetch_add(1, std::memory_order_relaxed);
++  s.floats.fetch_add(floats, std::memory_order_relaxed);
++  const float magnitude = std::fabs(gain);
++  if (magnitude == 0.0f) s.zero.fetch_add(1, std::memory_order_relaxed);
++  else if (magnitude < 3.0e-5f) s.tiny.fetch_add(1, std::memory_order_relaxed);
++  if (skipped) s.skipped_floats.fetch_add(floats, std::memory_order_relaxed);
++  if ((s.calls.load(std::memory_order_relaxed) & 0xFFF) != 0) return;
++  const int64_t now = NowMs();
++  int64_t next = s.next_report_ms.load(std::memory_order_relaxed);
++  if (next == 0) {
++    s.next_report_ms.compare_exchange_strong(next, now + 10000, std::memory_order_relaxed);
++    return;
++  }
++  if (now < next || !s.next_report_ms.compare_exchange_strong(next, now + 10000, std::memory_order_relaxed)) return;
++  REXLOG_INFO("[carbon-audio] 826CD8D0 gain sums, 10 s: {} calls, {} with zero gain, {} below one 16-bit step, "
++              "{} floats mixed, {} skipped",
++              s.calls.exchange(0, std::memory_order_relaxed), s.zero.exchange(0, std::memory_order_relaxed),
++              s.tiny.exchange(0, std::memory_order_relaxed), s.floats.exchange(0, std::memory_order_relaxed),
++              s.skipped_floats.exchange(0, std::memory_order_relaxed));
++}
++}  // namespace
++
++extern "C" REX_FUNC(AUDIO_FN_MIX_CD8D0) {
 +  if (REXCVAR_GET(carbon_audio_native_mix_cd8d0)) {
++    const float gain = float(ctx.f1.f64);
++    const double cull = REXCVAR_GET(carbon_audio_gain_cull_below);
++    const bool skip = std::isfinite(gain) && (std::fabs(gain) == 0.0f || std::fabs(gain) < cull) && ctx.r6.u32 != 0;
++    CountGain(gain, ctx.r6.u32, skip);
++    if (skip) {
++      ctx.fpscr.enableFlushMode();  // what the vector path leaves behind
++      return;
++    }
 +    if (REXCVAR_GET(carbon_audio_neon_gain) && carbon::audio::TryGain(ctx, base, true)) return;
 +    carbon::leaf::LeafCD8D0(ctx, base);
 +  } else {
-+    __imp__sub_826CD8D0(ctx, base);
++    CARBON_IMP(AUDIO_FN_MIX_CD8D0)(ctx, base);
 +  }
 +}
 +
-+extern "C" REX_FUNC(sub_826CD528) {
++extern "C" REX_FUNC(AUDIO_FN_SCALE_CD528) {
 +  if (REXCVAR_GET(carbon_audio_native_scale_cd528)) {
 +    if (REXCVAR_GET(carbon_audio_neon_gain) && carbon::audio::TryGain(ctx, base, false)) return;
 +    carbon::leaf::LeafCD528(ctx, base);
 +  } else {
-+    __imp__sub_826CD528(ctx, base);
++    CARBON_IMP(AUDIO_FN_SCALE_CD528)(ctx, base);
 +  }
 +}
 +
-+extern "C" REX_FUNC(sub_826B56A8) {
++extern "C" REX_FUNC(AUDIO_FN_UNPACK_B56A8) {
 +  static std::atomic<uint32_t> fast{0}, other{0};
 +  if (REXCVAR_GET(carbon_audio_native_unpack_b56a8)) {
 +    if (REXCVAR_GET(carbon_audio_neon_unpack_b56a8) && carbon::audio::TryUnpackB56A8(ctx, base)) {
@@ -5994,9 +6392,14 @@ index 0000000..bea373c
 +      return;
 +    }
 +    other.fetch_add(1, std::memory_order_relaxed);
++#if defined(NFSCARBON_COLLECTORS) && !defined(NFSCARBON_COLLECTORS_RL)
++    // Collector's original saves r14-r31 through guest millicode, so no register-local copy exists for it.
++    CARBON_IMP(AUDIO_FN_UNPACK_B56A8)(ctx, base);
++#else
 +    carbon::leaf::LeafB56A8(ctx, base);
++#endif
 +  } else {
-+    __imp__sub_826B56A8(ctx, base);
++    CARBON_IMP(AUDIO_FN_UNPACK_B56A8)(ctx, base);
 +  }
 +}
 +
@@ -6106,10 +6509,10 @@ index 0000000..b373dae
 +}  // namespace carbon::audio_server
 diff --git a/src/audio_server_wait_hook.cpp b/src/audio_server_wait_hook.cpp
 new file mode 100644
-index 0000000..8c50d51
+index 0000000..7644ad5
 --- /dev/null
 +++ b/src/audio_server_wait_hook.cpp
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,128 @@
 +// Switch: before each audio frame, wait (bounded) for the game mixer's packet instead of letting
 +// XAudio render its voice silent. See audio_server_wait.h for the mixer's layout and the failure.
 +//
@@ -6123,7 +6526,8 @@ index 0000000..8c50d51
 +#include <rex/cvar.h>
 +#include <rex/logging.h>
 +
-+#include "../generated/default/nfscarbon_pch.h"
++#include "edition.h"
++#include CARBON_GUEST_PCH
 +#include "audio_server_wait.h"
 +
 +REXCVAR_DEFINE_INT32(carbon_audio_wait_server_ms, 30, "CarbonAudio",
@@ -6133,15 +6537,18 @@ index 0000000..8c50d51
 +    .range(0, 100);
 +// MW pairs the wait with its server at 0x2D. With the wait alone (e6670266cf1a) the mixer still fell to
 +// 60-85% of real time near AI cars/particles, at 0x3B below the 0x3A handoff threads. Alone, 0x2D was
-+// rejected twice (852a1a901a15, 97b8ff5f4ca2), when late mixes still went out silent.
-+REXCVAR_DEFINE_INT32(carbon_audio_mixer_priority, 0x2D, "CarbonAudio",
++// rejected twice (852a1a901a15, 97b8ff5f4ca2), when late mixes still went out silent. 0x2A, above the XMA worker
++// (0x2B) and the GPU ring (0x2C), roughly halved the starved requests in race wars on hardware (standard,
++// 2026-10-23: peak 411 -> 251 per 10 s), so it is the default now.
++REXCVAR_DEFINE_INT32(carbon_audio_mixer_priority, 0x2A, "CarbonAudio",
 +                     "Horizon priority of the game's audio mixer thread (RWAudioCore Dac), 0x1C-0x3A; "
 +                     "0 = leave it with the game threads at 0x3B")
 +    .range(0, 0x3B);
 +
 +extern "C" bool RexSwitchSetCurrentThreadPriorityOk(int priority);
-+extern "C" void __imp__sub_826C6AB0(PPCContext& __restrict ctx, uint8_t* base);
-+extern "C" void __imp__sub_82A4C630(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CarbonAudioRatePatch(uint8_t* base, uint32_t obj);
++extern "C" void CARBON_IMP(AUDIO_FN_MIXER_LOOP)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(AUDIO_FN_SUBMIT_PACKET)(PPCContext& __restrict ctx, uint8_t* base);
 +
 +namespace {
 +using carbon::audio_server::Waiter;
@@ -6180,10 +6587,36 @@ index 0000000..8c50d51
 +}
 +}  // namespace
 +
++// Diagnostic: where does the mixer keep its sample rate? Lists every word of the mixer object (and of the structure
++// it points to at +0x30018) that holds 48000 or 44100 as an integer or a float, or one over either as a float.
++void ScanRate(const uint8_t* base, uint32_t obj) {
++  const uint32_t interesting[] = {48000u, 44100u, 0x473B8000u /*48000.0f*/, 0x472C4400u /*44100.0f*/,
++                                  0x37AEC33Eu /*1/48000*/, 0x37BDA29Cu /*1/44100*/};
++  const char* names[] = {"48000", "44100", "48000.0f", "44100.0f", "1/48000f", "1/44100f"};
++  const uint32_t at = carbon::audio_server::Load32(base, obj + 0x30018);
++  uint32_t shown = 0;
++  for (uint32_t region = 0; region < 2; ++region) {
++    const uint32_t start = region == 0 ? obj : at, length = region == 0 ? 0x31000u : 0x200u;
++    if (region == 1 && (at < 0x10000 || at > 0xBFFFFFFF)) break;
++    for (uint32_t off = 0; off < length && shown < 60; off += 4) {
++      const uint32_t value = carbon::audio_server::Load32(base, start + off);
++      for (size_t i = 0; i < 6; ++i) {
++        if (value == interesting[i]) {
++          REXLOG_INFO("[audio-rate] {} +0x{:X} ({:08X}) = {}", region == 0 ? "mixer" : "struct", off, start + off, names[i]);
++          ++shown;
++        }
++      }
++    }
++  }
++  REXLOG_INFO("[audio-rate] mixer object {:08X}, struct at +0x30018 = {:08X}, {} words listed", obj, at, shown);
++}
++
 +// The mixer thread's loop, entered once per audio session.
-+extern "C" REX_FUNC(sub_826C6AB0) {
++extern "C" REX_FUNC(AUDIO_FN_MIXER_LOOP) {
 +  g_base.store(base, std::memory_order_relaxed);
 +  g_obj.store(ctx.r3.u32, std::memory_order_release);
++  ScanRate(base, ctx.r3.u32);
++  CarbonAudioRatePatch(base, ctx.r3.u32);
 +  rex::audio::SetGanchoAntesDeTrama(&BeforeFrame);
 +  REXLOG_INFO("[audio-server] mixer 0x{:08X}: wait for its packet before each frame, at most {} ms (0 = off)",
 +              ctx.r3.u32, REXCVAR_GET(carbon_audio_wait_server_ms));
@@ -6192,20 +6625,20 @@ index 0000000..8c50d51
 +    const bool ok = RexSwitchSetCurrentThreadPriorityOk(priority);
 +    REXLOG_INFO("[audio-server] mixer thread priority 0x{:X}: {}", priority, ok ? "done" : "failed");
 +  }
-+  __imp__sub_826C6AB0(ctx, base);
++  CARBON_IMP(AUDIO_FN_MIXER_LOOP)(ctx, base);
 +  rex::audio::SetGanchoAntesDeTrama(nullptr);
 +  g_obj.store(0, std::memory_order_release);
 +}
 +
 +// XAudio source voice SubmitPacket(voice, packet, flags).
-+extern "C" REX_FUNC(sub_82A4C630) {
++extern "C" REX_FUNC(AUDIO_FN_SUBMIT_PACKET) {
 +  const uint32_t obj = g_obj.load(std::memory_order_acquire);
 +  if (obj == 0 || ctx.r3.u32 != carbon::audio_server::Load32(base, obj + carbon::audio_server::kVoice)) {
-+    __imp__sub_82A4C630(ctx, base);
++    CARBON_IMP(AUDIO_FN_SUBMIT_PACKET)(ctx, base);
 +    return;
 +  }
 +  g_waiter.BeginSubmit();
-+  __imp__sub_82A4C630(ctx, base);
++  CARBON_IMP(AUDIO_FN_SUBMIT_PACKET)(ctx, base);
 +  g_waiter.EndSubmit(NowUs());
 +}
 diff --git a/src/audio_unpack_fast.h b/src/audio_unpack_fast.h
@@ -6281,10 +6714,10 @@ index 0000000..548040d
 +}  // namespace carbon::audio
 diff --git a/src/dlc_install.cpp b/src/dlc_install.cpp
 new file mode 100644
-index 0000000..eeb8e35
+index 0000000..a0ea588
 --- /dev/null
 +++ b/src/dlc_install.cpp
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,58 @@
 +// Installs DLC packages (Xbox 360 STFS files) found in <executable folder>/dlc.
 +//
 +// The SDK enumerates marketplace content (type 00000002) from extracted folders under
@@ -6301,6 +6734,8 @@ index 0000000..eeb8e35
 +#include <cstdio>
 +#include <cstring>
 +#include <filesystem>
++#include <set>
++#include <string>
 +#include <system_error>
 +
 +
@@ -6311,7 +6746,8 @@ index 0000000..eeb8e35
 +  auto* kernel_state = runtime->kernel_state();
 +  auto* content = kernel_state ? kernel_state->content_manager() : nullptr;
 +  if (!content) return;
-+  int installed = 0, failed = 0;
++  int installed = 0, failed = 0, duplicates = 0;
++  std::set<std::string> seen;  // the same package in two folders installs to the same place: once is enough
 +  for (std::filesystem::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
 +    if (!it->is_regular_file(ec) || it->file_size(ec) < 0xA000) continue;
 +    char magic[4] = {};
@@ -6323,6 +6759,12 @@ index 0000000..eeb8e35
 +      continue;
 +    }
 +    if (std::memcmp(magic, "LIVE", 4) && std::memcmp(magic, "PIRS", 4) && std::memcmp(magic, "CON ", 4)) continue;
++    if (!seen.insert(it->path().filename().string()).second) {
++      ++duplicates;
++      REXLOG_INFO("[dlc] {}: same file name as an earlier package, skipped ({})", it->path().filename().string(),
++                  it->path().string());
++      continue;
++    }
 +    const auto result = content->InstallContent(it->path());
 +    if (result == 0) {
 +      ++installed;
@@ -6331,15 +6773,15 @@ index 0000000..eeb8e35
 +    }
 +    REXLOG_INFO("[dlc] {} -> {:08X}", it->path().filename().string(), uint32_t(result));
 +  }
-+  REXLOG_INFO("[dlc] {}: {} package(s) installed, {} failed (title {:08X})", root.string(), installed, failed,
-+              kernel_state->title_id());
++  REXLOG_INFO("[dlc] {}: {} package(s) installed, {} failed, {} duplicate(s) skipped (title {:08X})", root.string(),
++              installed, failed, duplicates, kernel_state->title_id());
 +}
 diff --git a/src/frame_handoff_hook.cpp b/src/frame_handoff_hook.cpp
 new file mode 100644
-index 0000000..f968bb0
+index 0000000..a051a44
 --- /dev/null
 +++ b/src/frame_handoff_hook.cpp
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,135 @@
 +// Switch: the game's frame handoff without a Sleep(0) spin (the MW port's approach,
 +// reference-nfsmw-nx/app/src/nfsmw_espera_fotograma.cpp, with Carbon's own addresses).
 +//
@@ -6369,7 +6811,8 @@ index 0000000..f968bb0
 +#include <chrono>
 +#include <cstdint>
 +
-+#include "../generated/default/nfscarbon_pch.h"
++#include "edition.h"
++#include CARBON_GUEST_PCH
 +
 +REXCVAR_DEFINE_BOOL(carbon_handoff_sleep, true, "CarbonPerf",
 +                    "Frame handoff loops (sub_824E9720 / sub_824E9948) sleep 100 us instead of spinning on Sleep(0)");
@@ -6377,14 +6820,28 @@ index 0000000..f968bb0
 +                     "Horizon priority for the two frame handoff threads (default 0x3A as in MW; 0 = untouched 0x3B)")
 +    .range(0, 0x3B);
 +
-+extern "C" void __imp__sub_82943548(PPCContext& __restrict ctx, uint8_t* base);
++// Edition-specific addresses (Collector's: Sleep(0) stub 82943548 -> 82943378, handoff functions
++// 824E9720 -> 824E95F0 and 824E9948 -> 824E9818, verified instruction-for-instruction).
++#if defined(NFSCARBON_COLLECTORS)
++#define HANDOFF_SLEEP sub_82943378
++#define HANDOFF_SLEEP_IMPL __imp__sub_82943378
++#else
++#define HANDOFF_SLEEP sub_82943548
++#define HANDOFF_SLEEP_IMPL __imp__sub_82943548
++#endif
++extern "C" void HANDOFF_SLEEP_IMPL(PPCContext& __restrict ctx, uint8_t* base);
 +extern "C" bool RexSwitchSetCurrentThreadPriorityOk(int priority);
 +extern "C" void RexSwitchPerfSetThreadName(uint32_t handle, const char* name);
 +extern "C" uint32_t threadGetCurHandle(void);  // libnx
 +
 +namespace {
++#if defined(NFSCARBON_COLLECTORS)
++constexpr uint32_t kMainWaitReturn = 0x824E964C;    // sub_824E95F0: wait for the flag to become 1
++constexpr uint32_t kRenderWaitReturn = 0x824E98B4;  // sub_824E9818: wait for the flag to go back to 0
++#else
 +constexpr uint32_t kMainWaitReturn = 0x824E977C;    // sub_824E9720: wait for the flag to become 1
 +constexpr uint32_t kRenderWaitReturn = 0x824E99E4;  // sub_824E9948: wait for the flag to go back to 0
++#endif
 +constexpr const char* kSide[2] = {"main", "render"};
 +
 +struct Side {
@@ -6437,18 +6894,18 @@ index 0000000..f968bb0
 +}
 +}  // namespace
 +
-+extern "C" REX_FUNC(sub_82943548) {
++extern "C" REX_FUNC(HANDOFF_SLEEP) {
 +  const uint32_t ret = uint32_t(ctx.lr);
 +  const int side = ret == kMainWaitReturn ? 0 : ret == kRenderWaitReturn ? 1 : -1;
 +  if (side < 0 || ctx.r3.u32 != 0 || !REXCVAR_GET(carbon_handoff_sleep)) {
-+    __imp__sub_82943548(ctx, base);
++    HANDOFF_SLEEP_IMPL(ctx, base);
 +    return;
 +  }
 +  RaisePriorityOnce(side);
 +  Side& s = g_side[side];
 +  const uint64_t n = s.waits.fetch_add(1, std::memory_order_relaxed);
 +  if ((n & 63) == 63) {
-+    __imp__sub_82943548(ctx, base);  // the original yield, with its title-termination check
++    HANDOFF_SLEEP_IMPL(ctx, base);  // the original yield, with its title-termination check
 +    return;
 +  }
 +  const int64_t start = NowNs();
@@ -6492,6 +6949,18 @@ index 0000000..fb2df74
 +  const double bias = REXCVAR_GET(carbon_lod_bias);
 +  if (bias < 1.0) ctx.r3.u64 = uint32_t(int32_t(double(ctx.r3.s32) * bias));
 +}
+diff --git a/src/main.cpp b/src/main.cpp
+index e622dec..7615c4e 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1,6 +1,6 @@
+ // nfscarbon - ReXGlue Recompiled Project
+ 
+-#include "generated/default/nfscarbon_init.h"
++#include "nfscarbon_init.h"
+ 
+ #include "nfscarbon_app.h"
+ 
 diff --git a/src/nfscarbon_app.h b/src/nfscarbon_app.h
 index 29e2a26..2d394c8 100644
 --- a/src/nfscarbon_app.h
@@ -6636,10 +7105,10 @@ index 29e2a26..2d394c8 100644
      thread_affinity_ = nfscarbon::afinidad::Arrancar();
 diff --git a/src/render_pass_profile_hook.cpp b/src/render_pass_profile_hook.cpp
 new file mode 100644
-index 0000000..8a42191
+index 0000000..cb21814
 --- /dev/null
 +++ b/src/render_pass_profile_hook.cpp
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,236 @@
 +// Switch: time the game's own per-frame render passes, and optionally skip them (diagnostic).
 +//
 +// Stack capture 23:14-23:20: the game's render thread grows from 47% to 72% of a core when
@@ -6663,19 +7132,62 @@ index 0000000..8a42191
 +#include <chrono>
 +#include <cstdint>
 +
-+#include "../generated/default/nfscarbon_pch.h"
++#include "edition.h"
++#include CARBON_GUEST_PCH
 +
 +REXCVAR_DEFINE_INT32(carbon_debug_skip_passes, 0, "CarbonDebug",
 +                     "Skip game render passes (diagnostic): bit 0 visibility prep sub_8250B4D0, bits 1-5 "
 +                     "view passes sub_824EED60, sub_824EF830, sub_824EFB70, sub_824EF1A8, sub_824EE110");
 +
-+extern "C" void __imp__sub_824F0210(PPCContext& __restrict ctx, uint8_t* base);
-+extern "C" void __imp__sub_8250B4D0(PPCContext& __restrict ctx, uint8_t* base);
-+extern "C" void __imp__sub_824EED60(PPCContext& __restrict ctx, uint8_t* base);
-+extern "C" void __imp__sub_824EF830(PPCContext& __restrict ctx, uint8_t* base);
-+extern "C" void __imp__sub_824EFB70(PPCContext& __restrict ctx, uint8_t* base);
-+extern "C" void __imp__sub_824EF1A8(PPCContext& __restrict ctx, uint8_t* base);
-+extern "C" void __imp__sub_824EE110(PPCContext& __restrict ctx, uint8_t* base);
++REXCVAR_DEFINE_INT32(carbon_cube_interval, 1, "CarbonPerf",
++                     "Run the car cube-reflection pass (sub_824EF830) once every N frames instead of every frame "
++                     "(1 = every frame, the game's behaviour). Between runs the cube map keeps its last contents, "
++                     "which is nearly invisible for a reflection, unlike skipping the pass with carbon_debug_skip_passes")
++    .range(1, 240);
++
++extern "C" void CARBON_IMP(PASS_FRAME)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(PASS_PREP)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(PASS_1)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(PASS_2)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(PASS_3)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(PASS_4)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(PASS_5)(PPCContext& __restrict ctx, uint8_t* base);
++// Other callees of the render thread's frame loop, timed inclusively (diagnostic; never skipped).
++extern "C" void CARBON_IMP(RT_FRAME)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_BODY)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_WAIT)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_A)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_B)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_C)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_D)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_E)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_F)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_G)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_H)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_I)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_J)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_K)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_L)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_M)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_N)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_O)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(RT_P)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(MP_0)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(MP_1)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(MP_2)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(MP_3)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(MP_4)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(MP_5)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(MP_6)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(MP_7)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(MP_8)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(MP_9)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(MP_10)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(MP_11)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(MP_12)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(MP_13)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(MP_14)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(MP_15)(PPCContext& __restrict ctx, uint8_t* base);
 +
 +namespace {
 +constexpr size_t kSlots = 7;  // 0 prep, 1-5 passes, 6 whole frame (sub_824F0210)
@@ -6695,10 +7207,62 @@ index 0000000..8a42191
 +    g_calls[slot].fetch_add(1, std::memory_order_relaxed);
 +    return;  // skipped: the game's pass does not run this frame
 +  }
++  if (slot == 2) {  // the car cube-reflection pass
++    static std::atomic<uint32_t> cube_frame{0};
++    const int32_t every = REXCVAR_GET(carbon_cube_interval);
++    if (every > 1 && cube_frame.fetch_add(1, std::memory_order_relaxed) % uint32_t(every) != 0) {
++      g_calls[slot].fetch_add(1, std::memory_order_relaxed);
++      return;
++    }
++  }
 +  const int64_t start = NowNs();
 +  Original(ctx, base);
 +  g_ns[slot].fetch_add(uint64_t(NowNs() - start), std::memory_order_relaxed);
 +  g_calls[slot].fetch_add(1, std::memory_order_relaxed);
++}
++
++constexpr size_t kMpSlots = 16;
++std::array<std::atomic<uint64_t>, kMpSlots> g_mp_ns{};
++std::atomic<uint32_t> g_mp_frames{0};
++
++template <void (*Original)(PPCContext& __restrict, uint8_t*)>
++void TimedMp(size_t slot, PPCContext& ctx, uint8_t* base) {
++  const int64_t start = NowNs();
++  Original(ctx, base);
++  g_mp_ns[slot].fetch_add(uint64_t(NowNs() - start), std::memory_order_relaxed);
++}
++
++constexpr size_t kRtSlots = 19;
++std::array<std::atomic<uint64_t>, kRtSlots> g_rt_ns{};
++std::atomic<uint32_t> g_rt_frames{0};
++
++template <void (*Original)(PPCContext& __restrict, uint8_t*)>
++void TimedRt(size_t slot, PPCContext& ctx, uint8_t* base) {
++  const int64_t start = NowNs();
++  Original(ctx, base);
++  g_rt_ns[slot].fetch_add(uint64_t(NowNs() - start), std::memory_order_relaxed);
++}
++
++void ReportRt(int64_t now, int64_t& due) {
++  if (now < due) return;
++  due = now + 10'000'000'000;
++  const double frames = double(std::max<uint32_t>(g_rt_frames.exchange(0), 1));
++  double ms[kRtSlots];
++  for (size_t i = 0; i < kRtSlots; ++i) ms[i] = double(g_rt_ns[i].exchange(0)) * 1e-6 / frames;
++  REXLOG_INFO("[render-thread] inclusive ms/frame over {:.0f} frames: frame-fn {:.2f} | body {:.2f} | flag-wait {:.2f} | "
++              "A {:.2f} B {:.2f} C {:.2f} D {:.2f} E {:.2f} F {:.2f} G {:.2f} H {:.2f} I {:.2f}",
++              frames, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], ms[7], ms[8], ms[9], ms[10], ms[11]);
++  {
++    const double mp_frames = double(std::max<uint32_t>(g_mp_frames.exchange(0), 1));
++    double mp[kMpSlots];
++    for (size_t i = 0; i < kMpSlots; ++i) mp[i] = double(g_mp_ns[i].exchange(0)) * 1e-6 / mp_frames;
++    REXLOG_INFO("[main-pass] callees, inclusive ms/frame (std address suffix): E02C0 {:.2f} C8000 {:.2f} AA710 {:.2f} 01CC8 {:.2f} E6C28 {:.2f} "
++                "E5B38 {:.2f} 879F8 {:.2f} 5C358 {:.2f} B0B98 {:.2f} 8A388 {:.2f} 10290 {:.2f} 0A648 {:.2f} D4C68 {:.2f} 7BDA8 {:.2f} "
++                "C49C8 {:.2f} C8C30 {:.2f}",
++                mp[0], mp[1], mp[2], mp[3], mp[4], mp[5], mp[6], mp[7], mp[8], mp[9], mp[10], mp[11], mp[12], mp[13], mp[14], mp[15]);
++  }
++  REXLOG_INFO("[render-thread] body callees: J {:.2f} K {:.2f} L {:.2f} M {:.2f} N {:.2f} O {:.2f} | P (in A) {:.2f}",
++              ms[12], ms[13], ms[14], ms[15], ms[16], ms[17], ms[18]);
 +}
 +
 +// One line every 10 s from the game's render thread, after a whole frame.
@@ -6724,18 +7288,65 @@ index 0000000..8a42191
 +}
 +}  // namespace
 +
-+extern "C" REX_FUNC(sub_8250B4D0) { Timed<__imp__sub_8250B4D0>(0, ctx, base); }
-+extern "C" REX_FUNC(sub_824EED60) { Timed<__imp__sub_824EED60>(1, ctx, base); }
-+extern "C" REX_FUNC(sub_824EF830) { Timed<__imp__sub_824EF830>(2, ctx, base); }
-+extern "C" REX_FUNC(sub_824EFB70) { Timed<__imp__sub_824EFB70>(3, ctx, base); }
-+extern "C" REX_FUNC(sub_824EF1A8) { Timed<__imp__sub_824EF1A8>(4, ctx, base); }
-+extern "C" REX_FUNC(sub_824EE110) { Timed<__imp__sub_824EE110>(5, ctx, base); }
-+extern "C" REX_FUNC(sub_824F0210) {
-+  Timed<__imp__sub_824F0210>(6, ctx, base);
++extern "C" REX_FUNC(PASS_PREP) { Timed<CARBON_IMP(PASS_PREP)>(0, ctx, base); }
++extern "C" REX_FUNC(PASS_1) { Timed<CARBON_IMP(PASS_1)>(1, ctx, base); }
++extern "C" REX_FUNC(PASS_2) { Timed<CARBON_IMP(PASS_2)>(2, ctx, base); }
++extern "C" REX_FUNC(PASS_3) { Timed<CARBON_IMP(PASS_3)>(3, ctx, base); }
++extern "C" REX_FUNC(PASS_4) { Timed<CARBON_IMP(PASS_4)>(4, ctx, base); }
++extern "C" REX_FUNC(PASS_5) {
++  Timed<CARBON_IMP(PASS_5)>(5, ctx, base);
++  g_mp_frames.fetch_add(1, std::memory_order_relaxed);
++}
++extern "C" REX_FUNC(PASS_FRAME) {
++  Timed<CARBON_IMP(PASS_FRAME)>(6, ctx, base);
 +  MaybeReport();
 +}
++extern "C" REX_FUNC(RT_BODY) { TimedRt<CARBON_IMP(RT_BODY)>(1, ctx, base); }
++extern "C" REX_FUNC(RT_WAIT) { TimedRt<CARBON_IMP(RT_WAIT)>(2, ctx, base); }
++extern "C" REX_FUNC(RT_A) { TimedRt<CARBON_IMP(RT_A)>(3, ctx, base); }
++extern "C" REX_FUNC(RT_B) { TimedRt<CARBON_IMP(RT_B)>(4, ctx, base); }
++extern "C" REX_FUNC(RT_C) { TimedRt<CARBON_IMP(RT_C)>(5, ctx, base); }
++extern "C" REX_FUNC(RT_D) { TimedRt<CARBON_IMP(RT_D)>(6, ctx, base); }
++extern "C" REX_FUNC(RT_E) { TimedRt<CARBON_IMP(RT_E)>(7, ctx, base); }
++extern "C" REX_FUNC(RT_F) { TimedRt<CARBON_IMP(RT_F)>(8, ctx, base); }
++extern "C" REX_FUNC(RT_G) { TimedRt<CARBON_IMP(RT_G)>(9, ctx, base); }
++extern "C" REX_FUNC(RT_H) { TimedRt<CARBON_IMP(RT_H)>(10, ctx, base); }
++extern "C" REX_FUNC(RT_I) { TimedRt<CARBON_IMP(RT_I)>(11, ctx, base); }
++extern "C" REX_FUNC(RT_FRAME) {
++  static int64_t due = 0;
++  const int64_t start = NowNs();
++  CARBON_IMP(RT_FRAME)(ctx, base);
++  const int64_t now = NowNs();
++  g_rt_ns[0].fetch_add(uint64_t(now - start), std::memory_order_relaxed);
++  g_rt_frames.fetch_add(1, std::memory_order_relaxed);
++  if (due == 0) due = now + 10'000'000'000;
++  ReportRt(now, due);
++}
++extern "C" REX_FUNC(RT_J) { TimedRt<CARBON_IMP(RT_J)>(12, ctx, base); }
++extern "C" REX_FUNC(RT_K) { TimedRt<CARBON_IMP(RT_K)>(13, ctx, base); }
++extern "C" REX_FUNC(RT_L) { TimedRt<CARBON_IMP(RT_L)>(14, ctx, base); }
++extern "C" REX_FUNC(RT_M) { TimedRt<CARBON_IMP(RT_M)>(15, ctx, base); }
++extern "C" REX_FUNC(RT_N) { TimedRt<CARBON_IMP(RT_N)>(16, ctx, base); }
++extern "C" REX_FUNC(RT_O) { TimedRt<CARBON_IMP(RT_O)>(17, ctx, base); }
++extern "C" REX_FUNC(RT_P) { TimedRt<CARBON_IMP(RT_P)>(18, ctx, base); }
++extern "C" REX_FUNC(MP_0) { TimedMp<CARBON_IMP(MP_0)>(0, ctx, base); }
++extern "C" REX_FUNC(MP_1) { TimedMp<CARBON_IMP(MP_1)>(1, ctx, base); }
++extern "C" REX_FUNC(MP_2) { TimedMp<CARBON_IMP(MP_2)>(2, ctx, base); }
++extern "C" REX_FUNC(MP_3) { TimedMp<CARBON_IMP(MP_3)>(3, ctx, base); }
++extern "C" REX_FUNC(MP_4) { TimedMp<CARBON_IMP(MP_4)>(4, ctx, base); }
++extern "C" REX_FUNC(MP_5) { TimedMp<CARBON_IMP(MP_5)>(5, ctx, base); }
++extern "C" REX_FUNC(MP_6) { TimedMp<CARBON_IMP(MP_6)>(6, ctx, base); }
++extern "C" REX_FUNC(MP_7) { TimedMp<CARBON_IMP(MP_7)>(7, ctx, base); }
++extern "C" REX_FUNC(MP_8) { TimedMp<CARBON_IMP(MP_8)>(8, ctx, base); }
++extern "C" REX_FUNC(MP_9) { TimedMp<CARBON_IMP(MP_9)>(9, ctx, base); }
++extern "C" REX_FUNC(MP_10) { TimedMp<CARBON_IMP(MP_10)>(10, ctx, base); }
++extern "C" REX_FUNC(MP_11) { TimedMp<CARBON_IMP(MP_11)>(11, ctx, base); }
++extern "C" REX_FUNC(MP_12) { TimedMp<CARBON_IMP(MP_12)>(12, ctx, base); }
++extern "C" REX_FUNC(MP_13) { TimedMp<CARBON_IMP(MP_13)>(13, ctx, base); }
++extern "C" REX_FUNC(MP_14) { TimedMp<CARBON_IMP(MP_14)>(14, ctx, base); }
++extern "C" REX_FUNC(MP_15) { TimedMp<CARBON_IMP(MP_15)>(15, ctx, base); }
 diff --git a/src/ring_wait_hook.cpp b/src/ring_wait_hook.cpp
-index d05e2cd..99d097d 100644
+index d05e2cd..0172549 100644
 --- a/src/ring_wait_hook.cpp
 +++ b/src/ring_wait_hook.cpp
 @@ -1,4 +1,4 @@
@@ -6753,7 +7364,7 @@ index d05e2cd..99d097d 100644
  // the loaded GPU plugin, librexgpu-carbon.so or librexgpu-xenos.so), capped at
  // 1 ms. Without that symbol it does nothing.
  //
-@@ -25,11 +25,22 @@
+@@ -25,31 +25,69 @@
  // A/B: adb shell setprop debug.nfscarbon.ring_wait 0 disables it (read once at
  // first use).
  
@@ -6776,10 +7387,24 @@ index d05e2cd..99d097d 100644
  
  #include <atomic>
  #include <cstdint>
-@@ -38,6 +49,14 @@
- #include "../generated/default/nfscarbon_pch.h"
+ #include <ctime>
  
- extern "C" void __imp__sub_826E0250(PPCContext& __restrict ctx, uint8_t* base);
+-#include "../generated/default/nfscarbon_pch.h"
++#include "edition.h"
++#include CARBON_GUEST_PCH
+ 
+-extern "C" void __imp__sub_826E0250(PPCContext& __restrict ctx, uint8_t* base);
++// Edition-specific addresses; the logic below is shared. Collector's Edition values were matched
++// instruction-for-instruction against standard (watchdog 826E0250 -> 826E0088, loops 826DBD78 ->
++// 826DBBB0 and 826DBB80 -> 826DB9B8, same offsets 10768 / 10813).
++#if defined(NFSCARBON_COLLECTORS)
++#define RING_WAIT_WATCHDOG sub_826E0088
++#define RING_WAIT_WATCHDOG_IMPL __imp__sub_826E0088
++#else
++#define RING_WAIT_WATCHDOG sub_826E0250
++#define RING_WAIT_WATCHDOG_IMPL __imp__sub_826E0250
++#endif
++extern "C" void RING_WAIT_WATCHDOG_IMPL(PPCContext& __restrict ctx, uint8_t* base);
 +#if REX_PLATFORM_SWITCH
 +extern "C" std::atomic<uint32_t> nfsmw_cp_rptr_seq;
 +extern "C" std::atomic<bool> carbon_cp_ring_wait_active;
@@ -6791,7 +7416,17 @@ index d05e2cd..99d097d 100644
  
  namespace {
  
-@@ -50,6 +69,9 @@ constexpr uint32_t kRingWaitReturn2 = 0x826DBBF8;  // sub_826DBB80
+ // Return addresses of the watchdog calls in the two ring-space wait loops.
++#if defined(NFSCARBON_COLLECTORS)
++constexpr uint32_t kRingWaitReturn1 = 0x826DBC4C;  // sub_826DBBB0
++constexpr uint32_t kRingWaitReturn2 = 0x826DBA30;  // sub_826DB9B8
++#else
+ constexpr uint32_t kRingWaitReturn1 = 0x826DBE14;  // sub_826DBD78
+ constexpr uint32_t kRingWaitReturn2 = 0x826DBBF8;  // sub_826DBB80
++#endif
+ 
+ // Offset in the D3D device of the pointer to the CP read pointer writeback
+ // (lwz rX,10768(rDevice) in both loops; 10384 in NFSMW).
  constexpr uint32_t kDeviceRptrPointer = 10768;
  
  std::atomic<uint32_t>* RptrSequence() {
@@ -6801,7 +7436,7 @@ index d05e2cd..99d097d 100644
    static std::atomic<uint32_t>* const sequence = []() -> std::atomic<uint32_t>* {
      char value[PROP_VALUE_MAX] = {};
      if (__system_property_get("debug.nfscarbon.ring_wait", value) > 0 && value[0] == '0') {
-@@ -65,6 +87,7 @@ std::atomic<uint32_t>* RptrSequence() {
+@@ -65,27 +103,46 @@ std::atomic<uint32_t>* RptrSequence() {
      return nullptr;
    }();
    return sequence;
@@ -6809,7 +7444,10 @@ index d05e2cd..99d097d 100644
  }
  
  }  // namespace
-@@ -74,16 +97,34 @@ extern "C" REX_FUNC(sub_826E0250) {
+ 
+-extern "C" REX_FUNC(sub_826E0250) {
++extern "C" REX_FUNC(RING_WAIT_WATCHDOG) {
+   const uint32_t ret = uint32_t(ctx.lr);
    if (ret == kRingWaitReturn1 || ret == kRingWaitReturn2) {
      if (std::atomic<uint32_t>* sequence = RptrSequence()) {
        // Sequence first, then the pointer: if the CP publishes in between, the
@@ -6847,6 +7485,9 @@ index d05e2cd..99d097d 100644
        }
      }
    }
+-  __imp__sub_826E0250(ctx, base);
++  RING_WAIT_WATCHDOG_IMPL(ctx, base);
+ }
 diff --git a/src/switch_limits_log.cpp b/src/switch_limits_log.cpp
 new file mode 100644
 index 0000000..e14b744

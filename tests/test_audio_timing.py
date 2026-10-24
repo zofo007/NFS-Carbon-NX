@@ -16,7 +16,7 @@ class AudioTimingTests(unittest.TestCase):
             for operation, counter in re.findall(r"RexSwitchPerf(Add|Max)\((\d+),", worker + driver)
             if int(counter) >= 33
         }
-        self.assertEqual(counters, {33: "Add", 34: "Max", 35: "Add", 36: "Max"})
+        self.assertEqual(counters, {33: "Add", 34: "Max", 35: "Add", 36: "Max", 42: "Add", 43: "Add", 44: "Add", 45: "Max"})
         capacity = re.search(r"kCounterCount = (\d+)", report)
         self.assertIsNotNone(capacity)
         self.assertGreater(int(capacity[1]), max(counters))

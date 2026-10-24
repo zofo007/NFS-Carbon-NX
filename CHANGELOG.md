@@ -1,5 +1,63 @@
 # Changelog
 
+## 1.0.0 (Standard Edition, first non-beta release)
+
+Audio, DLC and visual fixes, and Collector's Edition support. The numbers below are hardware measurements on one console
+at CPU 1428 / GPU 768 / memory 1600 MHz; see docs/PERFORMANCE.md.
+
+### Added
+- **Collector's Edition support (beta).** Own install folder (`switch/nfscarbon-collectors/`), own NRO
+  (`nfscarbon-collectors.nro`). The ring-space wait, frame hand-off, audio, render-pass and car-detail hooks of the
+  standard edition were ported with every address matched instruction by instruction against the Collector's code
+  (`src/edition.h`), with differential tests for the audio helpers. About 24 to 30 FPS in race wars against about 31 on the
+  standard edition, because its translated game code keeps registers in memory between calls.
+- `audio_switch_recuperar` (default 1): the audio pump refills its frame queue after a gap.
+- `carbon_cube_interval` (default 1, shipped 30): run the car cube-reflection pass once every N frames.
+- `carbon_gpu_bloom` is now on by default; `carbon_gpu_bloom_black_f84b` is an experiment (off).
+- `carbon_audio_gain_cull_below`, `carbon_audio_mixer_rate`: experiments, off. They did not help (see PERFORMANCE.md).
+- `content_max_marketplace_items` (default 30): how many DLC packs the game is shown.
+- `carbon_ai_car_lod_bias` and `carbon_ai_car_lod_min_cars`: lower the model detail of the other racers (off; little effect).
+- Diagnostics (report config only): per-pass render timings (`[render-pass]`, `[render-thread]`, `[main-pass]`), the audio
+  queue depth in `rex_perfil.log`, a gain-sum statistics line, a hotspot analyzer (`scripts/analyze_hotspots.py`).
+
+### Fixed
+- **Audio stutter in race wars.** The pump asked for exactly the frames the output consumed, so the 32-frame cushion never
+  refilled after the first gap and every mixer hiccup became silence. In race wars the audio requests without data went
+  from about 50 to 410 per 10 s in nearly every race window to none in most windows (24 of 34 in one run; worst window 117).
+- The game's mixer thread runs at Horizon priority 0x2A (was 0x2D), above the XMA decoder (0x2B) and the GPU ring (0x2C).
+- **Empty pause menu background** when bloom is off: only the quarter-resolution blur chain is drawn black now, not the
+  same shader at the resolutions the pause menu uses.
+- **No DLC at all after an interrupted or hand-cleaned install.** A stale install journal made recovery fail forever:
+  every install returned access denied and the game was shown no DLC. Recovery now clears such entries, a work folder
+  that cannot be deleted is logged and no longer blocks anything, and one stuck pack no longer hides the others.
+- Install work folders are deleted entry by entry when the standard delete fails on the SD card (it left
+  `.dlc-install/<pack>` behind at every launch).
+- The same DLC package in two folders under `dlc/` is installed once.
+- The DLC list is capped at 30 packs: 36 and 52 crashed the profile load (call to `0xEEEEEEEE`), 30 ran a long session.
+
+### Changed
+- The shipped configs keep the car cube-reflection pass (refreshed every 30 frames) instead of skipping it for good.
+- Bloom on: about 4 ms more GPU time per frame in a crowded race.
+
+### Known problems
+- Black patches next to a washed-out road at 120 to 150 km/h while the motion blur or tunnel vision effect is on. Not caused by
+  bloom or the cube pass. Still open.
+- Audio can still crackle for a few seconds at a heavy race start (mixer at about 3.8 ms of CPU per 5.3 ms block).
+- Collector's Edition is slower and has had fewer hours of testing.
+- Achievements are still not confirmed.
+## 1.0.0-collectors-beta.1 (Collector's Edition)
+
+First release of the Collector's Edition port. Beta. It uses the same renderer, audio output, DLC handling and settings as
+1.0.0 above (everything under "Added", "Fixed" and "Changed" there applies), with these differences:
+
+- Own install folder `switch/nfscarbon-collectors/` and own NRO `nfscarbon-collectors.nro`; saves are separate from the
+  standard edition's. `default.xex` SHA-256 `922c7a1a2fc77405c43aac5159ad67fb0414c872084abc3335c68dbb4bec1815`.
+- Slower than 1.0.0: its translated game code keeps every register in memory between calls. At the reference clocks race
+  wars run at 24 to 30 FPS (about 31 on the standard edition), lighter scenes at 45 to 55. A faster register-local
+  translation exists but has not been run on hardware, so it is not part of this release.
+- Fewer hours of testing: boot, career, races, pause and DLC loading were checked on hardware; cutscenes, long sessions
+  and every car and event were not.
+- The video hook, the mixer diagnostics and the level-of-detail hook of the standard edition are not used.
 ## 0.1.0-beta.8
 
 Stability and data-safety fixes for the Switch port. Keeps the beta.7 release settings.

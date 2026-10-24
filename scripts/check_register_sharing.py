@@ -15,7 +15,8 @@ from pathlib import Path
 
 # Normal functions (save helpers, called by bl) whose loop body comes first in text order and
 # is entered by a goto after the register is written: not real reads, never mark them.
-KNOWN_TEXT_ORDER = {"sub_82936C80", "sub_82936D80", "sub_82A8C528"}
+KNOWN_TEXT_ORDER = {"sub_82936C80", "sub_82936D80", "sub_82A8C528",  # standard
+                    "sub_82936AB0", "sub_82936BB0", "sub_82A8C358"}  # the same functions in Collector's
 
 FN = re.compile(r"^DEFINE_REX_FUNC\((\w+)\)")
 INSN = re.compile(r"^\s*// ([a-z][a-z0-9.+-]*)\s*(.*)$")

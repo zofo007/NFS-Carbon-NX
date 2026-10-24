@@ -12,7 +12,8 @@ class FrameHandoffTests(unittest.TestCase):
         hook = (CARBON / "src/frame_handoff_hook.cpp").read_text(encoding="utf-8")
         self.assertIn("kMainWaitReturn = 0x824E977C", hook)
         self.assertIn("kRenderWaitReturn = 0x824E99E4", hook)
-        self.assertIn("__imp__sub_82943548(ctx, base);", hook)  # every other Sleep keeps the original
+        self.assertIn("#define HANDOFF_SLEEP_IMPL __imp__sub_82943548", hook)
+        self.assertIn("HANDOFF_SLEEP_IMPL(ctx, base);", hook)  # every other Sleep keeps the original
         self.assertIn('REXCVAR_DEFINE_INT32(carbon_handoff_priority, 0x3A,', hook)  # MW relay priority by default
         self.assertIn("src/frame_handoff_hook.cpp", (CARBON / "CMakeLists.txt").read_text(encoding="utf-8"))
         generated = CARBON / "generated/default"

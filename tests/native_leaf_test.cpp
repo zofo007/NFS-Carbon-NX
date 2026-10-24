@@ -2,7 +2,8 @@
 // copy scripts/localize_leaf.py makes for the build: 826D1678 (VMX gain ramp, 256 samples) and 826CD8D0
 // (VMX gain-sum out += in * gain, scalar tail when unaligned). Both sides come from the current
 // generated code; nothing generated is committed.
-#include "../carbon-source/generated/default/nfscarbon_pch.h"
+#include "edition.h"
+#include CARBON_GUEST_PCH
 #include "native_leaf.h"
 #include "audio_unpack_fast.h"
 #include "audio_gain_fast.h"
@@ -32,11 +33,17 @@ using Function = void (*)(PPCContext&, uint8_t*);
 [[gnu::noinline]] void OriginalCD528(PPCContext& ctx, uint8_t* base) { Reference826CD528(ctx, base); }
 [[gnu::noinline]] void CandidateCD528(PPCContext& ctx, uint8_t* base) { carbon::leaf::LeafCD528(ctx, base); }
 [[gnu::noinline]] void OriginalB56A8(PPCContext& ctx, uint8_t* base) { Reference826B56A8(ctx, base); }
-[[gnu::noinline]] void CandidateB56A8(PPCContext& ctx, uint8_t* base) { carbon::leaf::LeafB56A8(ctx, base); }
+// Collector's unpack saves r14-r31 through guest millicode; it has no register-local copy and falls back to the original.
+#if defined(NFSCARBON_COLLECTORS) && !defined(NFSCARBON_COLLECTORS_RL)
+#define LEAF_B56A8(ctx, base) Reference826B56A8(ctx, base)
+#else
+#define LEAF_B56A8(ctx, base) carbon::leaf::LeafB56A8(ctx, base)
+#endif
+[[gnu::noinline]] void CandidateB56A8(PPCContext& ctx, uint8_t* base) { LEAF_B56A8(ctx, base); }
 // The fast unpack must leave memory, host FP state and everything the PPC ABI keeps (non-volatile registers,
 // lr, ctr, fpscr, r1) as the original does; the volatile registers r0, r3-r12, f0-f13, v0-v13 are scratch there.
 [[gnu::noinline]] void FastB56A8(PPCContext& ctx, uint8_t* base) {
-  if (!carbon::audio::TryUnpackB56A8(ctx, base)) carbon::leaf::LeafB56A8(ctx, base);
+  if (!carbon::audio::TryUnpackB56A8(ctx, base)) LEAF_B56A8(ctx, base);
 }
 [[gnu::noinline]] void FastCD528(PPCContext& ctx, uint8_t* base) {
   if (!carbon::audio::TryGain(ctx, base, false)) carbon::leaf::LeafCD528(ctx, base);
@@ -62,6 +69,46 @@ unsigned cases = 0;
 uint8_t* g_base_x = nullptr;
 uint8_t* g_base_y = nullptr;
 
+#if defined(NFSCARBON_COLLECTORS)
+// As in audio_filter_cca20_test.cpp: GCC may pick a different (equally valid) operand form for the same FMA
+// in the context-based original and the register-local copy. With a NaN operand that only changes which NaN
+// propagates (sign, payload): so two NaN results are the same result; every other word must be bit-exact.
+unsigned nan_vs_nan = 0;
+bool SameWord(uint32_t u, uint32_t v) {
+  if (u == v) return true;
+  const auto is_nan = [](uint32_t w) { return (w & 0x7F800000u) == 0x7F800000u && (w & 0x007FFFFFu) != 0; };
+  if (is_nan(u) && is_nan(v)) {
+    ++nan_vs_nan;
+    return true;
+  }
+  return false;
+}bool SameMemory(const uint8_t* x, const uint8_t* y, uint32_t bytes) {
+  for (uint32_t i = 0; i < bytes; i += 4) {
+    uint32_t u, v;
+    std::memcpy(&u, x + i, 4);
+    std::memcpy(&v, y + i, 4);
+    if (!SameWord(__builtin_bswap32(u), __builtin_bswap32(v))) return false;
+  }
+  return true;
+}
+// Context: the same rule over every 32-bit word of the context (registers hold floats, doubles and vectors).
+bool SameContext(const PPCContext& a, const PPCContext& b) {
+  static_assert(sizeof(PPCContext) % 4 == 0);
+  const auto* u = reinterpret_cast<const uint8_t*>(&a);
+  const auto* v = reinterpret_cast<const uint8_t*>(&b);
+  for (size_t i = 0; i < sizeof(PPCContext); i += 4) {
+    uint32_t x, y;
+    std::memcpy(&x, u + i, 4);
+    std::memcpy(&y, v + i, 4);
+    if (x != y && !SameWord(x, y) && !SameWord(__builtin_bswap32(x), __builtin_bswap32(y))) return false;
+  }
+  return true;
+}
+#else
+bool SameMemory(const uint8_t* x, const uint8_t* y, uint32_t bytes) { return std::memcmp(x, y, bytes) == 0; }
+bool SameContext(const PPCContext& a, const PPCContext& b) { return std::memcmp(&a, &b, sizeof(a)) == 0; }
+#endif
+
 void Compare(Function original, Function candidate, PPCContext& a, PPCContext& b, Memory& x, Memory& y) {
   std::memcpy(y.base, x.base, kBytes);
   std::memcpy(y.base + kConstants, x.base + kConstants, kConstantBytes);
@@ -71,10 +118,17 @@ void Compare(Function original, Function candidate, PPCContext& a, PPCContext& b
   const auto original_fp = HostFp();
   SetFp(before);
   candidate(b, y.base);
-  if (std::memcmp(&a, &b, sizeof(a)) || original_fp != HostFp() || std::memcmp(x.base, y.base, kBytes) ||
-      std::memcmp(x.base + kConstants, y.base + kConstants, kConstantBytes)) {
+  if (!SameContext(a, b) || original_fp != HostFp() || !SameMemory(x.base, y.base, kBytes) ||
+      !SameMemory(x.base + kConstants, y.base + kConstants, kConstantBytes)) {
     std::printf("FAIL case %u: context=%d fp=%08x/%08x memory=%d\n", cases, std::memcmp(&a, &b, sizeof(a)),
                 original_fp, HostFp(), std::memcmp(x.base, y.base, kBytes));
+    for (uint32_t i = 0; i < kBytes; ++i) {
+      if (x.base[i] != y.base[i]) {
+        { uint32_t w = i & ~3u, u, v; std::memcpy(&u, x.base + w, 4); std::memcpy(&v, y.base + w, 4);
+          std::printf("first differing guest byte 0x%X (%02x vs %02x); word 0x%X: %08x vs %08x\n", i, x.base[i], y.base[i], w, __builtin_bswap32(u), __builtin_bswap32(v)); }
+        break;
+      }
+    }
     std::exit(1);
   }
   ++cases;
@@ -94,6 +148,12 @@ void ClearVolatile(PPCContext& c) {
   std::memset(&c.v6, 0, sizeof(c.v6)); std::memset(&c.v7, 0, sizeof(c.v7)); std::memset(&c.v8, 0, sizeof(c.v8));
   std::memset(&c.v9, 0, sizeof(c.v9)); std::memset(&c.v10, 0, sizeof(c.v10)); std::memset(&c.v11, 0, sizeof(c.v11));
   std::memset(&c.v12, 0, sizeof(c.v12)); std::memset(&c.v13, 0, sizeof(c.v13));
+#if defined(NFSCARBON_COLLECTORS) && !defined(NFSCARBON_COLLECTORS_RL)
+  // Collector's originals use v20-v31 as scratch without restoring them (the standard build keeps them in codegen
+  // locals, so its context never sees that); the fast paths leave them untouched, which a caller of the original
+  // must already tolerate.
+  std::memset(&c.v20, 0, sizeof(c.v20)); std::memset(&c.v21, 0, sizeof(c.v21)); std::memset(&c.v22, 0, sizeof(c.v22)); std::memset(&c.v23, 0, sizeof(c.v23)); std::memset(&c.v24, 0, sizeof(c.v24)); std::memset(&c.v25, 0, sizeof(c.v25)); std::memset(&c.v26, 0, sizeof(c.v26)); std::memset(&c.v27, 0, sizeof(c.v27)); std::memset(&c.v28, 0, sizeof(c.v28)); std::memset(&c.v29, 0, sizeof(c.v29)); std::memset(&c.v30, 0, sizeof(c.v30)); std::memset(&c.v31, 0, sizeof(c.v31));
+#endif
 }
 
 
@@ -308,6 +368,9 @@ int main() {
     GainCases(OriginalCD8D0, FastCD8D0, rng, x, y, true);
   }
   std::printf("PASS 826CD528/826CD8D0 NEON path %u cases: memory, host FP state, non-volatile registers\n", cases - before);
+#if defined(NFSCARBON_COLLECTORS)
+  std::printf("NaN words that differ in sign/payload only (operand selection): %u\n", nan_vs_nan);
+#endif
   const double r0 = Time(Original1678, x, 0), r1 = Time(Candidate1678, y, 0);
   const double s0 = Time(OriginalCD8D0, x, 256), s1 = Time(CandidateCD8D0, y, 256);
   std::printf("Host-only 40,000 calls: 826D1678 %.3f -> %.3f ms (%.3fx), 826CD8D0 %.3f -> %.3f ms (%.3fx); "

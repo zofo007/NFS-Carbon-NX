@@ -1,5 +1,5 @@
 diff --git a/sdk/CMakeLists.txt b/sdk/CMakeLists.txt
-index c460dd3..8d9eb80 100644
+index c460dd3..17ae473 100644
 --- a/sdk/CMakeLists.txt
 +++ b/sdk/CMakeLists.txt
 @@ -153,6 +153,10 @@ add_compile_options(
@@ -13,6 +13,20 @@ index c460dd3..8d9eb80 100644
  if(APPLE AND CMAKE_OSX_ARCHITECTURES)
      list(LENGTH CMAKE_OSX_ARCHITECTURES REX_OSX_ARCH_COUNT)
      if(REX_OSX_ARCH_COUNT GREATER 1)
+@@ -241,9 +245,10 @@ configure_file(
+ )
+ 
+ # Output directories (multi-config appends /<Config>/ automatically)
+-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
++set(REXGLUE_OUTPUT_DIR "${REXGLUE_ROOT}/out/${REX_PLATFORM}" CACHE PATH "SDK binary output directory")
++set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
++set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
++set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
+ 
+ # Sanitizer support for debugging memory corruption and undefined behavior
+ if(REXGLUE_ENABLE_SANITIZERS)
 diff --git a/sdk/include/rex/audio/audio_system.h b/sdk/include/rex/audio/audio_system.h
 index 28e92e7..e9625c7 100644
 --- a/sdk/include/rex/audio/audio_system.h
@@ -580,10 +594,49 @@ index eefee0e..7e7433c 100644
      REXAPU_ERROR("AudioSystem::Restore - Invalid magic value!");
      return false;
 diff --git a/sdk/src/audio/switch/switch_audio_system.cpp b/sdk/src/audio/switch/switch_audio_system.cpp
-index 6a9dc8d..8546f48 100644
+index 6a9dc8d..6211c39 100644
 --- a/sdk/src/audio/switch/switch_audio_system.cpp
 +++ b/sdk/src/audio/switch/switch_audio_system.cpp
-@@ -373,9 +373,11 @@ void SwitchAudioSystem::OutputThreadMain() {
+@@ -39,6 +39,13 @@ REXCVAR_DEFINE_INT32(audio_switch_tramas_en_cola, 10, "Audio",
+                      "salida, a cambio de latencia: nfsmw_audio_esperar_servidor_ms espera hasta 30 ms; se lee "
+                      "al abrir el audio");
+ 
++REXCVAR_DEFINE_INT32(audio_switch_recuperar, 1, "Audio",
++                     "Con audio_switch_bomba: tramas extra que se piden por tick (ademas de la de cada 5,333 ms) "
++                     "mientras la cola tiene menos de audio_switch_tramas_en_cola - 2. Sin esto la cola nunca se "
++                     "rellena tras un hueco (se pide exactamente lo que se consume) y cada pico del mezclador de "
++                     "mas de unos ms es un corte. 0 = como antes; 1-3 = rellena a 2-4 veces el ritmo normal")
++    .range(0, 3);
++
+ namespace rex::audio::nx {
+ 
+ namespace {
+@@ -350,11 +357,24 @@ void SwitchAudioSystem::FillAndAppend(size_t buffer_index) {
+ 
+ void SwitchAudioSystem::PumpTick() {
+   std::lock_guard<std::mutex> guard(drivers_mutex_);
++  // Queue depth seen by each tick goes to the passive counters (42 sum, 43 ticks, 44 ticks with none,
++  // 45 deepest shortfall below 64): this thread never logs, so rex_perfil.log reports them.
+   for (SwitchAudioDriver* driver : drivers_) {
+     const size_t queued = driver->QueuedFrames();
++    RexSwitchPerfAdd(42, queued);
++    RexSwitchPerfAdd(43, 1);
++    RexSwitchPerfAdd(44, queued == 0 ? 1 : 0);
++    RexSwitchPerfMax(45, queued < 64 ? 64 - queued : 0);
+     if (queued <= output_->tramas_en_cola) {
+       driver->RequestFrame();
+     }
++    // The pump asks for exactly the one frame audout consumes per tick, so a queue that emptied (a mixer
++    // spike) stays empty and the next spike is silence. Below the cushion, ask for extra frames until it is back.
++    if (queued + 2 < output_->tramas_en_cola) {
++      for (int32_t extra = 0; extra < REXCVAR_GET(audio_switch_recuperar); ++extra) {
++        driver->RequestFrame();
++      }
++    }
+     if (queued < kMinQueuedFrames) {
+       driver->RequestFrame();  // the queue has emptied: one more to catch up
+     }
+@@ -373,9 +393,11 @@ void SwitchAudioSystem::OutputThreadMain() {
      if (output.pump) {
        const u64 now = armGetSystemTick();
        if (now >= deadline) {
@@ -1381,32 +1434,38 @@ index ccf5e2a..ee36923 100644
      const bool ahora = modificador && (held & kAtajos[i].boton) != 0;
      const bool antes = (slot.menu_shortcuts & bit) != 0;
 diff --git a/sdk/src/kernel/xam/xam_content.cpp b/sdk/src/kernel/xam/xam_content.cpp
-index 78734b4..4244d14 100644
+index 78734b4..454f1ad 100644
 --- a/sdk/src/kernel/xam/xam_content.cpp
 +++ b/sdk/src/kernel/xam/xam_content.cpp
-@@ -58,6 +58,11 @@ u32 XamContentResolve_entry(u32 user_index, mapped_void content_data_ptr, mapped
+@@ -58,6 +58,13 @@ u32 XamContentResolve_entry(u32 user_index, mapped_void content_data_ptr, mapped
  
  // https://github.com/MrColdbird/gameservice/blob/master/ContentManager.cpp
  // https://github.com/LestaD/SourceEngine2007/blob/master/se2007/engine/xboxsystem.cpp#L499
 +// Carbon with 36 extracted DLC folders crashed in profile loading (call to a garbage guest address right after the
-+// last pack was opened); 9 packs worked. A fixed table in the game is the suspect. 0 = no limit.
-+REXCVAR_DEFINE_INT32(content_max_marketplace_items, 0, "Kernel",
-+                     "Maximum marketplace (type 2) items listed to the game, 0 = all. Test setting for big DLC sets");
++// last pack was opened); 9 packs worked. A fixed table in the game is the suspect. Hardware 2026-10-24: 30 packs ran a
++// long session, 52 crashed the same way after the last token was read. 0 = no limit.
++REXCVAR_DEFINE_INT32(content_max_marketplace_items, 30, "Kernel",
++                     "Maximum marketplace (type 2) items listed to the game, 0 = all. 30 packs are verified on "
++                     "hardware, 36 and 52 crashed while the profile loaded");
 +
  u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_type,
                                       u32 content_flags, u32 items_per_enumerate,
                                       mapped_u32 buffer_size_ptr, mapped_u32 handle_out) {
-@@ -87,7 +92,9 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
+@@ -87,7 +94,13 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
      // Enumerate user-specific content
      auto content_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
          static_cast<uint32_t>(DummyDeviceId::HDD), xuid, XContentType(uint32_t(content_type)));
 +    const int32_t item_limit = content_type == 2 ? REXCVAR_GET(content_max_marketplace_items) : 0;
      for (const auto& content_data : content_datas) {
-+      if (item_limit > 0 && int32_t(e->item_count()) >= item_limit) break;
++      if (item_limit > 0 && int32_t(e->item_count()) >= item_limit) {
++        REXKRNL_WARN("[dlc] {} packs are installed but only {} are listed to the game (content_max_marketplace_items): "
++                     "more than that crashed the profile load on hardware", content_datas.size(), item_limit);
++        break;
++      }
        auto item = e->AppendItem();
        *item = content_data;
      }
-@@ -97,6 +104,7 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
+@@ -97,6 +110,7 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
        auto common_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
            static_cast<uint32_t>(DummyDeviceId::HDD), 0, XContentType(uint32_t(content_type)));
        for (const auto& content_data : common_datas) {
@@ -1739,10 +1798,20 @@ index 697399c..33ee983 100644
    auto global_lock = global_critical_region_.Acquire();
    XThread* thread = nullptr;
 diff --git a/sdk/src/system/xam/content_manager.cpp b/sdk/src/system/xam/content_manager.cpp
-index 78826a6..72b842b 100644
+index 78826a6..e715bb3 100644
 --- a/sdk/src/system/xam/content_manager.cpp
 +++ b/sdk/src/system/xam/content_manager.cpp
-@@ -18,6 +18,7 @@
+@@ -10,14 +10,17 @@
+  */
+ 
+ #include <array>
++#include <cerrno>
+ #include <cstring>
+ #include <queue>
+ #include <string>
+ 
++#include <unistd.h>
+ #include <fmt/format.h>
  
  #include <rex/cvar.h>
  #include <rex/filesystem.h>
@@ -1750,10 +1819,49 @@ index 78826a6..72b842b 100644
  #include <rex/filesystem/devices/host_path_device.h>
  #include <rex/filesystem/devices/stfs_container_device.h>
  #include <rex/logging.h>
-@@ -294,9 +295,22 @@ std::filesystem::path ContentManager::ResolvePackageHeaderPath(const std::string
+@@ -294,9 +297,61 @@ std::filesystem::path ContentManager::ResolvePackageHeaderPath(const std::string
           final_name;
  }
  
++// std::filesystem::remove_all fails on the Switch SD card for the install work folders (hardware 2026-10-24: every
++// launch left .dlc-install/<pack> behind, "DLC work folder could not be removed ... (error)", and the next install of that
++// pack then failed with ACCESS_DENIED). Fall back to deleting entry by entry with remove/unlink/rmdir and remember what
++// could not be removed.
++static std::string g_remove_failure;
++
++static void RemoveTreeManual(const std::filesystem::path& dir) {
++  for (const auto& f : rex::filesystem::ListFiles(dir)) {
++    const auto child = dir / f.name;
++    if (f.type == rex::filesystem::FileInfo::Type::kDirectory) {
++      RemoveTreeManual(child);
++      continue;
++    }
++    std::error_code ec;
++    if (!std::filesystem::remove(child, ec) || ec) {
++      const auto native = child.string();
++      if (::unlink(native.c_str()) != 0) g_remove_failure = fmt::format("{}: errno {}", native, errno);
++    }
++  }
++  std::error_code ec;
++  if (!std::filesystem::remove(dir, ec) || ec) {
++    const auto native = dir.string();
++    if (::rmdir(native.c_str()) != 0) g_remove_failure = fmt::format("{}: errno {}", native, errno);
++  }
++}
++
++static bool RemoveTree(const std::filesystem::path& path, std::error_code& ec) {
++  ec.clear();
++  g_remove_failure.clear();
++  std::filesystem::remove_all(path, ec);
++  if (!ec) return true;
++  ec.clear();
++  RemoveTreeManual(path);
++  std::error_code exists_ec;
++  if (!std::filesystem::exists(path, exists_ec)) return true;
++  ec = std::make_error_code(std::errc::directory_not_empty);
++  return false;
++}
++
 +static bool RecoverContentInstall(const std::filesystem::path& work,
 +                                   const std::filesystem::path& install,
 +                                   const std::filesystem::path& header);
@@ -1773,7 +1881,7 @@ index 78826a6..72b842b 100644
    std::vector<XCONTENT_AGGREGATE_DATA> result;
  
    if (title_id == kCurrentlyRunningTitleId) {
-@@ -306,6 +320,26 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
+@@ -306,6 +361,26 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
    // Search path:
    // content_root/xuid/title_id/type_name/*
    auto package_root = ResolvePackageRoot(xuid, content_type, title_id);
@@ -1788,10 +1896,10 @@ index 78826a6..72b842b 100644
 +      while (!ec && it != end) {
 +        const auto work = it->path();
 +        it.increment(ec);  // Recovery removes this directory.
-+        if (ec || !RecoverContentInstall(work, package_root / work.filename(),
++        if (ec) return {};
++        if (!RecoverContentInstall(work, package_root / work.filename(),
 +            ResolvePackageHeaderPath(rex::path_to_utf8(work.filename()), xuid, title_id, content_type))) {
-+          REXSYS_ERROR("DLC recovery failed in {}", rex::path_to_utf8(work));
-+          return {};
++          REXSYS_ERROR("DLC recovery failed in {} (skipped, the other packs are listed)", rex::path_to_utf8(work));
 +        }
 +      }
 +      if (ec) return {};
@@ -1800,7 +1908,7 @@ index 78826a6..72b842b 100644
    auto file_infos = rex::filesystem::ListFiles(package_root);
    for (const auto& file_info : file_infos) {
      if (file_info.type != rex::filesystem::FileInfo::Type::kDirectory) {
-@@ -352,12 +386,39 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
+@@ -352,12 +427,39 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
  }
  
  bool ContentManager::ContentExists(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
@@ -1840,7 +1948,7 @@ index 78826a6..72b842b 100644
    if (data.title_id == uint32_t(-1)) {
      data.title_id = kernel_state_->title_id();
    }
-@@ -368,28 +429,18 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
+@@ -368,28 +470,18 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
  
    auto header_path =
        ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
@@ -1879,7 +1987,7 @@ index 78826a6..72b842b 100644
  }
  
  X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name, uint64_t xuid,
-@@ -427,6 +478,11 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
+@@ -427,6 +519,11 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
  
  X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_t xuid,
                                         const XCONTENT_AGGREGATE_DATA& data) {
@@ -1891,7 +1999,7 @@ index 78826a6..72b842b 100644
    {
      auto global_lock = global_critical_region_.Acquire();
      if (open_packages_.count(string::string_key_case(root_name))) {
-@@ -462,6 +518,7 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
+@@ -462,6 +559,7 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
  X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t xuid,
                                       const XCONTENT_AGGREGATE_DATA& data,
                                       uint32_t& content_license) {
@@ -1899,7 +2007,7 @@ index 78826a6..72b842b 100644
    {
      auto global_lock = global_critical_region_.Acquire();
      if (open_packages_.count(string::string_key_case(root_name))) {
-@@ -470,6 +527,10 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t
+@@ -470,6 +568,10 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t
    }
  
    auto package_path = ResolvePackagePath(xuid, data);
@@ -1910,7 +2018,7 @@ index 78826a6..72b842b 100644
    if (!std::filesystem::exists(package_path)) {
      REXSYS_WARN("[guardado] abrir «{}»: no existe {}", data.file_name(),
                  rex::path_to_utf8(package_path));
-@@ -709,7 +770,16 @@ void ContentManager::CloseOpenedFilesFromContent(const std::string_view root_nam
+@@ -709,7 +811,16 @@ void ContentManager::CloseOpenedFilesFromContent(const std::string_view root_nam
  
  static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
                               const std::filesystem::path& base_path) {
@@ -1928,7 +2036,7 @@ index 78826a6..72b842b 100644
  
    if (entry->attributes() & rex::filesystem::kFileAttributeDirectory) {
      std::error_code ec;
-@@ -723,6 +793,7 @@ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
+@@ -723,6 +834,7 @@ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
    // Ensure parent directory exists
    std::error_code ec;
    std::filesystem::create_directories(dest_path.parent_path(), ec);
@@ -1936,7 +2044,7 @@ index 78826a6..72b842b 100644
  
    rex::filesystem::File* in_file = nullptr;
    X_STATUS status = entry->Open(rex::filesystem::FileAccess::kFileReadData, &in_file);
-@@ -741,62 +812,168 @@ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
+@@ -741,62 +853,178 @@ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
    size_t remaining = entry->size();
    size_t offset = 0;
  
@@ -1991,7 +2099,7 @@ index 78826a6..72b842b 100644
 +      const bool backup = std::filesystem::exists(backups[i], ec);
 +      if (ec) return false;
 +      if (backup || state[4 + i] == '0') {
-+        std::filesystem::remove_all(targets[i], ec);
++        RemoveTree(targets[i], ec);
 +        if (ec) return false;
 +        if (backup) {
 +          std::filesystem::rename(backups[i], targets[i], ec);
@@ -1999,13 +2107,23 @@ index 78826a6..72b842b 100644
 +        }
 +      } else {
 +        const bool original = std::filesystem::exists(targets[i], ec);
-+        if (ec || !original) return false;
++        if (ec) return false;
++        // The journal says the installed copy existed, but it is gone and there is no backup of it: it was deleted
++        // by hand (the README cleanup). Nothing is left to restore, and failing here would block every install and
++        // hide all marketplace content for good, so drop this entry and clear the work directory.
++        if (!original) continue;
 +      }
 +    }
    }
 +  // No journal means publication never started, or both final renames committed.
-+  std::filesystem::remove_all(work, ec);
-+  return !ec;
++  RemoveTree(work, ec);
++  if (ec) {
++    // Whatever was to be restored has been; the leftover is only garbage. Failing here used to block every
++    // install and hide all marketplace content.
++    REXSYS_ERROR("DLC work folder could not be removed: {} ({}; {})", rex::path_to_utf8(work), ec.message(),
++                 g_remove_failure);
++  }
++  return true;
 +}
  
 -  // Mount the STFS package as a virtual filesystem device
@@ -2037,8 +2155,8 @@ index 78826a6..72b842b 100644
 +  // destinations cannot be atomically renamed together, including on Horizon.
 +  if (!WriteContentFile(work / "journal.tmp", state)) {
 +    RecoverContentInstall(work, install, header);
-     return X_ERROR_ACCESS_DENIED;
-   }
++    return X_ERROR_ACCESS_DENIED;
++  }
 +  std::filesystem::rename(work / "journal.tmp", work / "journal", ec);
 +  if (ec) {
 +    RecoverContentInstall(work, install, header);
@@ -2048,7 +2166,7 @@ index 78826a6..72b842b 100644
 +    if (!RecoverContentInstall(work, install, header)) {
 +      REXSYS_ERROR("DLC rollback pending in {}", rex::path_to_utf8(work));
 +    }
-+    return X_ERROR_ACCESS_DENIED;
+     return X_ERROR_ACCESS_DENIED;
 +  };
 +  for (size_t i = 0; i < targets.size(); ++i) {
 +    if (state[4 + i] == '1') {
@@ -2064,7 +2182,7 @@ index 78826a6..72b842b 100644
 +  if (ec) return rollback();
 +  const bool committed = std::filesystem::remove(work / "journal", ec);
 +  if (ec || !committed) return rollback();
-+  std::filesystem::remove_all(work, ec);  // A stale committed backup is safe to clean next time.
++  RemoveTree(work, ec);  // A stale committed backup is safe to clean next time.
 +  return X_ERROR_SUCCESS;
 +}
 +
@@ -2073,7 +2191,7 @@ index 78826a6..72b842b 100644
 +  std::error_code ec;
 +  if (!std::filesystem::is_regular_file(package_path, ec) || ec) {
 +    return X_ERROR_FILE_NOT_FOUND;
-+  }
+   }
  
    // Derive install destination:
    // root_path_/0000000000000000/{title_id}/00000002/{filename}/
@@ -2130,7 +2248,7 @@ index 78826a6..72b842b 100644
    // Extract all files breadth-first
    auto* root = device->ResolvePath("");
    if (!root) {
-@@ -814,8 +991,9 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
+@@ -814,8 +1042,9 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
        queue.push(child.get());
      }
  
@@ -2141,7 +2259,7 @@ index 78826a6..72b842b 100644
        return result;
      }
    }
-@@ -828,8 +1006,12 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
+@@ -828,8 +1057,12 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
      }
    }
  
@@ -2666,7 +2784,7 @@ index 0000000..6e2ade8
 +
 +}  // namespace rex::ui::switch_profile
 diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
-index 6b3d30a..6da63aa 100644
+index 6b3d30a..d465b67 100644
 --- a/sdk/src/ui/switch_perf.cpp
 +++ b/sdk/src/ui/switch_perf.cpp
 @@ -49,9 +49,12 @@
@@ -2711,7 +2829,7 @@ index 6b3d30a..6da63aa 100644
  constexpr size_t kMaxSamples = 1 << 15;
  constexpr size_t kFrames = 10;
 -constexpr unsigned kCounterCount = 33;
-+constexpr unsigned kCounterCount = 42;
++constexpr unsigned kCounterCount = 48;
  // In <NRO folder>/logs/rex/ (switch_crash_hooks.c computes it at startup).
  std::string ReportPath() {
    return std::string(RexSwitchLogDir()) + "rex_perfil.log";
@@ -2749,7 +2867,7 @@ index 6b3d30a..6da63aa 100644
    // Work the game sends to the GPU, per presented frame. One screen is
    // 1280x720 = 921,600 pixels.
    const auto delta = [&](unsigned id) { return double(counters_now[id] - counters_last[id]); };
-@@ -421,6 +445,32 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+@@ -421,6 +445,36 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
                 rex::ui::switch_saltynx::ModoBase(appletGetOperationMode() == AppletOperationMode_Console)
                     ? "sobremesa"
                     : "portatil");
@@ -2759,6 +2877,10 @@ index 6b3d30a..6da63aa 100644
 +               "     audio timing: pump deadline resets %.0f, max lateness %.3f ms | "
 +               "worker blocks >5.333 ms %.0f, max worker block %.3f ms\n",
 +               delta(33), double(pump_late_us) / 1000.0, delta(35), double(worker_block_us) / 1000.0);
++  const u64 queue_short = g_counters[45].exchange(0, std::memory_order_relaxed);
++  std::fprintf(f, "     audio queue (frames waiting for audout): average %.1f, minimum %.0f, ticks with none %.0f of %.0f\n",
++               delta(43) > 0 ? delta(42) / delta(43) : 0.0, delta(43) > 0 ? 64.0 - double(queue_short) : 0.0, delta(44),
++               delta(43));
 +  static constexpr const char* xma_stage_names[] = {
 +      "enable", "disable", "work.lock", "work.body(inclusive)", "codec", "convert"};
 +  static_assert(std::size(xma_stage_names) == rex::audio::kXmaProfileStageCount);
@@ -2782,7 +2904,7 @@ index 6b3d30a..6da63aa 100644
    // Reverse-NX state as is, without interpretation. A whole test session was wasted because its
    // overlay said "Docked" while "Controlled by system" was Yes, and in that case its mode does not
    // rule: it only mirrors the console's. This shows at a glance which of the two is happening.
-@@ -808,6 +858,13 @@ void ProfilerMain(void*) {
+@@ -808,6 +862,13 @@ void ProfilerMain(void*) {
      sample_stacks = true;
      std::fclose(flag);
    }
@@ -2796,7 +2918,7 @@ index 6b3d30a..6da63aa 100644
  
    u64 counters_last[kCounterCount]{};
    for (unsigned i = 0; i < kCounterCount; ++i) {
-@@ -816,7 +873,10 @@ void ProfilerMain(void*) {
+@@ -816,7 +877,10 @@ void ProfilerMain(void*) {
    if (FILE* f = std::fopen(ReportPath().c_str(), "w")) {
      std::fprintf(f, "imagen 0x%016" PRIx64 ", codigo hasta 0x%016" PRIx64 "\n\n", g_base,
                   g_text_hi);
@@ -2808,7 +2930,7 @@ index 6b3d30a..6da63aa 100644
      std::fclose(f);
    }
  
-@@ -830,24 +890,32 @@ void ProfilerMain(void*) {
+@@ -830,24 +894,32 @@ void ProfilerMain(void*) {
  
    size_t rr = 0;
    size_t mode_index = 0;
@@ -2843,7 +2965,7 @@ index 6b3d30a..6da63aa 100644
          out = {};
          out.pc = ctx.pc.x;
          out.lr = ctx.lr;
-@@ -870,7 +938,12 @@ void ProfilerMain(void*) {
+@@ -870,7 +942,12 @@ void ProfilerMain(void*) {
            }
          }
        }
@@ -2857,7 +2979,7 @@ index 6b3d30a..6da63aa 100644
        break;
      }
  
-@@ -1065,7 +1138,8 @@ void RexSwitchPerfAdd(unsigned id, u64 value) {
+@@ -1065,7 +1142,8 @@ void RexSwitchPerfAdd(unsigned id, u64 value) {
    }
  }
  
@@ -2867,7 +2989,7 @@ index 6b3d30a..6da63aa 100644
  void RexSwitchPerfMax(unsigned id, u64 value) {
    if (id >= kCounterCount) {
      return;
-@@ -1092,6 +1166,7 @@ void RexSwitchPerfSetThreadName(u32 handle, const char* name) {
+@@ -1092,6 +1170,7 @@ void RexSwitchPerfSetThreadName(u32 handle, const char* name) {
        char tmp[sizeof(s.name)]{};
        std::strncpy(tmp, name, sizeof(tmp) - 1);
        std::memcpy(s.name, tmp, sizeof(tmp));

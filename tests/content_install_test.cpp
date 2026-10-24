@@ -185,6 +185,13 @@ class ContentManager {
   bool ContentExists(uint64_t, const XCONTENT_AGGREGATE_DATA&);
   X_RESULT CreateContent(std::string_view, uint64_t, const XCONTENT_AGGREGATE_DATA&);
 };
+// The production RemoveTree adds a Switch-only manual fallback around remove_all; the transaction logic under test only needs
+// the remove_all behaviour (and the failure text it logs).
+static std::string g_remove_failure;
+static bool RemoveTree(const std::filesystem::path& path, std::error_code& ec) {
+  std::filesystem::remove_all(path, ec);
+  return !ec;
+}
 #define fwrite CheckedWrite
 #define fflush CheckedFlush
 #define fclose CheckedClose
@@ -291,6 +298,12 @@ int main(int argc, char** argv) {
     std::filesystem::remove_all(scratch);
     return 0;
   }
+  if (name == "journal_orphan") {
+    // A journal says the installed copy existed, but it was deleted by hand: the install must still go through.
+    std::filesystem::remove_all(install);
+    std::filesystem::remove(header);
+    Write(install.parent_path().parent_path() / ".dlc-install/package/journal", "DLC111");
+  }
   const auto result = content.InstallContent(source);
   if (name == "rollback_retry" || name == "recovery_without_source") {
     CHECK(result != X_ERROR_SUCCESS && failed_renames >= 2);
@@ -312,7 +325,7 @@ int main(int argc, char** argv) {
     CHECK(content.InstallContent(source) != X_ERROR_SUCCESS);
     CHECK(opened >= 2);  // recovery allowed another extraction attempt
   }
-  if (name == "success" || name == "unrelated_mount") {
+  if (name == "success" || name == "unrelated_mount" || name == "journal_orphan") {
     CHECK(result == X_ERROR_SUCCESS);
     CHECK(Read(install / "nested/new.bin") == "COMPLETE NEW CONTENT");
     CHECK(!std::filesystem::exists(install / "old.bin"));

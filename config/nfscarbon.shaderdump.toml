@@ -1,0 +1,48 @@
+# nfscarbon.report.toml - NFS Carbon NX, FULL LOGGING for performance reports.
+# Copy over nfscarbon.toml for ONE session, play, then send the logs (see the README). Costs some FPS.
+# nfscarbon.toml - NFS Carbon NX
+# A missing line uses the default. Restart the game after editing. All options: docs/CONFIG.md
+gpu_plugin = "carbon"
+input_backend = "switch"
+input_xbox_layout = false
+mnk_mode = false
+mnk_mouse = false
+log_level = "info"
+carbon_gpu_vsync = true
+carbon_gpu_watchdog = true
+carbon_gpu_render_scale = 80
+# Scene drawn at 80% and upscaled with FSR (sharper than plain bilinear stretching, cheaper than 90% + bilinear).
+# present_effect = "bilinear" goes back to the plain stretch; "cas" only sharpens.
+present_effect = "fsr"
+carbon_gpu_max_anisotropy = 4
+
+# Audio: 32 frames (about 170 ms) queued before output.
+audio_switch_tramas_en_cola = 32
+carbon_handoff_priority = 58
+# Car cube-reflection pass: once every 30 frames instead of every frame (skipping it for good was a suspect for flashing).
+carbon_cube_interval = 30
+# Quality / speed (defaults shown commented):
+# Full logging: statistics and diagnostics on (they cost FPS at the race start).
+carbon_gpu_stats = true
+carbon_audio_mixer_diag = true
+audio_xma_profile = true
+
+# carbon_gpu_texture_lod_bias = 0.0
+# carbon_gpu_mip_nearest = false
+# carbon_gpu_bloom = true
+# carbon_gpu_stats = true      # false = no FPS lines in the log, slightly less CPU per draw
+
+# Host stack per guest thread in MiB (default 8; was 16 before 0.1.0-beta.6). A smaller value leaves more process memory
+# free for new threads (cutscenes froze when none was left). 16 = old behaviour.
+# thread_host_stack_mib = 8
+
+# Texture memory (MiB) above which the least recently used textures are freed. Default 704 on the Switch.
+# carbon_gpu_texture_budget_mb = 704
+
+# Controller rumble (vibration) is on. Each rumble update is an IPC call to the Switch; false turns it off.
+input_vibracion = true
+# Other racers and traffic 2 model steps lower; bloom on (it looks much better; off saves about 4 ms of GPU per frame in a crowded race: carbon_gpu_bloom = false).
+# carbon_ai_car_lod_bias = 1   # 0 = off (default). 1+ = level 2 for other racers/traffic; little FPS effect measured
+carbon_gpu_bloom = true
+# Diagnostic for one run only: writes the game's pixel shaders as text (carbon_gpu/glsl/). Remove afterwards.
+carbon_gpu_dump_shaders = true

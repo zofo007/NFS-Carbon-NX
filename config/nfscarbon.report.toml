@@ -19,9 +19,8 @@ carbon_gpu_max_anisotropy = 4
 # Audio: 32 frames (about 170 ms) queued before output.
 audio_switch_tramas_en_cola = 32
 carbon_handoff_priority = 58
-# Skips the car cube-reflection pass (its faces are never sampled).
-carbon_debug_skip_passes = 4
-
+# Car cube-reflection pass: once every 30 frames instead of every frame (skipping it for good was a suspect for flashing).
+carbon_cube_interval = 30
 # Quality / speed (defaults shown commented):
 # Full logging: statistics and diagnostics on (they cost FPS at the race start).
 carbon_gpu_stats = true
@@ -42,3 +41,6 @@ audio_xma_profile = true
 
 # Controller rumble (vibration) is on. Each rumble update is an IPC call to the Switch; false turns it off.
 input_vibracion = true
+# Other racers and traffic 2 model steps lower; bloom on (it looks much better; off saves about 4 ms of GPU per frame in a crowded race: carbon_gpu_bloom = false).
+# carbon_ai_car_lod_bias = 1   # 0 = off (default). 1+ = level 2 for other racers/traffic; little FPS effect measured
+carbon_gpu_bloom = true

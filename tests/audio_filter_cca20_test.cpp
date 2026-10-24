@@ -1,4 +1,5 @@
-#include "../carbon-source/generated/default/nfscarbon_pch.h"
+#include "edition.h"
+#include CARBON_GUEST_PCH
 #include "audio_filter_cca20.h"
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN

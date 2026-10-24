@@ -1,0 +1,27 @@
+# nfscarbon.toml for ONE Collector's performance-report session: statistics on (cost some FPS). Copy over nfscarbon.toml.
+# Initial Collector's Edition boot test. Use a separate switch/nfscarbon-collectors folder.
+gpu_plugin = "carbon"
+input_backend = "switch"
+input_xbox_layout = false
+mnk_mode = false
+mnk_mouse = false
+log_level = "info"
+carbon_gpu_vsync = true
+carbon_gpu_watchdog = true
+carbon_gpu_render_scale = 80
+present_effect = "fsr"
+carbon_gpu_max_anisotropy = 4
+audio_switch_tramas_en_cola = 32
+carbon_gpu_stats = true
+audio_xma_profile = true
+input_vibracion = true
+# Render-pass trimming (restart needed). Value 4 skips the car cube-reflection pass (never sampled), as the standard config does.
+# Values: 2 EEC30, 4 EF700 (cube), 8 EFA40, 16 EF078, 32 EDFE0; 1 (the prep) breaks the picture. Add values to combine.
+# The log prints ms/frame per pass every 10 s ([render-pass]); use it to find the shadow pass, then test its bit.
+carbon_cube_interval = 30
+carbon_audio_mixer_diag = true
+# Other racers and traffic N model steps lower (0-3, 0 = game default); your car and menu cars are never touched. Log: [car-lod].
+# carbon_ai_car_lod_bias = 1   # 0 = off (default). 1+ = level 2 for other racers/traffic; little FPS effect measured
+carbon_gpu_bloom = true
+# Diagnostic for one run only: writes the game's pixel shaders as text (carbon_gpu/glsl/). Remove afterwards.
+carbon_gpu_dump_shaders = true
