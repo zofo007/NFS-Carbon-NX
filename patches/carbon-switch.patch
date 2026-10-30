@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 2f69162..ba25d62 100644
+index 2f69162..8f8d329 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -8,7 +8,31 @@ project(nfscarbon LANGUAGES CXX)
@@ -48,7 +48,7 @@ index 2f69162..ba25d62 100644
  
  if(WIN32)
      list(APPEND NFSCARBON_SOURCES src/crash_diag.cpp)
-@@ -76,6 +103,61 @@ option(NFSCARBON_BUILD_CARBON_GPU "Build the rexgpu-carbon native renderer plugi
+@@ -76,6 +103,81 @@ option(NFSCARBON_BUILD_CARBON_GPU "Build the rexgpu-carbon native renderer plugi
  if(NFSCARBON_BUILD_CARBON_GPU)
      add_subdirectory(renderer)
      add_dependencies(nfscarbon rexgpu-carbon)
@@ -103,6 +103,26 @@ index 2f69162..ba25d62 100644
 +    endif()
 +    rexglue_switch_add_nro(nfscarbon NAME "${NFSCARBON_DISPLAY_NAME}" AUTHOR "zofo007" VERSION "${NFSCARBON_VERSION}"
 +        ICON "${NFSCARBON_ICON}")
++    # Hot-function layout (opt-in, default OFF): the linker places the listed .text.<function> sections first, so the
++    # ~1.5 MB of code that holds 95% of the on-CPU time sits together instead of being spread over 46 MB.
++    # The list comes from scripts/hotspot_order.py (hotspot logs + nm of the matching ELF). Does not change behavior.
++    option(NFSCARBON_HOT_ORDER "Link with a hot-function section order (Switch)" OFF)
++    set(NFSCARBON_HOT_ORDER_FILE "" CACHE FILEPATH "Section ordering file for NFSCARBON_HOT_ORDER")
++    if(NFSCARBON_HOT_ORDER)
++        if(NOT EXISTS "${NFSCARBON_HOT_ORDER_FILE}")
++            message(FATAL_ERROR "NFSCARBON_HOT_ORDER needs NFSCARBON_HOT_ORDER_FILE (made by scripts/hotspot_order.py)")
++        endif()
++        target_link_options(nfscarbon PRIVATE "LINKER:--section-ordering-file,${NFSCARBON_HOT_ORDER_FILE}")
++        set_property(TARGET nfscarbon APPEND PROPERTY LINK_DEPENDS "${NFSCARBON_HOT_ORDER_FILE}")
++    endif()
++    # Plain (non-volatile) guest loads in the generated guest code (opt-in, default OFF). The generated files must first be
++    # transformed by scripts/fast_loads_apply.py (build-switch.ps1 -FastLoads does both); without that this define changes nothing.
++    # Hooks and native_leaf.h are in another target and keep volatile loads.
++    option(NFSCARBON_FAST_LOADS "Plain guest loads in generated guest code (Switch)" OFF)
++    if(NFSCARBON_FAST_LOADS AND TARGET nfscarbon_recomp)
++        target_compile_definitions(nfscarbon_recomp PRIVATE NFSCARBON_FAST_LOADS=1)
++        target_compile_definitions(nfscarbon PRIVATE NFSCARBON_FAST_LOADS_BUILD=1)
++    endif()
 +    if(NFSCARBON_ICON)
 +        # The NRO is packed after linking; relink so a new icon alone repackages it.
 +        set_property(TARGET nfscarbon APPEND PROPERTY LINK_DEPENDS "${NFSCARBON_ICON}")
@@ -2212,7 +2232,7 @@ index d413fc5..3639e9f 100644
      }
      EndRendering();
 diff --git a/renderer/src/renderer.cpp b/renderer/src/renderer.cpp
-index 22736d5..702d9bb 100644
+index 22736d5..09ee9ef 100644
 --- a/renderer/src/renderer.cpp
 +++ b/renderer/src/renderer.cpp
 @@ -3,6 +3,7 @@
@@ -3402,6 +3422,7 @@ index 22736d5..702d9bb 100644
  
    // The bloom blur chain is 6-8 full-screen passes of 8 scattered texture reads each;
    // on phone GPUs they cost more than the whole scene for a subtle glow.
+-  if (!bloom_enabled_ && ps) {
 +  // carbon_gpu_bloom = false: the half-resolution blur chain (8 passes in a race, pixel shader 56B15EE1 at pitch 640)
 +  // is drawn as black instead of blurred; its output is then defined and the compositor adds no glow. The same
 +  // shader at full resolution and the other three blur variants (seen only outside races: cutscenes, menus) keep
@@ -3429,7 +3450,7 @@ index 22736d5..702d9bb 100644
 +      ++slot->count;
 +    }
 +  }
-   if (!bloom_enabled_ && ps) {
++  if (!REXCVAR_GET(carbon_gpu_bloom) && ps) {  // read per draw: the in-game settings can switch it live
 +    const bool skip_all = REXCVAR_GET(carbon_gpu_bloom_skip);
      switch (ps->hash) {
 -      case 0xF84B05E744D442E8ull:
@@ -3955,7 +3976,7 @@ index 22736d5..702d9bb 100644
    frame_idle_s_ = frame_wait_s_ = frame_texture_s_ = frame_draw_s_ = 0;
    frame_textures_ = frame_pipeline_builds_ = 0;
    if (overlay_last_swap_ > 0.0) {
-@@ -2870,24 +3517,29 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2870,24 +3517,47 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
      overlay_worst_ms_ = 0.0;
    }
    if (now - stats_start_ >= 5.0) {
@@ -3980,10 +4001,29 @@ index 22736d5..702d9bb 100644
 +          stats_.chunk_vertex_draws / f, stats_.vertex_memo_hits / f, stats_.pipelines_created, stats_.shaders_compiled,
            stats_.textures_uploaded, texture_bytes_ >> 20, render_target_bytes_ >> 20,
 -          arena_used_ >> 20, stats_.evicted);
-+          arena_used_ >> 20, upload_chunks_.size(), (upload_chunks_.size() * chunk_size_) >> 20, stats_.evicted);
-     }
+-    }
 -    if (REXCVAR_GET(carbon_gpu_stats) && stats_.draws_skipped) {
-+    if (REXCVAR_GET(carbon_gpu_stats) && full && stats_.draws_skipped) {
++          arena_used_ >> 20, upload_chunks_.size(), (upload_chunks_.size() * chunk_size_) >> 20, stats_.evicted);
++    }
++    if (REXCVAR_GET(carbon_gpu_stats) && full && allocator_) {
++      // How much memory the GPU allocator holds from the driver (blocks) against what it actually hands out (allocations).
++      // Hardware: the process memory grew in steps of 256 MiB, which is the allocator's default block size.
++      VmaTotalStatistics vma{};
++      vmaCalculateStatistics(allocator_, &vma);
++      const VmaStatistics& t = vma.total.statistics;
++      REXGPU_INFO("[carbon-gpu] gpu allocator: {} blocks hold {} MiB, {} allocations use {} MiB (unused inside blocks {} MiB)",
++                  t.blockCount, t.blockBytes >> 20, t.allocationCount, t.allocationBytes >> 20,
++                  (t.blockBytes - t.allocationBytes) >> 20);
++      const VkPhysicalDeviceMemoryProperties* props = nullptr;
++      vmaGetMemoryProperties(allocator_, &props);
++      VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
++      vmaGetHeapBudgets(allocator_, budgets);
++      for (uint32_t h = 0; props && h < props->memoryHeapCount; ++h) {
++        REXGPU_INFO("[carbon-gpu] gpu heap {}: size {} MiB, driver budget {} MiB, in use {} MiB (blocks {} MiB)", h,
++                    props->memoryHeaps[h].size >> 20, budgets[h].budget >> 20, budgets[h].usage >> 20,
++                    budgets[h].statistics.blockBytes >> 20);
++      }
++    }    if (REXCVAR_GET(carbon_gpu_stats) && full && stats_.draws_skipped) {
        static const char* kNames[kSkipReasonCount] = {
            "no-vs", "edram-mode", "ps-failed", "memexport", "primitive", "no-pitch", "no-output",
 -          "modules", "cull-all", "pipeline", "scissor", "vertices", "no-indices"};
@@ -3991,7 +4031,7 @@ index 22736d5..702d9bb 100644
        std::string reasons;
        double frames = double(std::max<uint64_t>(stats_frames_, 1));
        for (uint32_t i = 0; i < kSkipReasonCount; ++i) {
-@@ -2905,22 +3557,128 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2905,22 +3575,128 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
            debug_mode_, (now - stats_start_) * 1000.0 / frames, stats_.worst_ms, stats_.slow25, stats_.slow34,
            stats_.slow50, stats_.draw_s * 1000.0 / frames, stats_.resolve_s * 1000.0 / frames,
            stats_.swap_s * 1000.0 / frames, stats_.fence_s * 1000.0 / frames);
@@ -4123,7 +4163,7 @@ index 22736d5..702d9bb 100644
          double g = double(stats_.gpu_frames);
          {
            auto pct = [](std::vector<float>& v, double p) {
-@@ -2943,7 +3701,7 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2943,7 +3719,7 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
              stats_.gpu_tag_s[kTagEnd] * 1000.0 / g, stats_.gpu_passes / g);
        }
      }
@@ -4132,7 +4172,7 @@ index 22736d5..702d9bb 100644
        double f = double(std::max<uint64_t>(stats_frames_, 1));
        REXGPU_INFO(
            "[carbon-gpu] resolves per frame: copied {:.1f}, skipped as redundant {:.1f} | pixels "
-@@ -2957,7 +3715,7 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2957,7 +3733,7 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
            stats_.resolves_dead / f, double(stats_.resolve_px_dead) / f / 1e3,
            double(stats_.resolve_bytes_dead) / f / (1024.0 * 1024.0));
      }
@@ -4141,7 +4181,7 @@ index 22736d5..702d9bb 100644
        std::vector<const DestAgg*> top;
        for (auto& kv : dest_agg_) top.push_back(&kv.second);
        std::sort(top.begin(), top.end(), [](const DestAgg* a, const DestAgg* b) {
-@@ -2973,10 +3731,15 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
+@@ -2973,10 +3749,15 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
              d.base, d.w, d.h, d.fmt, d.src_pitch, d.src_fmt, d.resolves / f, d.dead / f);
        }
      }
@@ -6060,6 +6100,128 @@ index 0000000..b136948
 +extern "C" REX_FUNC(sub_826CE418) { Timed<__imp__sub_826CE418>(6, ctx, base); }
 +extern "C" REX_FUNC(sub_826CE068) { Timed<__imp__sub_826CE068>(7, ctx, base); }
 +extern "C" REX_FUNC(sub_826CDBA0) { Timed<__imp__sub_826CDBA0>(8, ctx, base); }
+diff --git a/src/audio_rate_hook.cpp b/src/audio_rate_hook.cpp
+new file mode 100644
+index 0000000..4edc633
+--- /dev/null
++++ b/src/audio_rate_hook.cpp
+@@ -0,0 +1,115 @@
++// Experiment: run the game's audio mixer at a lower sample rate (carbon_audio_mixer_rate, 0 = off).
++//
++// Carbon's sub_826BF910 (Collector's sub_826BF748) fills an output-format record: a 16-bit sample rate at +0,
++// the channel count at +2 and a block length at +3, starting from a default of 48000 Hz. The mixer takes its
++// rate from that record, so lowering it makes every per-block cost that scales with samples (resampling,
++// filters, gain, sums) 44.1/48 as large. The guest XAudio layer then has to resample the mixer's packets back
++// to the 48 kHz render frame. The hook only changes the record the original produced when it holds 48000.
++// The first calls are logged either way so the value the game really uses is visible.
++#include <rex/cvar.h>
++#include <rex/logging.h>
++
++#include <atomic>
++#include <chrono>
++#include <string>
++
++#include "edition.h"
++#include CARBON_GUEST_PCH
++
++REXCVAR_DEFINE_INT32(carbon_audio_mixer_rate, 0, "CarbonAudio",
++                     "Sample rate the game's audio mixer is told to use (0 = leave the game's 48000; 44100 saves "
++                     "about 8% of the per-sample mixing work). Experimental: the XAudio layer resamples to 48 kHz")
++    .range(0, 48000);
++
++extern "C" void CARBON_IMP(AUDIO_FN_FORMAT_INIT)(PPCContext& __restrict ctx, uint8_t* base);
++
++extern "C" void CARBON_IMP(AUDIO_FN_BUS_CONVERT)(PPCContext& __restrict ctx, uint8_t* base);
++
++// Probe: how many channels does the game's mixer really carry? Carbon's sub_826CA768 (Collector's sub_826CA5A0) runs for
++// every mixer stage; it compares the stage's channel count (byte +33 of the stage) with the count left by the stage
++// before it (byte +0x30028 of the mixer object) and converts between 1, 2, 4 and 6 channels with sub_826C5440. This
++// counts the (previous, stage) pairs and logs them every 10 s as "[audio-chan] 6>6 n, 6>2 n, ...". If most pairs end in 6
++// the game mixes 5.1 and a stereo mixing mode could cut the per-voice work; if they end in 2 it already mixes stereo.
++REXCVAR_DEFINE_BOOL(carbon_audio_chan_probe, false, "CarbonAudio",
++                    "Count and log (every 10 s, info level) how many channels each mixer stage carries; diagnostic only");
++
++extern "C" REX_FUNC(AUDIO_FN_BUS_CONVERT) {
++  if (!REXCVAR_GET(carbon_audio_chan_probe)) {
++    CARBON_IMP(AUDIO_FN_BUS_CONVERT)(ctx, base);
++    return;
++  }
++  static std::atomic<uint32_t> pairs[8][8];
++  static std::atomic<int64_t> next_ms{0};
++  const uint32_t stage = ctx.r3.u32, mixer = ctx.r4.u32;
++  const uint32_t before = REX_LOAD_U8(mixer + 0x30028), count = REX_LOAD_U8(stage + 33);
++  pairs[before & 7][count & 7].fetch_add(1, std::memory_order_relaxed);
++  CARBON_IMP(AUDIO_FN_BUS_CONVERT)(ctx, base);
++  const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
++                          std::chrono::steady_clock::now().time_since_epoch()).count();
++  int64_t due = next_ms.load(std::memory_order_relaxed);
++  if (due == 0) {
++    next_ms.compare_exchange_strong(due, now + 10000, std::memory_order_relaxed);
++    return;
++  }
++  if (now < due || !next_ms.compare_exchange_strong(due, now + 10000, std::memory_order_relaxed)) return;
++  std::string line;
++  for (uint32_t i = 0; i < 8; ++i) {
++    for (uint32_t j = 0; j < 8; ++j) {
++      const uint32_t n = pairs[i][j].exchange(0, std::memory_order_relaxed);
++      if (n) line += " " + std::to_string(i) + ">" + std::to_string(j) + " x" + std::to_string(n);
++    }
++  }
++  REXLOG_INFO("[audio-chan] mixer stage channel counts (before>stage), 10 s:{}", line.empty() ? " none" : line);
++}
++
++extern "C" REX_FUNC(AUDIO_FN_FORMAT_INIT) {
++  static std::atomic<uint32_t> calls{0};
++  const uint32_t record = ctx.r5.u32;  // r5 is volatile: keep it across the original
++  CARBON_IMP(AUDIO_FN_FORMAT_INIT)(ctx, base);
++  const uint32_t rate = REX_LOAD_U16(record);
++  const uint32_t channels = REX_LOAD_U8(record + 2), length = REX_LOAD_U8(record + 3);
++  const int32_t wanted = REXCVAR_GET(carbon_audio_mixer_rate);
++  const bool patch = wanted > 0 && rate == 48000;
++  if (patch) REX_STORE_U16(record, uint32_t(wanted));
++  if (calls.fetch_add(1, std::memory_order_relaxed) < 8) {
++    REXLOG_INFO("[carbon-audio] format record {:08X}: rate {} channels {} length {}{}", record, rate, channels, length,
++                patch ? " -> patched" : "");
++  }
++}
++// Called at the start of the mixer thread (audio_server_wait_hook.cpp) with the mixer object. The scan found the
++// mixer's rate as the float 48000.0 at +0x30 of the object. With carbon_audio_mixer_rate set, it is replaced.
++// The XAudio source voice the mixer feeds is at [obj+64]: its first words are listed so the voice's own rate can be
++// found if the packets then play at the wrong speed.
++extern "C" void CarbonAudioRatePatch(uint8_t* base, uint32_t obj) {
++  const int32_t wanted = REXCVAR_GET(carbon_audio_mixer_rate);
++  const uint32_t voice = REX_LOAD_U32(obj + 64);
++  uint32_t shown = 0;
++  if (voice >= 0x10000 && voice < 0xBFFFFFFF) {
++    for (uint32_t off = 0; off < 0x300 && shown < 24; off += 4) {
++      const uint32_t value = REX_LOAD_U32(voice + off);
++      if (value == 48000u || value == 44100u || value == 0x473B8000u || value == 0x472C4400u) {
++        REXLOG_INFO("[audio-rate] voice {:08X} +0x{:X} = {:08X}", voice, off, value);
++        ++shown;
++      }
++    }
++  }
++  if (wanted > 0 && voice >= 0x10000 && voice < 0xBFFFFFFF) {
++    // The scan found the voice's 48000 at +0x38, +0x5C, +0x140, +0x1CC and +0x1DC: the XAudio layer then resamples
++    // the mixer's packets to the 48 kHz render frame instead of playing them 9% fast.
++    uint32_t patched = 0;
++    for (uint32_t off = 0; off < 0x300; off += 4) {
++      if (REX_LOAD_U32(voice + off) == 48000u) {
++        REX_STORE_U32(voice + off, uint32_t(wanted));
++        ++patched;
++      }
++    }
++    REXLOG_INFO("[audio-rate] voice {:08X}: {} rate word(s) set to {}", voice, patched, wanted);
++  }
++  if (wanted > 0 && REX_LOAD_U32(obj + 0x30) == 0x473B8000u) {
++    const float rate = float(wanted);
++    uint32_t bits;
++    __builtin_memcpy(&bits, &rate, 4);
++    REX_STORE_U32(obj + 0x30, bits);
++    REXLOG_INFO("[audio-rate] mixer rate at +0x30 patched to {} Hz", wanted);
++  }
++}
+\ No newline at end of file
 diff --git a/src/audio_resampler.h b/src/audio_resampler.h
 new file mode 100644
 index 0000000..4f08866
@@ -6712,6 +6874,148 @@ index 0000000..548040d
 +}
 +
 +}  // namespace carbon::audio
+diff --git a/src/car_lod_hook.cpp b/src/car_lod_hook.cpp
+new file mode 100644
+index 0000000..432b326
+--- /dev/null
++++ b/src/car_lod_hook.cpp
+@@ -0,0 +1,136 @@
++// Lower detail for the cars the game pins in a race (the other racers and traffic), not the player's.
++//
++// sub_825A43A8 (Collector's: sub_825A4278) is CarRenderInfo::Render, called once per car per view. It picks the
++// body model as car_body_lod = min(mMaxLodLevel, bodyLodIx + mMinLodLevel), where bodyLodIx comes from the car's
++// projected size against the ladder {120, 25, 20, 10, 0} (the tires use {80, 40, 20, 10, 0}), and mMinLodLevel /
++// mMaxLodLevel are the object's ints at +12492 / +12496, copied from the RideInfo when the car is created.
++// Measured on Switch (the [car-lod] "new car" lines): in a race every racer and traffic car is created with
++// min == max == 1 (always model 1), while the showroom/garage cars and the one car drawn once per frame in a race
++// (the player's) have a variable range 0..4. Raising min and max together to N + bias therefore lowers only the
++// pinned cars, and menu cars and the player's car are never touched.
++// Hook: for a pinned car with 1 <= N < 2, raise min and max by carbon_ai_car_lod_bias (at most to 2) for this
++// one call, then restore them. Only while at least carbon_ai_car_lod_min_cars cars were drawn in the last 0.3 s.
++// The render thread is the only writer of the fields during the call. Default 0 = the game's own choice.
++#include <rex/cvar.h>
++#include <rex/logging.h>
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++
++#include "edition.h"
++#include CARBON_GUEST_PCH
++
++REXCVAR_DEFINE_INT32(carbon_ai_car_lod_bias, 0, "CarbonPerf",
++                     "Model steps added to every car the game pins at one LOD in a race (the other racers and traffic; "
++                     "showroom cars and the player's car vary and are never touched): 1 = one step lower (level 2; deeper levels draw "
++                     "no body), 2-3 behave the same; "
++                     "0 = the game's choice")
++    .range(0, 3);
++
++REXCVAR_DEFINE_INT32(carbon_ai_car_lod_min_cars, 5, "CarbonPerf",
++                     "carbon_ai_car_lod_bias only applies while at least this many different cars were drawn in the last "
++                     "0.3 s (a race; the garage and menus show one or two cars and stay untouched)")
++    .range(1, 32);
++
++extern "C" void CARBON_IMP(CAR_RENDER)(PPCContext& __restrict ctx, uint8_t* base);
++extern "C" void CARBON_IMP(CAR_INIT)(PPCContext& __restrict ctx, uint8_t* base);
++
++namespace {
++constexpr uint32_t kMinLod = 12492, kMaxLod = 12496;
++std::atomic<uint32_t> g_raised{0}, g_variable{0}, g_other{0};
++// Hardware (final1): pinned 1 + bias 2 = level 3 draws no car body at all, only lights and shadows. Level 2 is the lowest
++// level known to draw the body, so the result is capped there.
++constexpr int32_t kLastLod = 2;
++std::atomic<int64_t> g_report_at{0};
++
++// Cars drawn lately (render thread only): pointer and last time seen.
++struct Seen {
++  uint32_t car = 0;
++  int64_t at = 0;
++};
++Seen g_seen[32];
++constexpr int64_t kWindowNs = 300'000'000;
++
++int64_t NowNs() {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++
++// Marks car as drawn now and returns how many different cars were drawn within the window.
++int CarsInWindow(uint32_t car, int64_t now) {
++  int count = 0;
++  Seen* slot = nullptr;
++  Seen* oldest = &g_seen[0];
++  for (Seen& s : g_seen) {
++    if (s.car == car) slot = &s;
++    else if (s.at < oldest->at) oldest = &s;
++    if (s.car != 0 && now - s.at <= kWindowNs && s.car != car) ++count;
++  }
++  if (!slot) slot = oldest;
++  slot->car = car;
++  slot->at = now;
++  return count + 1;
++}
++
++void MaybeReport() {
++  const int64_t now = NowNs();
++  const int64_t due = g_report_at.load(std::memory_order_relaxed);
++  if (due == 0) {
++    g_report_at.store(now + 10'000'000'000, std::memory_order_relaxed);
++    return;
++  }
++  if (now < due) return;
++  g_report_at.store(now + 10'000'000'000, std::memory_order_relaxed);
++  REXLOG_INFO("[car-lod] bias {} | Render calls in 10 s: lowered (pinned at 1-3) {}, variable range (player, menus) {}, "
++              "pinned at 0 or 4 {}",
++              REXCVAR_GET(carbon_ai_car_lod_bias), g_raised.exchange(0), g_variable.exchange(0), g_other.exchange(0));
++}
++}  // namespace
++
++extern "C" REX_FUNC(CAR_RENDER) {
++  const int32_t bias = REXCVAR_GET(carbon_ai_car_lod_bias);
++  if (bias <= 0) {
++    CARBON_IMP(CAR_RENDER)(ctx, base);
++    return;
++  }
++  const uint32_t car = ctx.r3.u32;
++  if (CarsInWindow(car, NowNs()) < REXCVAR_GET(carbon_ai_car_lod_min_cars)) {
++    CARBON_IMP(CAR_RENDER)(ctx, base);
++    MaybeReport();
++    return;
++  }
++  const int32_t min_lod = int32_t(REX_LOAD_U32(car + kMinLod)), max_lod = int32_t(REX_LOAD_U32(car + kMaxLod));
++  if (min_lod != max_lod) {
++    g_variable.fetch_add(1, std::memory_order_relaxed);  // showroom/garage and the player's car: never touched
++  } else if (min_lod < 1 || min_lod >= kLastLod) {
++    g_other.fetch_add(1, std::memory_order_relaxed);
++  } else {
++    const int32_t raised = min_lod + bias < kLastLod ? min_lod + bias : kLastLod;
++    g_raised.fetch_add(1, std::memory_order_relaxed);
++    REX_STORE_U32(car + kMinLod, uint32_t(raised));
++    REX_STORE_U32(car + kMaxLod, uint32_t(raised));
++    CARBON_IMP(CAR_RENDER)(ctx, base);
++    REX_STORE_U32(car + kMinLod, uint32_t(min_lod));
++    REX_STORE_U32(car + kMaxLod, uint32_t(max_lod));
++    MaybeReport();
++    return;
++  }  CARBON_IMP(CAR_RENDER)(ctx, base);
++  MaybeReport();
++}
++
++// Diagnostic: what the game puts in the RideInfo (fields +0..+76) and the LOD range for each car it creates, so the
++// player's car can be told apart from the rest. Constructions are rare; the first 48 are logged.
++extern "C" REX_FUNC(CAR_INIT) {
++  static std::atomic<uint32_t> logged{0};
++  const uint32_t car = ctx.r3.u32, ride = ctx.r4.u32;
++  CARBON_IMP(CAR_INIT)(ctx, base);
++  if (logged.fetch_add(1, std::memory_order_relaxed) < 48) {
++    char words[20 * 9 + 1];
++    int n = 0;
++    for (uint32_t i = 0; i < 20; ++i) n += std::snprintf(words + n, sizeof(words) - n, "%08X ", uint32_t(REX_LOAD_U32(ride + 4 * i)));
++    REXLOG_INFO("[car-lod] new car 0x{:08X} rideinfo 0x{:08X} lod min {} max {} | rideinfo words {}", car, ride,
++                int32_t(REX_LOAD_U32(car + kMinLod)), int32_t(REX_LOAD_U32(car + kMaxLod)), words);
++  }
++}
 diff --git a/src/dlc_install.cpp b/src/dlc_install.cpp
 new file mode 100644
 index 0000000..a0ea588
@@ -6776,6 +7080,164 @@ index 0000000..a0ea588
 +  REXLOG_INFO("[dlc] {}: {} package(s) installed, {} failed, {} duplicate(s) skipped (title {:08X})", root.string(),
 +              installed, failed, duplicates, kernel_state->title_id());
 +}
+diff --git a/src/edition.h b/src/edition.h
+new file mode 100644
+index 0000000..80e5f34
+--- /dev/null
++++ b/src/edition.h
+@@ -0,0 +1,151 @@
++#pragma once
++
++// Edition-specific guest addresses for the native audio hooks, so one implementation serves both
++// editions. Collector's values were matched instruction-for-instruction against standard (same
++// instructions, same data addresses; only the code addresses move) and are re-checked against the
++// generated CE code by tests/test_editions.py. Data addresses (0x820C7E18/7F24/7F28, 0x82C236EE/EF)
++// and structure offsets are identical in both editions.
++
++#define CARBON_CAT_(a, b) a##b
++#define CARBON_IMP(name) CARBON_CAT_(__imp__, name)
++
++#if defined(NFSCARBON_COLLECTORS)
++#if defined(NFSCARBON_COLLECTORS_RL)
++#define CARBON_GUEST_PCH "../generated/collectors-rl/nfscarbon_pch.h"
++#define CARBON_LEAF_HEADER "../generated/collectors-rl/native_leaf.h"
++#else
++#define CARBON_GUEST_PCH "../generated/collectors/nfscarbon_pch.h"
++#define CARBON_LEAF_HEADER "../generated/collectors/native_leaf.h"
++#endif
++#define AUDIO_FN_RESAMPLE sub_826CB010        // std 826CB1D8
++#define AUDIO_FN_RESAMPLE_15D0 sub_826D1408   // std 826D15D0
++#define AUDIO_FN_FILTER_8BB0 sub_826C89E8     // std 826C8BB0
++#define AUDIO_FN_FILTER_CCA20 sub_826CC858    // std 826CCA20
++#define AUDIO_FN_RAMP_1678 sub_826D14B0       // std 826D1678
++#define AUDIO_FN_MIX_CD8D0 sub_826CD708       // std 826CD8D0
++#define AUDIO_FN_SCALE_CD528 sub_826CD360     // std 826CD528
++#define AUDIO_FN_UNPACK_B56A8 sub_826B54E0    // std 826B56A8
++#define AUDIO_FN_MIXER_LOOP sub_826C68E8      // std 826C6AB0
++#define AUDIO_FN_FORMAT_INIT sub_826BF748     // std 826BF910
++#define AUDIO_FN_BUS_CONVERT sub_826CA5A0     // std 826CA768
++#define AUDIO_FN_SUBMIT_PACKET sub_82A4C460   // std 82A4C630
++// Collector's guest code keeps cr0/cr6/xer and the non-volatile registers in the context (standard has them as
++// codegen locals), so hooks must read and write those exactly as the original does.
++#if defined(NFSCARBON_COLLECTORS_RL)
++// collectors-rl is generated with register-local codegen like the standard edition: the standard hook variants apply.
++constexpr bool kConservativeContext = false;
++#else
++constexpr bool kConservativeContext = true;
++#endif
++#define RT_FRAME sub_8250AAB8   // std 8250ABE8, the render thread's per-frame function
++#define RT_BODY sub_8250ABC0    // std 8250ACF0
++#define RT_WAIT sub_824E9818    // std 824E9948 (flag wait)
++#define RT_A sub_824E9950       // std 824E9A80
++#define RT_B sub_824E98D8       // std 824E9A08
++#define RT_C sub_822CBB48       // std 822CBC88
++#define RT_D sub_824E5E20       // std 824E5F50
++#define RT_E sub_822C3350       // std 822C3490
++#define RT_F sub_82469318       // std 82469448
++#define RT_G sub_824EFF10       // std 824F0040
++#define RT_H sub_824E5598       // std 824E56C8
++#define RT_I sub_825091B0       // std 825092E0
++#define RT_J sub_8250A820       // std 8250A950, callees of the frame body RT_BODY
++#define RT_K sub_824E71D0       // std 824E7300
++#define RT_L sub_825A8190       // std 825A82C0 (car code range)
++#define RT_M sub_822CEA60       // std 822CEBA0
++#define RT_N sub_822CE920       // std 822CEA60
++#define RT_O sub_82510570       // std 825106A0
++#define RT_P sub_824E94E8       // std 824E9618 (callee of RT_A)
++#define CAR_INIT sub_8259F810     // std 8259F940, CarRenderInfo constructor (this = r3, RideInfo* = r4)
++// Callees of the main view pass (PASS_5), timed inclusively by render_pass_profile_hook.cpp: the largest ones.
++#define MP_0 sub_824E0190      // std 824E02C0
++#define MP_1 sub_825C7ED0      // std 825C8000
++#define MP_2 sub_825AA5E0      // std 825AA710
++#define MP_3 sub_82601B98      // std 82601CC8
++#define MP_4 sub_824E6AF8      // std 824E6C28
++#define MP_5 sub_824E5A08      // std 824E5B38
++#define MP_6 sub_825878C8      // std 825879F8
++#define MP_7 sub_8215C358      // std 8215C358
++#define MP_8 sub_825B0A68      // std 825B0B98
++#define MP_9 sub_8238A278      // std 8238A388
++#define MP_10 sub_82510160      // std 82510290
++#define MP_11 sub_8250A518      // std 8250A648
++#define MP_12 sub_825D4B38      // std 825D4C68
++#define MP_13 sub_8257BC78      // std 8257BDA8
++#define MP_14 sub_825C4898      // std 825C49C8
++#define MP_15 sub_825C8B00      // std 825C8C30
++#define CAR_RENDER sub_825A4278   // std 825A43A8, CarRenderInfo::Render (std - 0x130)
++#define PASS_FRAME sub_824F00E0   // std 824F0210; every render-pass address here is std - 0x130
++#define PASS_PREP sub_8250B3A0    // std 8250B4D0
++#define PASS_1 sub_824EEC30       // std 824EED60
++#define PASS_2 sub_824EF700       // std 824EF830, the car cube-reflection pass (standard ships skip mask 4)
++#define PASS_3 sub_824EFA40       // std 824EFB70
++#define PASS_4 sub_824EF078       // std 824EF1A8
++#define PASS_5 sub_824EDFE0       // std 824EE110
++constexpr unsigned kFilter8BB0Lr1 = 0x826C89F0;   // after the prologue call
++constexpr unsigned kFilter8BB0Lr2 = 0x826C8A2C;   // after the indirect callback
++constexpr unsigned kFilterCCA20Lr = 0x826CC860;
++#else
++#define CARBON_GUEST_PCH "../generated/default/nfscarbon_pch.h"
++#define CARBON_LEAF_HEADER "../generated/default/native_leaf.h"
++#define AUDIO_FN_RESAMPLE sub_826CB1D8
++#define AUDIO_FN_RESAMPLE_15D0 sub_826D15D0
++#define AUDIO_FN_FILTER_8BB0 sub_826C8BB0
++#define AUDIO_FN_FILTER_CCA20 sub_826CCA20
++#define AUDIO_FN_RAMP_1678 sub_826D1678
++#define AUDIO_FN_MIX_CD8D0 sub_826CD8D0
++#define AUDIO_FN_SCALE_CD528 sub_826CD528
++#define AUDIO_FN_UNPACK_B56A8 sub_826B56A8
++#define AUDIO_FN_MIXER_LOOP sub_826C6AB0
++#define AUDIO_FN_FORMAT_INIT sub_826BF910
++#define AUDIO_FN_BUS_CONVERT sub_826CA768
++#define AUDIO_FN_SUBMIT_PACKET sub_82A4C630
++constexpr bool kConservativeContext = false;
++#define RT_FRAME sub_8250ABE8
++#define RT_BODY sub_8250ACF0
++#define RT_WAIT sub_824E9948
++#define RT_A sub_824E9A80
++#define RT_B sub_824E9A08
++#define RT_C sub_822CBC88
++#define RT_D sub_824E5F50
++#define RT_E sub_822C3490
++#define RT_F sub_82469448
++#define RT_G sub_824F0040
++#define RT_H sub_824E56C8
++#define RT_I sub_825092E0
++#define RT_J sub_8250A950
++#define RT_K sub_824E7300
++#define RT_L sub_825A82C0
++#define RT_M sub_822CEBA0
++#define RT_N sub_822CEA60
++#define RT_O sub_825106A0
++#define RT_P sub_824E9618
++#define CAR_INIT sub_8259F940
++#define MP_0 sub_824E02C0
++#define MP_1 sub_825C8000
++#define MP_2 sub_825AA710
++#define MP_3 sub_82601CC8
++#define MP_4 sub_824E6C28
++#define MP_5 sub_824E5B38
++#define MP_6 sub_825879F8
++#define MP_7 sub_8215C358
++#define MP_8 sub_825B0B98
++#define MP_9 sub_8238A388
++#define MP_10 sub_82510290
++#define MP_11 sub_8250A648
++#define MP_12 sub_825D4C68
++#define MP_13 sub_8257BDA8
++#define MP_14 sub_825C49C8
++#define MP_15 sub_825C8C30
++#define CAR_RENDER sub_825A43A8
++#define PASS_FRAME sub_824F0210
++#define PASS_PREP sub_8250B4D0
++#define PASS_1 sub_824EED60
++#define PASS_2 sub_824EF830
++#define PASS_3 sub_824EFB70
++#define PASS_4 sub_824EF1A8
++#define PASS_5 sub_824EE110
++constexpr unsigned kFilter8BB0Lr1 = 0x826C8BB8;
++constexpr unsigned kFilter8BB0Lr2 = 0x826C8BF4;
++constexpr unsigned kFilterCCA20Lr = 0x826CCA28;
++#endif
+\ No newline at end of file
 diff --git a/src/frame_handoff_hook.cpp b/src/frame_handoff_hook.cpp
 new file mode 100644
 index 0000000..a051a44
@@ -6962,29 +7424,31 @@ index e622dec..7615c4e 100644
  #include "nfscarbon_app.h"
  
 diff --git a/src/nfscarbon_app.h b/src/nfscarbon_app.h
-index 29e2a26..2d394c8 100644
+index 29e2a26..df99e85 100644
 --- a/src/nfscarbon_app.h
 +++ b/src/nfscarbon_app.h
-@@ -2,6 +2,7 @@
+@@ -2,12 +2,20 @@
  
  #include <rex/cvar.h>
  #include <rex/filesystem.h>
 +#include <rex/logging.h>
  #include <rex/rex_app.h>
++#include <rex/ui/overlay/settings_overlay.h>
  
  #include <filesystem>
-@@ -9,6 +10,10 @@
+ #include <functional>
  #include <optional>
  #include <string>
- 
++#include <utility>
++#include <vector>
++
 +#if defined(NFSCARBON_STATIC_CARBON_GPU)
 +#include "renderer/src/gpu_system.h"
 +#endif
-+
+ 
  #if defined(__ANDROID__)
  #include "android_aaudio.h"
- #include "thread_affinity.h"
-@@ -17,6 +22,12 @@ extern "C" const char* SDL_GetAndroidInternalStoragePath(void);
+@@ -17,6 +25,12 @@ extern "C" const char* SDL_GetAndroidInternalStoragePath(void);
  extern "C" const char* SDL_GetAndroidExternalStoragePath(void);
  #endif
  
@@ -6997,7 +7461,7 @@ index 29e2a26..2d394c8 100644
  class NfsCarbonApp : public rex::ReXApp {
   public:
    using rex::ReXApp::ReXApp;
-@@ -28,7 +39,19 @@ class NfsCarbonApp : public rex::ReXApp {
+@@ -28,7 +42,19 @@ class NfsCarbonApp : public rex::ReXApp {
    }
  
    void OnConfigurePaths(rex::PathConfig& paths) override {
@@ -7018,7 +7482,7 @@ index 29e2a26..2d394c8 100644
      const char* internal = SDL_GetAndroidInternalStoragePath();
      const char* external = SDL_GetAndroidExternalStoragePath();
      const std::filesystem::path internal_dir = internal ? internal : "";
-@@ -78,7 +101,7 @@ class NfsCarbonApp : public rex::ReXApp {
+@@ -78,7 +104,7 @@ class NfsCarbonApp : public rex::ReXApp {
        const rex::PathConfig& defaults,
        std::function<void(rex::PathConfig)> resume) override {
      (void)resume;
@@ -7027,7 +7491,7 @@ index 29e2a26..2d394c8 100644
      // SetupEnvironment loads the TOML only after OnConfigurePaths has already
      // built the path defaults, so the game_data_root written by the launcher
      // must be applied here, once the config is live and before the runtime is
-@@ -88,6 +111,14 @@ class NfsCarbonApp : public rex::ReXApp {
+@@ -88,6 +114,14 @@ class NfsCarbonApp : public rex::ReXApp {
      if (!configured_root.empty()) {
        paths.game_data_root = configured_root;
      }
@@ -7042,7 +7506,7 @@ index 29e2a26..2d394c8 100644
      return paths;
  #else
      return defaults;
-@@ -99,14 +130,24 @@ class NfsCarbonApp : public rex::ReXApp {
+@@ -99,14 +133,24 @@ class NfsCarbonApp : public rex::ReXApp {
      // emulation, kept as a fallback selectable with gpu_plugin in the TOML
      // (the Android launcher writes it from Settings > Renderer).
      if (config.gpu_plugin.empty()) {
@@ -7051,14 +7515,14 @@ index 29e2a26..2d394c8 100644
 +#else
        config.gpu_plugin = "carbon";
 +#endif
-+    }
-+
+     }
+ 
 +#if defined(NFSCARBON_STATIC_CARBON_GPU)
 +    if (config.gpu_plugin == "carbon") {
 +      config.graphics = std::make_unique<carbon::gpu::GpuSystem>();
-     }
++    }
 +#endif
- 
++
  #if defined(__ANDROID__)
      config.audio_factory = REX_AUDIO_BACKEND(carbon::audio::AAudioSystem);
  #endif
@@ -7068,14 +7532,67 @@ index 29e2a26..2d394c8 100644
      // On Android the launcher writes these keys to the TOML config, and
      // OnPreSetup runs before LoadConfig, so setting defaults here would win
      // with Source::kRuntime and silently override the launcher.
-@@ -148,6 +189,34 @@ class NfsCarbonApp : public rex::ReXApp {
+@@ -146,8 +190,87 @@ class NfsCarbonApp : public rex::ReXApp {
+ #endif
+   }
  
++  // The short settings page of the in-game overlay (hold L + R and press Right): the settings that are useful and safe
++  // to touch, in plain words. "Restart" marks the ones read once at start. Everything else stays under "All settings".
++  static void RegisterQuickSettings() {
++    using rex::ui::QuickSetting;
++    std::vector<QuickSetting> items;
++    auto add = [&](const char* cvar, const char* group, const char* label, const char* help, bool restart,
++                   std::vector<std::pair<std::string, std::string>> choices = {}) {
++      QuickSetting item;
++      item.cvar = cvar;
++      item.group = group;
++      item.label = label;
++      item.help = help;
++      item.restart = restart;
++      item.choices = std::move(choices);
++      items.push_back(std::move(item));
++    };
++    add("carbon_gpu_render_scale", "Video", "Render resolution", "Percent of 1280x720 the scene is drawn at before upscaling. Lower is faster.", true,
++        {{"60", "60%"}, {"70", "70%"}, {"80", "80% (default)"}, {"90", "90%"}, {"100", "100% (native)"}});
++    add("present_effect", "Video", "Upscaler", "How the scene is scaled to the screen: FSR upscale, sharpen only, or a plain stretch.", true,
++        {{"fsr", "FSR (default)"}, {"cas", "Sharpen only (CAS)"}, {"bilinear", "Plain stretch"}});
++    add("carbon_gpu_max_anisotropy", "Video", "Anisotropic filtering", "Sharper textures at a distance and on the road. 4x is the default.", true,
++        {{"1", "Off"}, {"2", "2x"}, {"4", "4x (default)"}, {"8", "8x"}, {"16", "16x"}});
++    add("carbon_gpu_bloom", "Video", "Bloom", "The glow around lights. Off saves about 4 ms of GPU time per frame in a crowded race. Applies at once.", false);
++    add("carbon_gpu_texture_lod_bias", "Video", "Texture detail", "Softer textures use less memory bandwidth. Applies to textures as they load.", false,
++        {{"0.0", "Full (default)"}, {"0.5", "Slightly softer"}, {"1.0", "Softer, cheaper"}});
++    add("carbon_gpu_vsync", "Video", "VSync", "Keeps the game at the display rate. Off is only for testing.", false);
++    add("audio_mute", "Audio", "Mute audio", "Silences the output. Applies at once.", false);
++    add("audio_switch_tramas_en_cola", "Audio", "Audio buffer", "Audio kept queued before output. A longer buffer survives busy moments but delays the sound.", true,
++        {{"10", "Short, about 53 ms"}, {"16", "About 85 ms"}, {"24", "About 130 ms"}, {"32", "Long, about 170 ms (default)"}});
++    add("audio_switch_recuperar", "Audio", "Audio buffer refill", "How fast the buffer refills after a hiccup. Normal is right for most races. Applies at once.", false,
++        {{"0", "Off (old behaviour)"}, {"1", "Normal (default)"}, {"2", "Fast"}, {"3", "Fastest"}});
++    add("input_vibracion", "Controls", "Controller rumble", "Vibration from the game. Applies at once.", false);
++    add("input_xbox_layout", "Controls", "Xbox button layout", "Face buttons by position, as on an Xbox pad (the bottom button acts as A).", true);
++    rex::ui::SetQuickSettings(std::move(items));
++  }
++
    void OnPostSetup() override {
      rex::cvar::SetFlagByName("gpu_allow_invalid_fetch_constants", "true");
 +#ifdef NFSCARBON_VERSION
 +    REXLOG_INFO("NFS Carbon NX {} - made by zofo007", NFSCARBON_VERSION);
++    // One line at warning level, so even a quiet log says which build it came from (edition and load style).
++#if defined(NFSCARBON_COLLECTORS_RL)
++    constexpr const char* kBuildEdition = "collectors register-local";
++#elif defined(NFSCARBON_COLLECTORS)
++    constexpr const char* kBuildEdition = "collectors";
++#else
++    constexpr const char* kBuildEdition = "standard";
++#endif
++#if defined(NFSCARBON_FAST_LOADS_BUILD)
++    constexpr const char* kBuildLoads = "plain guest loads";
++#else
++    constexpr const char* kBuildLoads = "volatile guest loads";
++#endif
++    REXLOG_WARN("[build] NFS Carbon NX {} ({}, {})", NFSCARBON_VERSION, kBuildEdition, kBuildLoads);
 +#endif
 +    CarbonInstallDlc(runtime());
++    RegisterQuickSettings();
 +#if defined(__SWITCH__)
 +    CarbonLogProcessLimits();
 +    // SDK option off by default for MW; a TOML value still wins.

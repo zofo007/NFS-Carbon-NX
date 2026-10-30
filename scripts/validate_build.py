@@ -7,6 +7,8 @@ import sys
 def validate_nro(data):
     if len(data) < 0x80 or data[0x10:0x14] != b"NRO0":
         raise ValueError("Missing or truncated NRO0 header")
+    if data[3] & 0xFC != 0x14:  # the first instruction of crt0 is an unconditional B; anything else means code was placed ahead of it
+        raise ValueError("NRO does not start with the crt0 entry branch (a section was linked before .crt0)")
     size = struct.unpack_from("<I", data, 0x18)[0]
     if size < 0x80 or size > len(data):
         raise ValueError("NRO image size exceeds the file or omits its header")

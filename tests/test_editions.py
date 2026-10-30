@@ -102,7 +102,7 @@ class EditionTests(unittest.TestCase):
         for lr, callee in (("826C89F0", "__savegprlr_28"), ("826C8A2C", None), ("826CC860", "__savegprlr_28")):
             self.assertIn(f"0x{lr}", collectors)
             self.assertIn(f"ctx.lr = 0x{lr};", text)
-        self.assertEqual(len(re.findall(r"#define AUDIO_FN_", collectors)), 11)
+        self.assertEqual(len(re.findall(r"#define AUDIO_FN_", collectors)), 12)
         # Render passes: same call order inside the frame function, all at standard - 0x130.
         passes = re.findall(r"#define PASS_\w+ (sub_[0-9A-F]{8})", collectors)
         self.assertEqual(len(passes), 7)

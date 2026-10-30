@@ -29,6 +29,7 @@ editing. The release file ships the values below under "Shipped"; everything els
 | `carbon_gpu_render_scale` | 100 | Lower = faster, softer image (the shipped file uses 80 with FSR) |
 | `carbon_gpu_texture_budget_mb` | 704 on Switch | Texture memory above which the least recently used textures are freed. Without a cap the cache grew until memory ran out in long sessions |
 | `thread_host_stack_mib` | 8 | Host stack per game thread. Smaller leaves more memory free for new threads |
+| `vulkan_vma_block_mb` | 64 on Switch | Size of the memory blocks the GPU allocator asks the driver for, in MB (0 to 1024, restart needed). 64 makes the process memory grow in steps of about 65 MB: about 2.4 GB instead of 2.7 GB after a long session. 0 = the allocator's own default (256 MB on this GPU), the 1.0.0 behaviour |
 | `carbon_gpu_max_anisotropy` | 4 on Switch | 1 = off |
 | `carbon_gpu_texture_lod_bias` | 0.0 | 0 to 2. +1 uses one mip level lower on scene textures: blurrier, less memory traffic |
 | `carbon_gpu_mip_nearest` | false | Bilinear instead of trilinear mip filtering (visible mip steps) |
@@ -64,7 +65,9 @@ editing. The release file ships the values below under "Shipped"; everything els
 | `carbon_gpu_stats` | true (shipped false) | Statistics lines in the log (FPS, draws, GPU time). The short summary is printed every 5 s, the detailed one once a minute. `false` also skips two clock reads per draw |
 | `carbon_audio_mixer_diag` | true (shipped false) | `[mixer-diag]` timing of the audio mixer every 10 s, plus a memory and thread line |
 | `carbon_video_wmv3_shadow` | false | The game decodes every cutscene frame and FFmpeg only compares |
+| `carbon_audio_chan_probe` | false | Counts the channel conversions of the audio mixer and logs `[audio-chan]` every 10 s (a developer probe) |
 | `switch_log_console_shortcut` | false | L+R+Down log console. Off because opening it froze the console |
 
 Logs go to `sdmc:/switch/nfscarbon/logs/`. If you report a problem, attach `nfscarbon_001.log` (and the newest
-numbered one) and say what you did.
+numbered one) and say what you did. Every log has a `[build] NFS Carbon NX <version> (<edition>, <plain or volatile> guest loads)`
+line near the start, even at the quiet warning level, so a report shows which build wrote it.
