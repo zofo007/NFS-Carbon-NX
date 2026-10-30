@@ -58,6 +58,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate-build.ps1
 many large files under `carbon-source/generated/`). `build-switch.ps1` compiles everything for the Switch.
 The result is `artifacts/nfscarbon.nro`. Raise `-Jobs` if you have the memory; the generated files compile slowly.
 
+Since 1.1.0 the translated game code reads guest memory with plain loads (`scripts/fast_loads_scan.py` and `fast_loads_apply.py`
+rewrite the generated files for the build and undo it afterwards; the functions that wait for another thread, use barriers,
+atomics or the global lock keep strict volatile loads). Add `-NoFastLoads` to `build-switch.ps1` to build with volatile loads
+everywhere. `tests/test_fast_loads.py` covers the scanner and the transform.
+
 ## 5. Put it on the SD card
 
 Copy `nfscarbon.nro` and `config/nfscarbon.release.toml` (as `nfscarbon.toml`) to `sdmc:/switch/nfscarbon/`, together
@@ -68,8 +73,10 @@ with your `game-data/` folder. See the README for launching.
 Put your Collector's Edition dump in `game-data-collectors/` (`default.xex`, `NFS/`, `Movies/`), then run:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-switch.ps1 -Edition collectors -Jobs 4
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-switch.ps1 -Edition collectors-rl -Jobs 4
 ```
+
+`collectors-rl` is the 1.1.0 Collector's translation (see below). `-Edition collectors` builds the older translation, kept as a fallback.
 
 The accepted CE executable has SHA-256 `922c7a1a2fc77405c43aac5159ad67fb0414c872084abc3335c68dbb4bec1815`
 (media `1F8BEB88`, version 7, USA / NTSC-U). The script uses the existing host code generator; it does not build a Windows game.
@@ -77,22 +84,24 @@ Generated code, CMake glue, build files and artifacts are separate from standard
 The renderer and runtime source are shared. Plain `build-switch.ps1` still builds the standard edition.
 Re-run the edition's build script after updates; it also runs the required code generation.
 
-Output: `artifacts/collectors/nfscarbon-collectors.nro` and `artifacts/collectors/nfscarbon.toml`.
+Output: `artifacts/collectors-rl/nfscarbon-collectors-rl.nro` (install it as `nfscarbon-collectors.nro`) and
+`artifacts/collectors-rl/nfscarbon.toml` (for `-Edition collectors`: `artifacts/collectors/nfscarbon-collectors.nro`).
 Install both in `sdmc:/switch/nfscarbon-collectors/`, with the CE dump in that folder's `game-data/`.
 Use a fresh, separate `user/` folder for the first test. The standard installation stays in `switch/nfscarbon/`.
 
-The normal Collector's build uses context-preserving translated guest routines (every register lives in the guest
-context between calls), which is why its game code is about 25 to 35% slower than the standard edition's. It shares the
-standard edition's native hooks: the GPU ring-space wait, the frame hand-off, the audio helpers, the render-pass timers
+The older `-Edition collectors` build uses context-preserving translated guest routines (every register lives in the guest
+context between calls), which is why its game code was 14% heavier in instructions than the standard edition's in the hottest
+functions (docs/PERFORMANCE.md). Both Collector's builds share the standard edition's native hooks: the GPU ring-space wait, the frame hand-off, the audio helpers, the render-pass timers
 and cube refresh, the audio server wait and the car-detail hook. Every address in the Collector's branches of those hooks
 was matched instruction for instruction against the standard edition (`src/edition.h`; the tests in
 `tests/test_editions.py` re-check them against the generated code), and the audio helpers have differential tests
 (`tests/check_audio_collectors.ps1`).
 
-`-Edition collectors-rl` builds an experimental register-local Collector's NRO (`artifacts/collectors-rl/`), translated
-the way the standard edition is. It needs the list of functions that read each other's registers
-(`config/collectors_rl_share_registers.txt`; `scripts/check_register_sharing.py` checks it). It is smaller and should be
-faster, but it has not been run on hardware yet; a crash reports the guest address that needs a new entry.
+`-Edition collectors-rl` is translated the way the standard edition is: the long-lived registers are local variables.
+It needs the list of functions that read each other's registers (`config/collectors_rl_share_registers.txt`, 150 entries;
+`scripts/check_register_sharing.py` checks it and `0 function(s) need share_registers` is the expected result; all 151
+Standard entries that have an identical Collector's function are in the list). It is 20% smaller than the older translation
+and has run for one 34-minute session on hardware; if it ever crashes, the log reports the guest address that needs a new entry.
 ### Optional: DLC
 
 Copy your Xbox 360 DLC packages (the STFS files, from your own copy of the game) into

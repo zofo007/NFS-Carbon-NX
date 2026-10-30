@@ -320,6 +320,47 @@ index a72911e..e0c27c2 100644
  
    std::string thread_name_;
    std::unique_ptr<runtime::ThreadState> thread_state_;
+diff --git a/sdk/include/rex/ui/overlay/settings_overlay.h b/sdk/include/rex/ui/overlay/settings_overlay.h
+index 4c519df..885ba25 100644
+--- a/sdk/include/rex/ui/overlay/settings_overlay.h
++++ b/sdk/include/rex/ui/overlay/settings_overlay.h
+@@ -12,6 +12,7 @@
+ #pragma once
+ #include <filesystem>
+ #include <string>
++#include <utility>
+ #include <vector>
+ #include <rex/ui/imgui_dialog.h>
+ 
+@@ -22,6 +23,19 @@ namespace rex::ui {
+ // line and the configuration file still read them. Can be called at any time; calls accumulate.
+ void OcultarAjustesEnMenu(const std::vector<std::string>& nombres);
+ 
++// One row of the short "Quick settings" page the app can offer instead of the long list of every setting.
++struct QuickSetting {
++  std::string cvar;   // name of the setting
++  std::string group;  // page section, for example "Video" or "Audio"
++  std::string label;  // text shown on the row
++  std::string help;   // tooltip
++  bool restart = false;  // changing it takes effect after a restart (shown on the row)
++  double lo = 0, hi = 0;  // slider range of a number (both 0 = the setting's own range)
++  std::vector<std::pair<std::string, std::string>> choices;  // value, label: shown as a list
++};
++// Replaces the quick settings. With none registered the dialog is the full list, as before.
++void SetQuickSettings(std::vector<QuickSetting> items);
++
+ class SettingsDialog : public ImGuiDialog {
+  public:
+   // config_path: where "Save to config" writes (e.g. exe_dir / "app.toml")
+@@ -36,6 +50,8 @@ class SettingsDialog : public ImGuiDialog {
+   char search_buf_[128] = {};
+   std::string selected_category_;
+   std::string capturing_bind_name_;
++  bool show_all_ = false;  // quick settings registered: false = the short page, true = every setting
++  void DrawQuickPage();
+ };
+ 
+ }  // namespace rex::ui
 diff --git a/sdk/include/rex/ui/vulkan/functions/device_1_0.inc b/sdk/include/rex/ui/vulkan/functions/device_1_0.inc
 index aa55a4a..d9d6ed3 100644
 --- a/sdk/include/rex/ui/vulkan/functions/device_1_0.inc
@@ -1487,10 +1528,56 @@ index 8778066..93f380f 100644
      return X_ERROR_INVALID_PARAMETER;
    }
 diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/sdk/src/kernel/xboxkrnl/xboxkrnl_io.cpp
-index d8fac47..22348f9 100644
+index d8fac47..4a4958a 100644
 --- a/sdk/src/kernel/xboxkrnl/xboxkrnl_io.cpp
 +++ b/sdk/src/kernel/xboxkrnl/xboxkrnl_io.cpp
-@@ -372,12 +372,15 @@ inline void AnotarLectura(uint64_t us, uint32_t bytes, const std::string_view ru
+@@ -36,6 +36,14 @@
+ #include <rex/thread/mutex.h>
+ 
+ #include <cctype>
++#if defined(__SWITCH__)
++#include <malloc.h>
++extern "C" {
++#include <switch/kernel/svc.h>
++#include <switch/result.h>
++#include <switch/types.h>
++}
++#endif
+ #include <mutex>
+ #include <string>
+ #include <utility>
+@@ -328,6 +336,30 @@ void QuizaResumenIo(uint64_t ahora_us) {
+       rangos.bytes_vivos / (1024.0 * 1024.0), rangos.tope_mb, rangos.expulsiones, rangos.bajo_suelo,
+       rangos.suelo_kb, rangos.sobre_techo, rangos.secuenciales,
+       rangos.secuenciales_bytes / (1024.0 * 1024.0), rangos.sin_memoria ? " [APAGADA: sin memoria]" : "");
++#if defined(__SWITCH__)
++  // The kernel's own number: the process memory limit (resource limit) against what is committed, plus what
++  // malloc holds. Free = cap - used. This is the figure to read before raising any cache cap.
++  {
++    static Handle limite = INVALID_HANDLE;
++    if (limite == INVALID_HANDLE) {
++      u64 raw = 0;
++      Result rc = svcGetInfo(&raw, InfoType_ResourceLimit, INVALID_HANDLE, 0);
++      if (R_FAILED(rc)) rc = svcGetInfo(&raw, InfoType_ResourceLimit, CUR_PROCESS_HANDLE, 0);
++      if (R_SUCCEEDED(rc)) limite = static_cast<Handle>(raw);
++    }
++    s64 usada = 0, tope = 0;
++    if (limite != INVALID_HANDLE) {
++      svcGetResourceLimitCurrentValue(&usada, limite, LimitableResource_Memory);
++      svcGetResourceLimitLimitValue(&tope, limite, LimitableResource_Memory);
++    }
++    const struct mallinfo mi = mallinfo();
++    constexpr double kMb = 1024.0 * 1024.0;
++    REXKRNL_INFO("[io] memoria del proceso: usada {:.0f} MB de {:.0f} MB (LIBRE {:.0f} MB); malloc: en uso {:.0f} MB, "
++                 "libre dentro del monton {:.0f} MB, arena {:.0f} MB",
++                 double(usada) / kMb, double(tope) / kMb, double(tope - usada) / kMb, double(mi.uordblks) / kMb,
++                 double(mi.fordblks) / kMb, double(mi.arena) / kMb);
++  }
++#endif
+ }
+ 
+ // Always measured: reading the monotonic clock on Horizon is a processor register read, not a system call.
+@@ -372,12 +404,15 @@ inline void AnotarLectura(uint64_t us, uint32_t bytes, const std::string_view ru
  // natively with FFmpeg, because the recompiled XDK WMV decoder does not reach real time on the
  // Switch.
  namespace {
@@ -1507,7 +1594,7 @@ index d8fac47..22348f9 100644
    std::lock_guard<std::mutex> lock(g_nfsmw_wmv_mutex);
    g_nfsmw_ultimo_wmv = ruta;
    for (auto& [e, r] : g_nfsmw_wmv_abiertos) {
-@@ -393,6 +396,14 @@ void NfsmwAnotarApertura(const rex::filesystem::Entry* entrada, const std::strin
+@@ -393,6 +428,14 @@ void NfsmwAnotarApertura(const rex::filesystem::Entry* entrada, const std::strin
    REXLOG_INFO("[video] el juego abre '{}'", ruta);
  }
  
@@ -1522,7 +1609,7 @@ index d8fac47..22348f9 100644
  void NfsmwAnotarLectura(const rex::filesystem::Entry* entrada) {
    std::lock_guard<std::mutex> lock(g_nfsmw_wmv_mutex);
    for (const auto& [e, r] : g_nfsmw_wmv_abiertos) {
-@@ -538,6 +549,10 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+@@ -538,6 +581,10 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
        (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0, &vfs_file, &file_action);
    const uint64_t io_fin_us = AhoraUs();
    AnotarApertura(io_fin_us - io_inicio_us, XSUCCEEDED(result), target_path);
@@ -2741,6 +2828,176 @@ index af02bc0..b2de00e 100644
      assert_not_null(thread->thread_);
  
      // NOTE(tomc): if this is kept and processor notification dispatch is implemented,
+diff --git a/sdk/src/ui/overlay/settings_overlay.cpp b/sdk/src/ui/overlay/settings_overlay.cpp
+index 8604a11..8e04c9f 100644
+--- a/sdk/src/ui/overlay/settings_overlay.cpp
++++ b/sdk/src/ui/overlay/settings_overlay.cpp
+@@ -37,6 +37,22 @@ std::set<std::string>& AjustesOcultos() {
+ }
+ }  // namespace
+ 
++namespace {
++std::mutex& QuickMutex() {
++  static std::mutex mutex;
++  return mutex;
++}
++std::vector<QuickSetting>& QuickItems() {
++  static std::vector<QuickSetting> items;
++  return items;
++}
++}  // namespace
++
++void SetQuickSettings(std::vector<QuickSetting> items) {
++  std::lock_guard<std::mutex> lock(QuickMutex());
++  QuickItems() = std::move(items);
++}
++
+ void OcultarAjustesEnMenu(const std::vector<std::string>& nombres) {
+   std::lock_guard<std::mutex> cerrojo(MutexAjustesOcultos());
+   AjustesOcultos().insert(nombres.begin(), nombres.end());
+@@ -174,6 +190,100 @@ static rex::ui::VirtualKey ImGuiKeyToVirtualKey(ImGuiKey key) {
+   }
+ }
+ 
++// The short page: Video, Audio and Controls with sliders, lists and switches, a restart tag where it applies, and Save.
++void SettingsDialog::DrawQuickPage() {
++  std::vector<QuickSetting> items;
++  {
++    std::lock_guard<std::mutex> lock(QuickMutex());
++    items = QuickItems();
++  }
++  auto& registry = rex::cvar::GetRegistry();
++  const auto& style = imgui_drawer()->style().settings;
++  std::string group;
++  for (const QuickSetting& item : items) {
++    const rex::cvar::FlagEntry* entry = nullptr;
++    for (auto& e : registry) {
++      if (e.name == item.cvar) {
++        entry = &e;
++        break;
++      }
++    }
++    if (!entry) {
++      continue;  // not compiled into this build
++    }
++    if (item.group != group) {
++      group = item.group;
++      ImGui::Spacing();
++      ImGui::TextColored(style.lifecycle_live, "%s", group.c_str());
++      ImGui::Separator();
++    }
++    ImGui::PushID(item.cvar.c_str());
++    ImGui::TextUnformatted(item.label.c_str());
++    if (item.restart) {
++      ImGui::SameLine();
++      ImGui::TextColored(style.lifecycle_restart, "[restart]");
++    }
++    if (!item.help.empty() && ImGui::IsItemHovered()) {
++      ImGui::SetTooltip("%s", item.help.c_str());
++    }
++    ImGui::SameLine(300.0f);
++    ImGui::SetNextItemWidth(200.0f);
++    const std::string current = entry->getter();
++    if (!item.choices.empty()) {
++      int cur_idx = 0;
++      for (int i = 0; i < static_cast<int>(item.choices.size()); ++i) {
++        if (item.choices[i].first == current) {
++          cur_idx = i;
++          break;
++        }
++      }
++      if (ImGui::BeginCombo("##v", item.choices[cur_idx].second.c_str())) {
++        for (int i = 0; i < static_cast<int>(item.choices.size()); ++i) {
++          const bool sel = (i == cur_idx);
++          if (ImGui::Selectable(item.choices[i].second.c_str(), sel)) {
++            rex::cvar::SetFlagByName(entry->name, item.choices[i].first);
++          }
++          if (sel) {
++            ImGui::SetItemDefaultFocus();
++          }
++        }
++        ImGui::EndCombo();
++      }
++    } else if (entry->type == rex::cvar::FlagType::Boolean) {
++      bool v = rex::string::from_string<bool>(current, false);
++      if (ImGui::Checkbox("##v", &v)) {
++        rex::cvar::SetFlagByName(entry->name, v ? "true" : "false");
++      }
++    } else if (entry->type == rex::cvar::FlagType::Int32 || entry->type == rex::cvar::FlagType::Int64 ||
++               entry->type == rex::cvar::FlagType::Uint32 || entry->type == rex::cvar::FlagType::Uint64) {
++      int v = std::atoi(current.c_str());
++      const int lo = item.hi > item.lo ? static_cast<int>(item.lo)
++                                       : (entry->constraints.min ? static_cast<int>(*entry->constraints.min) : 0);
++      const int hi = item.hi > item.lo ? static_cast<int>(item.hi)
++                                       : (entry->constraints.max ? static_cast<int>(*entry->constraints.max) : 100);
++      if (ImGui::SliderInt("##v", &v, lo, hi)) {
++        rex::cvar::SetFlagByName(entry->name, std::to_string(v));
++      }
++    } else if (entry->type == rex::cvar::FlagType::Double) {
++      float v = static_cast<float>(std::atof(current.c_str()));
++      const float lo = item.hi > item.lo ? static_cast<float>(item.lo)
++                                         : (entry->constraints.min ? static_cast<float>(*entry->constraints.min) : 0.0f);
++      const float hi = item.hi > item.lo ? static_cast<float>(item.hi)
++                                         : (entry->constraints.max ? static_cast<float>(*entry->constraints.max) : 1.0f);
++      if (ImGui::SliderFloat("##v", &v, lo, hi, "%.2f")) {
++        rex::cvar::SetFlagByName(entry->name, std::to_string(v));
++      }
++    } else {
++      ImGui::TextUnformatted(current.c_str());
++    }
++    ImGui::SameLine();
++    if (ImGui::SmallButton("Default")) {
++      rex::cvar::SetFlagByName(entry->name, entry->default_value);
++    }
++    ImGui::PopID();
++  }
++}
++
+ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
+   auto& registry = rex::cvar::GetRegistry();
+   // nfsmw: hidden cvars are not listed, and a category with nothing visible does not show either.
+@@ -228,11 +338,41 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
+ 
+   ImGui::SetNextWindowSize(ImVec2(620, 480), ImGuiCond_FirstUseEver);
+   ImGui::SetNextWindowBgAlpha(0.85f);
++  bool has_quick = false;
++  {
++    std::lock_guard<std::mutex> lock(QuickMutex());
++    has_quick = !QuickItems().empty();
++  }
+   if (!ImGui::Begin("Settings##rex", nullptr, ImGuiWindowFlags_NoCollapse)) {
+     ImGui::End();
+     return;
+   }
+ 
++  if (has_quick && !show_all_) {
++    // The short page the app registered: Video, Audio and Controls.
++    ImGui::BeginChild("##quick", ImVec2(0, -30.0f), false);
++    DrawQuickPage();
++    ImGui::EndChild();
++    ImGui::Separator();
++    if (ImGui::Button("Save to config")) {
++      rex::cvar::SaveConfig(config_path_);
++    }
++    ImGui::SameLine();
++    if (ImGui::Button("All settings (advanced)")) {
++      show_all_ = true;
++    }
++    ImGui::SameLine();
++    ImGui::TextDisabled("(%s)", config_path_.filename().string().c_str());
++    ImGui::End();
++    return;
++  }
++  if (has_quick) {
++    if (ImGui::SmallButton("<< Quick settings")) {
++      show_all_ = false;
++    }
++    ImGui::SameLine();
++  }
++
+   // Search bar at the top (full width).
+   ImGui::SetNextItemWidth(-1.0f);
+   ImGui::InputText("##search", search_buf_, sizeof(search_buf_));
 diff --git a/sdk/src/ui/switch_hotspot_policy.h b/sdk/src/ui/switch_hotspot_policy.h
 new file mode 100644
 index 0000000..6e2ade8
@@ -2997,6 +3254,48 @@ index 6b3d30a..d465b67 100644
        return;
      }
    }
+diff --git a/sdk/src/ui/vulkan/vulkan_mem_alloc.cpp b/sdk/src/ui/vulkan/vulkan_mem_alloc.cpp
+index 9ffc2d1..2796d27 100644
+--- a/sdk/src/ui/vulkan/vulkan_mem_alloc.cpp
++++ b/sdk/src/ui/vulkan/vulkan_mem_alloc.cpp
+@@ -13,9 +13,26 @@
+ #define VMA_IMPLEMENTATION
+ #include <cstring>
+ 
++#include <rex/cvar.h>
+ #include <rex/logging.h>
+ #include <rex/ui/vulkan/mem_alloc.h>
+ 
++// Size of the memory blocks the allocator asks the driver for. 0 keeps the allocator's own default (256 MiB when the heap is
++// larger than 1 GiB). On the Switch every block is process memory: four 256 MiB blocks held 1 GiB for about 700 MiB of textures
++// in a 73 minute session (hardware log), so a smaller size follows the real use more closely. Read once, at start.
++// Hardware, 48 minute test: 64 MiB blocks ended with the process 260 MiB lower than 256 MiB blocks (2.43 against 2.69 GiB of a ~3.2 GiB
++// heap) at the same frame rate; the blocks hold 1.26 GiB for 1.17 GiB of live allocations. (The cvar macro pastes its default, so
++// the two defaults are two definitions, not a macro.)
++#if defined(__SWITCH__)
++REXCVAR_DEFINE_INT32(vulkan_vma_block_mb, 64, "Vulkan",
++                     "Memory block size for the GPU allocator in MiB (0 = allocator default, 256 MiB on large heaps; 64 on the Switch)")
++    .range(0, 1024);
++#else
++REXCVAR_DEFINE_INT32(vulkan_vma_block_mb, 0, "Vulkan",
++                     "Memory block size for the GPU allocator in MiB (0 = allocator default, 256 MiB on large heaps; 64 on the Switch)")
++    .range(0, 1024);
++#endif
++
+ namespace rex {
+ namespace ui {
+ namespace vulkan {
+@@ -85,6 +102,10 @@ VmaAllocator CreateVmaAllocator(const VulkanDevice* const vulkan_device,
+   allocator_create_info.pVulkanFunctions = &vma_vulkan_functions;
+   allocator_create_info.instance = vulkan_instance->instance();
+   allocator_create_info.vulkanApiVersion = vulkan_device->properties().apiVersion;
++  if (const int32_t block_mb = REXCVAR_GET(vulkan_vma_block_mb); block_mb > 0) {
++    allocator_create_info.preferredLargeHeapBlockSize = VkDeviceSize(block_mb) << 20;
++    REXLOG_INFO("VMA block size set to {} MiB", block_mb);
++  }
+   VmaAllocator allocator;
+   if (vmaCreateAllocator(&allocator_create_info, &allocator) != VK_SUCCESS) {
+     REXLOG_ERROR("Failed to create a Vulkan Memory Allocator instance");
 diff --git a/sdk/src/ui/vulkan/vulkan_presenter.cpp b/sdk/src/ui/vulkan/vulkan_presenter.cpp
 index 271e8b6..b7c7631 100644
 --- a/sdk/src/ui/vulkan/vulkan_presenter.cpp

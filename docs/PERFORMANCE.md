@@ -4,6 +4,82 @@ This page describes play sessions, not benchmarks. It shows what a user with an 
 read the numbers. Other consoles, scenes and clocks will differ, which is why the README asks for reports. The newest
 measurements come first; the earlier sessions follow and use different scenes.
 
+## 1.1.0: faster game code, less memory, Collector's catch-up (October 2026)
+
+Same console and clocks as below (CPU 1428 / GPU 768 / memory 1600 MHz, 80% with FSR, bloom on, full logging with
+`nfscarbon.report.toml`). The scene decides most of the frame rate, so everything is compared at the same number of draws per
+frame (buckets). A window is 5 seconds. One console, handheld.
+
+### Standard: plain memory reads (paired test, same race, order old-new-old-new)
+
+The translated game code used to read the game's memory with strict "volatile" reads. They are plain reads now, except in the
+543 of 72,459 functions that wait for another thread or use barriers, atomics or the global lock. Code size 46.5 MB to 42.5 MB.
+
+| Draws per frame | Pair 1: FPS old to new | render-thread ms old to new | Pair 2: FPS old to new | render-thread ms old to new |
+|---|---|---|---|---|
+| 300 to 1000 | 36.6 to 47.2 (5 / 6 windows) | 13.07 to 13.81 | 45.4 to 45.3 (5 / 3) | 15.46 to 12.02 |
+| 1000 to 1500 | 38.6 to 39.6 | 8.86 to 7.47 | 39.0 to 40.4 | 8.87 to 7.56 |
+| 1500 to 2000 | 33.5 to 35.1 | 10.09 to 8.29 | 34.8 to 34.3 | 9.66 to 8.50 |
+| 2000 to 2500 | 28.9 to 28.7 (10 / 5) | 12.85 to 11.84 | 29.7 to 30.4 (3 / 6) | 12.09 to 11.40 |
+| 2500 and more | 25.0 to 24.4 (7 / 4) | 13.20 to 13.18 | 23.7 to 24.8 (5 / 6) | 15.23 to 8.35 |
+| Weighted gain | FPS +3.5%, render thread +16.5% | | FPS +1.3%, render thread +13.5% | |
+
+Median FPS 34.2 to 37.0 (pair 1) and 36.6 to 36.9 (pair 2). Process CPU in busy windows (percent of the three usable cores,
+300 = all): 270 / 260 before, 240 / 249 after. Windows with more than 50 audio requests without data: 7 of 53 before, 2 of 55
+after. Frames over 33.3 ms: 29.4% / 24.2% before, 21.5% / 24.4% after (noisy). No crash or exception line in any of the four
+runs. The frame rate moves little because the GPU is the limit in crowded scenes (24 to 28 ms of a 28 to 30 ms frame); the
+saving is CPU time, which the audio mixer and the render thread share.
+
+### Both editions: GPU memory in 64 MB steps
+
+| | 1.0.0 behaviour (256 MB blocks) | 1.1.0 (64 MB blocks) |
+|---|---|---|
+| Session | 73 minutes | 48 minutes |
+| Process memory (malloc in use) | 1563 to 2678 MB, maximum 2712 MB, in four jumps of 260 to 300 MB | 1354 to 2421 MB, maximum 2446 MB, in steps of about 65 MB |
+| Share of the allocator's blocks in use | not measured | 92% (1259 MiB in 30 blocks for 1143 to 1175 MiB of live allocations) |
+| Median FPS / frames over 33.3 ms | 38.5 / 24.0% | 39.7 / 20.1% (different scenes) |
+
+The heap limit is about 3.2 GB. What remains after the change is real use: the texture cache fills toward its 704 MB budget, plus
+render targets, vertex arena and upload chunks. One frame of 1.1 to 1.25 seconds was seen in the middle of the 48-minute session
+(none in the older session except at start-up); its log line shows no texture upload, pipeline build or disk stall, so the
+cause is unknown. `vulkan_vma_block_mb = 0` restores the old step size.
+
+### Collector's Edition: the translation that Standard uses
+
+Compiled to assembly with the shipping flags (volatile reads in both, so only the translation differs), the 15 hottest game
+functions of the Standard Edition and their Collector's counterparts:
+
+| | 1.0.0 beta translation | 1.1.0 translation | Change |
+|---|---|---|---|
+| Instructions | 11,164 | 9,602 | -14% |
+| Memory reads | 2,199 | 1,836 | -17% |
+| Memory writes | 2,501 | 1,954 | -22% |
+| Code size (NRO text segment) | 52,969,472 bytes | 42,393,600 bytes | -20% |
+| Register save and restore helper calls in the code | more than 31,000 | 0 | |
+
+The new Collector's code has exactly the instruction counts of the Standard Edition in those functions. On the console, one
+34-minute session of the 1.1.0 beta (four intro movies, six races, a save; no crash, no freeze, no stall), compared with a
+Standard 1.1.0 session of 48 minutes at the same draws per frame:
+
+| Draws per frame | Standard 1.1.0 FPS (windows) | Collector's 1.1.0 FPS (windows) | Render thread ms per frame (Standard and Collector's) |
+|---|---|---|---|
+| 300 to 1000 | 53.0 (152) | 54.0 (141) | |
+| 1000 to 1500 | 40.7 (209) | 47.0 (167) | the Collector's windows are lighter scenes (GPU 20.6 against 23.5 ms): not comparable |
+| 1500 to 2000 | 35.3 (110) | 36.1 (41) | 7.87 and 7.72 |
+| 2000 to 2500 | 31.9 (35) | 31.1 (31) | 9.23 and 7.91 |
+| 2500 and more | 25.5 (58) | 26.9 (17) | 9.22 and 9.19 |
+
+The whole session: median 46.7 FPS (10th percentile 32.0, lowest 18.9), 93% of the windows at 30 FPS or more, 1% under 25 FPS,
+median 1193 draws per frame and up to 5133. Audio: 3 of 202 windows with more than 50 requests without data (worst 111).
+Process memory 1337 to 2443 MB (maximum 2455 MB). The only frames over 250 ms were two of 1.1 and 1.2 seconds within five
+seconds of the launch, one of 0.38 seconds while the GPU waited for the game and one of 0.27 seconds with 68 texture uploads.
+
+For comparison, the 1.0.0 beta had the main render pass at 6.2 ms against 4.6 ms on the Standard Edition and a whole render
+frame at 10.6 against 8.5 ms (October 23 builds), and 24 to 30 FPS in race wars against 31.
+
+Limits of the comparison: two different sessions on different scenes (not a paired test), 17 to 41 windows in the heavy
+buckets, one console. A controlled comparison of the 1.0.0 beta against the 1.1.0 beta (old-new-old-new on the same race) and a
+long soak test are still to be done. The numbers above come from the logs kept with the release candidates.
 ## Race wars, October 2026 builds (standard and Collector's)
 
 Race wars are the heaviest scenes: 13 to 16 cars, about 1900 draws per frame (up to 4500 to 5600 in the worst windows).

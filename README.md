@@ -6,9 +6,9 @@
 
 **Need for Speed: Carbon on the Nintendo Switch. Translated, not emulated.**
 
-![Standard Edition](https://img.shields.io/badge/Standard%20Edition-v1.0.0-brightgreen) ![Collector's Edition](https://img.shields.io/badge/Collector's%20Edition-v1.0.0--collectors--beta.1-orange) ![Platform](https://img.shields.io/badge/platform-Nintendo%20Switch%20(ARM64)-lightgrey) ![License](https://img.shields.io/badge/license-GPL--3.0-blue) [![Support me on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20me-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/ojojoj)
+![Standard Edition](https://img.shields.io/badge/Standard%20Edition-v1.1.0-brightgreen) ![Collector's Edition](https://img.shields.io/badge/Collector's%20Edition-v1.1.0--collectors--beta.1-orange) ![Platform](https://img.shields.io/badge/platform-Nintendo%20Switch%20(ARM64)-lightgrey) ![License](https://img.shields.io/badge/license-GPL--3.0-blue) [![Support me on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20me-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/ojojoj)
 
-[Overview](#overview) · [Screenshots](#screenshots) · [Install](#install) · [Performance](#performance) · [What's new](#whats-new-in-100) · [Known issues](#known-issues) · [Report a problem](#report-a-problem) · [Docs](#documentation) · [Credits](#credits)
+[Overview](#overview) · [Screenshots](#screenshots) · [Install](#install) · [Performance](#performance) · [What's new](#whats-new-in-110) · [Known issues](#known-issues) · [Report a problem](#report-a-problem) · [Docs](#documentation) · [Credits](#credits)
 
 </div>
 
@@ -21,12 +21,12 @@ There is no emulation layer between the game and the hardware. You need your own
 
 | | Standard Edition | Collector's Edition |
 |---|---|---|
-| Release | **1.0.0**, the first non-beta release | **1.0.0-collectors-beta.1**, beta |
+| Release | **1.1.0** | **1.1.0-collectors-beta.1**, beta |
 | Boot, menus, career, saves | Work | Work, fewer hours of testing |
-| Heaviest races (13 to 16 cars) | median **31 FPS**, 62% of the time at 30 FPS or more | **24 to 30 FPS** |
+| Heaviest races (13 to 16 cars) | median **31 FPS**, 62% of the time at 30 FPS or more (1.0.0; 1.1.0 adds 1 to 3.5%) | **Close to the Standard Edition at the same scene load** in one 34-minute test, can still be slower (1.0.0 beta: 24 to 30 FPS) |
 | Open roads, lighter races | 40 to 55 FPS | 45 to 55 FPS |
-| Cutscenes | Work (FFmpeg, verified against the game's own decoder) | Not covered by testing yet |
-| Audio | Clean in most windows; a heavy race start can still crackle | Same code, slightly worse in the heaviest races |
+| Cutscenes | Work (FFmpeg, verified against the game's own decoder) | The four intro movies ran without errors in the log; reports on the rest are welcome |
+| Audio | Clean in most windows; a heavy race start can still crackle | Same code; 3 of 202 windows with drop-outs in the latest test |
 | DLC | Up to 30 packs | Up to 30 packs |
 | Install folder | `switch/nfscarbon/` | `switch/nfscarbon-collectors/` |
 
@@ -81,8 +81,8 @@ Captured on a Switch in handheld mode at the reference clocks. The number in the
 
   Both tested dumps are the **USA (NTSC-U)** releases: the region flags in their executables are `0x000000FF`. Other
   editions and regions (PAL, NTSC-J) have not been tested and may crash or misbehave.
-- The release zip from the [Releases](../../releases) page: `nfscarbon-1.0.0.zip` for the Standard Edition,
-  `nfscarbon-collectors-1.0.0-beta.1.zip` for the Collector's Edition. Each contains the folder layout below.
+- The release zip from the [Releases](../../releases) page: `nfscarbon-1.1.0.zip` for the Standard Edition,
+  `nfscarbon-collectors-1.1.0-beta.1.zip` for the Collector's Edition. Each contains the folder layout below.
 
 The game files are not included and never will be.
 
@@ -145,7 +145,7 @@ rumble is on; set `input_vibracion = false` to turn it off.
 | Hold **L + R** and press | Action |
 |---|---|
 | Up | Debug overlay (FPS and counters) |
-| Right | Settings overlay |
+| Right | Settings overlay (opens on a short Quick settings page; "All settings" shows the full list) |
 | Left | Achievements list |
 
 ### Settings
@@ -160,7 +160,7 @@ rate (most at the race start). `carbon_gpu_bloom = false` saves about 4 ms of GP
 Handheld, 1428 / 768 / 1600 MHz, 80% with FSR, bloom on, 30 DLC packs installed. A window is the 5 seconds between two
 statistics lines of the renderer; "heavy" means race wars (13 to 16 cars, about 1900 draws per frame).
 
-| Windows with more than 300 draws | Standard | Collector's (beta) |
+| Windows with more than 300 draws (1.0.0 builds) | Standard | Collector's (beta) |
 |---|---|---|
 | FPS median / 10th / 90th percentile | 31.5 / 26.8 / 38.0 | 26.3 / 20.3 / 46.6 |
 | Lowest | 18.7 | 15.5 |
@@ -168,9 +168,34 @@ statistics lines of the renderer; "heavy" means race wars (13 to 16 cars, about 
 | Under 25 FPS | 8% | 42% |
 
 In the heaviest races the Standard Edition holds about 30 FPS; open roads and lighter races run 40 to 55 FPS. The Collector's
-Edition is slower there because its translated game code keeps registers in memory between calls. Audio requests that found no
+Edition (the 1.0.0 beta in the column above) was slower there because its translated game code kept registers in memory between
+calls; 1.1.0 changes that (below). Audio requests that found no
 data per 10 seconds went from 50 to 410 in nearly every race window to none in most windows. The full measurements, what was
 tried and did not help, and the older sessions are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+The table above is from the 1.0.0 builds. In 1.1.0 the Standard Edition gains 1 to 3.5% frame rate and 13 to 17% render-thread CPU
+time in paired tests, and the Collector's Edition came close to the Standard Edition's frame rate at the same scene load in a 34-minute
+test (36.1 against 35.3 FPS at 1500 to 2000 draws per frame, 31.1 against 31.9 at 2000 to 2500, 26.9 against 25.5 above 2500).
+One session on one console; the details and the limits of the comparison are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+## What's new in 1.1.0
+
+Changes since 1.0.0 (full list in [CHANGELOG.md](CHANGELOG.md)):
+
+- **Faster game code, both editions.** The game's own code now reads memory in a way the compiler can optimize. In two
+  back-to-back tests on the same race, the main rendering thread needed 13 to 17% less CPU time and the console's CPU was 5 to
+  10% less busy. The frame rate itself rose only 1 to 3.5%, because the GPU limits it in crowded scenes; the extra CPU room
+  showed up as fewer audio drop-outs (2 of 55 busy windows against 7 of 53).
+- **The Collector's Edition catches up.** Its game code was translated in a slow, safe way that kept every register in memory.
+  It now uses the same translation as the Standard Edition: 20% less code, 14% fewer instructions in the hottest functions, and
+  in a 34-minute test a frame rate close to the Standard Edition's at the same scene load (it was 5 to 10 FPS behind in crowded
+  races). It can still run behind the Standard Edition in some scenes, so it is recommended only for people willing to test.
+- **Less memory in long sessions.** GPU memory is now handed out in 64 MB steps instead of 256 MB steps: about 2.4 GB at the end
+  of a 48-minute session instead of about 2.7 GB.
+- **Easier reports.** Every log starts with a line that says which build wrote it.
+- **Quick settings page.** The in-game settings overlay (hold L+R, press Right) now opens on a short **Quick settings** page with Video (render resolution, upscaler, anisotropic filtering, bloom, texture detail, VSync), Audio (mute, audio buffer, buffer refill) and Controls (rumble, Xbox button layout) rows, each with a one-line help text; a `[restart]` tag marks the ones that apply after a restart. "All settings (advanced)" opens the old full list. "Save to config" writes `nfscarbon.toml` with only the settings that differ from the defaults; comments in the file are not kept, so back it up first.
+
+Still open: flickering shadows in crowded scenes and audio crackle at heavy race starts (see [Known issues](#known-issues)).
 
 ## What's new in 1.0.0
 
@@ -246,11 +271,17 @@ Removing a package from `dlc/` does **not** uninstall its extracted copy in `use
 - **Audio is much better but not perfect.** A heavy race start can still crackle for a few seconds: in the latest runs 4 of 23
   busy windows of 10 seconds had more than 50 audio requests without data (worst 135, median 1). The mixer needs about 3.8 ms of
   CPU per 5.3 ms block there, with no headroom, and the CPU is saturated.
-- **Frame rate** in race wars is about 30 FPS on the Standard Edition and 24 to 30 on the Collector's beta.
-- **Flashing shadows.** For a few frames, car shadows can turn into black patches next to a washed-out white road. It appears
-  only while the motion blur or tunnel vision effect is on, at speed (around 120 to 150 km/h) with strong light and many cars.
-  It is not caused by bloom or by the car reflection pass (both tested). Cause still unknown.
-- **Collector's Edition is a beta**: slower, and with fewer hours of testing.
+- **Frame rate** in race wars is about 30 FPS on the Standard Edition. The Collector's beta measured the same at equal scene load in
+  one test session (1.0.0 beta: 24 to 30 FPS).
+- **Flickering shadows.** In crowded scenes with many AI cars (race wars), shadows can flicker or turn into black patches next to a washed-out
+  white road for a few frames. Seen at speed (around 120 to 150 km/h) with strong light and the motion blur or tunnel vision
+  effect on. It is not caused by bloom or by the car reflection pass (both tested). Cause still unknown; both editions.
+- **A rare one-second pause.** Once in 48 minutes of testing the game stopped for about 1.2 seconds in the middle of a race; the
+  log shows no cause and the new 64 MB GPU memory steps are the main suspect. `vulkan_vma_block_mb = 0` in `nfscarbon.toml`
+  restores the old behaviour at the price of about 260 MB more memory.
+- **Collector's Edition is a beta.** Its new, faster translation has run for one 34-minute session on one console; long sessions,
+  cutscenes beyond the intro movies and every car and event have had few hours of play. Recommended only for people willing to test.
+- **Long sessions.** The longest session tested with 1.1.0 is 48 minutes.
 - **Achievements** are not confirmed. The SDK handles the unlock call, but no unlock has been seen in the logs.
 - A title-override host with a small memory budget can make a cutscene fail (the game waits for a thread that was never created
   and appears frozen); pick a host that leaves about 3.2 GB.

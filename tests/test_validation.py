@@ -56,6 +56,7 @@ class ValidationTests(unittest.TestCase):
 
     def test_nro_segments_and_elf_architecture(self):
         data = bytearray(0x3000)
+        data[0:4] = bytes.fromhex("20000014")  # crt0's entry branch
         data[0x10:0x14] = b"NRO0"
         struct.pack_into("<I", data, 0x18, len(data))
         for i in range(3):
@@ -78,6 +79,13 @@ class ValidationTests(unittest.TestCase):
         struct.pack_into("<HHH", elf, 52, 64, 56, 1)
         struct.pack_into("<II6Q", elf, 64, 1, 5, 0x1000, 0, 0, 0x1000, 0x1000, 0x1000)
         return elf
+
+    def test_nro_with_code_before_crt0_is_rejected(self):
+        data = bytearray(0x3000)
+        data[0:4] = bytes.fromhex("fd7baaa9")  # a function prologue where the entry branch must be
+        data[0x10:0x14] = b"NRO0"
+        with self.assertRaises(ValueError):
+            validate_nro(bytes(data))
 
     def test_elf_program_headers_and_entry(self):
         cases = ((32, "<Q", 0xFFFFFFFF), (56, "<H", 0), (64 + 32, "<Q", 0x3000),

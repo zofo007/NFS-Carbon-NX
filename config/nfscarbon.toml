@@ -40,3 +40,6 @@ audio_xma_profile = false
 
 # Controller rumble (vibration) is on. Each rumble update is an IPC call to the Switch; false turns it off.
 input_vibracion = true
+# Other racers and traffic N model steps lower (0-3, 0 = game default); your car and menu cars are never touched. Log: [car-lod].
+# carbon_ai_car_lod_bias = 1   # 0 = off (default). 1+ = level 2 for other racers/traffic; little FPS effect measured
+carbon_gpu_bloom = true
