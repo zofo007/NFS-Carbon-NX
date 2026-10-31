@@ -61,6 +61,21 @@ void IdentityStable() {
   CHECK(fl::MakeIdentity(7).xuid != fl::MakeIdentity(8).xuid);
 }
 
+void OnlineIdBytes() {
+  const fl::Identity id = fl::MakeIdentity(5);
+  const auto bytes = fl::OnlineId(id);
+  uint64_t round_trip = 0;
+  for (int i = 7; i >= 0; --i) {
+    round_trip = (round_trip << 8) | bytes[i];
+  }
+  CHECK(round_trip == id.machine_id);
+  for (size_t i = 8; i < bytes.size(); ++i) {
+    CHECK(bytes[i] == 0);
+  }
+  CHECK(fl::kFakeIpv4 == 0x0A000002);
+  CHECK(fl::kFakeOnlinePort == 3074);
+}
+
 void SeedPersists(const fs::path& folder) {
   const fs::path file = folder / "online_identity.bin";
   const uint64_t first = fl::LoadOrCreateSeed(file);
@@ -92,6 +107,7 @@ int main(int argc, char** argv) {
   OnReportsLive();
   IdentityShape();
   IdentityStable();
+  OnlineIdBytes();
   SeedPersists(folder);
   SeedRepairs(folder);
   std::cout << "fake_live: all checks passed\n";
