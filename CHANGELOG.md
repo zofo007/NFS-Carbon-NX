@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `online_fake_live` (off by default, experimental): the profile reports as signed in to Xbox Live so the online menus can open. See docs/CONFIG.md.
+
 ## 1.1.0 (Standard Edition)
 
 The game's own code runs faster and the process uses less memory in long sessions. There is nothing to change in your

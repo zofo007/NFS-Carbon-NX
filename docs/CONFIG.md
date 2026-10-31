@@ -22,6 +22,12 @@ editing. The release file ships the values below under "Shipped"; everything els
 | `carbon_cube_interval` | `30` | Runs the car cube-reflection pass once every 30 frames instead of every frame (about 0.1 ms instead of 2.4 ms per frame) |
 | `carbon_gpu_bloom` | `true` | Bloom on. `false` saves about 4 ms of GPU time per frame in a crowded race |
 
+## Online (experimental)
+
+| Setting | Default | Effect |
+|---|---|---|
+| `online_fake_live` | `false` | `true` makes the game see a profile signed in to Xbox Live, with online privileges and a live network link, so the online menus open. The profile gets a made-up gamertag and XUID, generated once and kept in `user/online_identity.bin`. Nothing connects to any server yet. |
+
 ## Quality and speed
 
 | Setting | Default | Effect |

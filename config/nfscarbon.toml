@@ -35,6 +35,9 @@ audio_xma_profile = false
 # free for new threads (cutscenes froze when none was left). 16 = old behaviour.
 # thread_host_stack_mib = 8
 
+# Online (experimental): pretend the profile is signed in to Xbox Live so the online menus open. Off by default.
+# online_fake_live = false
+
 # Texture memory (MiB) above which the least recently used textures are freed. Default 704 on the Switch.
 # carbon_gpu_texture_budget_mb = 704
 
