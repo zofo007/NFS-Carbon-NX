@@ -109,6 +109,18 @@ void OnlineCallNames() {
   static_assert(fl::IsOnlineCallName("__imp__NetDll_connect"));
 }
 
+void InitialNotifications() {
+  const auto notes = fl::InitialNotifications();
+  CHECK(notes.size() == 3);
+  CHECK(notes[0].id == 0x0000000A && notes[0].param == 1);            // XN_SYS_SIGNINCHANGED, user 0
+  CHECK(notes[1].id == 0x02000001 && notes[1].param == 0x001510F0);   // connection established
+  CHECK(notes[2].id == 0x02000003 && notes[2].param == 1);            // link state: up
+  // A listener only gets an id whose area bit is in its mask; the Live ids belong to area 1 (0x2).
+  CHECK(((notes[1].id >> 25) & 0x3F) == 1);
+  CHECK(((notes[2].id >> 25) & 0x3F) == 1);
+  CHECK(((notes[0].id >> 25) & 0x3F) == 0);  // system area (0x1)
+}
+
 void SeedPersists(const fs::path& folder) {
   const fs::path file = folder / "online_identity.bin";
   const uint64_t first = fl::LoadOrCreateSeed(file);
@@ -143,6 +155,7 @@ int main(int argc, char** argv) {
   OnlineIdBytes();
   EaServiceHosts();
   OnlineCallNames();
+  InitialNotifications();
   SeedPersists(folder);
   SeedRepairs(folder);
   std::cout << "fake_live: all checks passed\n";

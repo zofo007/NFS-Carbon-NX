@@ -329,10 +329,10 @@ index 9b9cf9e..d853a94 100644
  
 diff --git a/sdk/include/rex/system/xam/fake_live.h b/sdk/include/rex/system/xam/fake_live.h
 new file mode 100644
-index 0000000..68eb181
+index 0000000..1bc5e13
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/fake_live.h
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,197 @@
 +#pragma once
 +
 +// Values the kernel reports when the profile is made to look signed in to Xbox Live.
@@ -427,6 +427,21 @@ index 0000000..68eb181
 +    }
 +  }
 +  return false;
++}
++
++struct Notification {
++  uint32_t id;
++  uint32_t param;
++};
++
++// What a signed-in, Live-connected console has already told every title that listens: the first user
++// is signed in (XN_SYS_SIGNINCHANGED, a bitmask of users), the Live connection is established
++// (XN_LIVE_CONNECTIONCHANGED with XONLINE_S_LOGON_CONNECTION_ESTABLISHED) and the link is up
++// (XN_LIVE_LINK_STATE_CHANGED). The game waits for these before it looks up a server, and a new
++// listener only receives what is queued after it exists, so each new listener gets them at creation.
++// Values are from memory of the Xbox 360 SDK headers; the hardware run is what confirms them.
++inline std::array<Notification, 3> InitialNotifications() {
++  return {{{0x0000000A, 1}, {0x02000001, 0x001510F0}, {0x02000003, 1}}};
 +}
 +
 +// Address the title reports for itself: 10.0.0.2 (host order), Live's usual port 3074.
@@ -2117,6 +2132,25 @@ index 58e36a4..82e0cfe 100644
  REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
+diff --git a/sdk/src/kernel/xam/xam_notify.cpp b/sdk/src/kernel/xam/xam_notify.cpp
+index 9abcef6..c93d792 100644
+--- a/sdk/src/kernel/xam/xam_notify.cpp
++++ b/sdk/src/kernel/xam/xam_notify.cpp
+@@ -33,6 +33,14 @@ uint32_t xeXamNotifyCreateListener(uint64_t mask, uint32_t is_system, uint32_t m
+   auto listener = object_ref<XNotifyListener>(new XNotifyListener(REX_KERNEL_STATE()));
+   listener->Initialize(mask, max_version);
+ 
++  // With online_fake_live on, tell the new listener what a signed-in, Live-connected console
++  // already announced (the game waits for the Live connection before it looks up a server).
++  if (REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    for (const auto& note : fake_live::InitialNotifications()) {
++      listener->EnqueueNotification(XNotificationID(note.id), note.param);
++    }
++  }
++
+   // Handle ref is incremented, so return that.
+   uint32_t handle = listener->handle();
+ 
 diff --git a/sdk/src/kernel/xam/xam_user.cpp b/sdk/src/kernel/xam/xam_user.cpp
 index 8778066..9fef1b1 100644
 --- a/sdk/src/kernel/xam/xam_user.cpp
