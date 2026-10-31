@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Added
-- `online_fake_live` (off by default, experimental, not yet tried on hardware): the profile reports as signed in to Xbox Live so the online menus can open. Saves are not affected. See docs/CONFIG.md.
+- `online_fake_live` (off by default, experimental): the profile reports as signed in to Xbox Live so the online menu can be entered; the game then tries to reach EA's servers, which no longer answer. Saves are not affected. Also fixes `XamEnumerate` returning an uninitialized item count when the handle is invalid. See docs/CONFIG.md.
 
 ## 1.1.0 (Standard Edition)
 

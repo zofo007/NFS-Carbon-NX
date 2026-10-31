@@ -1700,6 +1700,30 @@ index 78734b4..454f1ad 100644
          auto item = e->AppendItem();
          *item = content_data;
        }
+diff --git a/sdk/src/kernel/xam/xam_enum.cpp b/sdk/src/kernel/xam/xam_enum.cpp
+index 9dcab94..0faf4a3 100644
+--- a/sdk/src/kernel/xam/xam_enum.cpp
++++ b/sdk/src/kernel/xam/xam_enum.cpp
+@@ -73,7 +73,9 @@ uint32_t xeXamEnumerate(uint32_t handle, uint32_t flags, mapped_void buffer_ptr,
+ 
+ u32 XamEnumerate_entry(u32 handle, u32 flags, mapped_void buffer, u32 buffer_length,
+                        mapped_u32 items_returned, ppc_ptr_t<XAM_OVERLAPPED> overlapped) {
+-  uint32_t dummy;
++  // Zero it: xeXamEnumerate returns early on a bad handle without writing the count, and the
++  // game then walked that many entries off the end of its stack (found with online_fake_live).
++  uint32_t dummy = 0;
+   auto result =
+       xeXamEnumerate(handle, flags, buffer, buffer_length,
+                      !overlapped.guest_address() ? &dummy : nullptr, overlapped.guest_address());
+@@ -85,6 +87,8 @@ u32 XamEnumerate_entry(u32 handle, u32 flags, mapped_void buffer, u32 buffer_len
+ 
+ u32 XamCreateEnumeratorHandle_entry(u32 unk1, u32 unk2, u32 unk3, u32 unk4, u32 unk5, u32 unk6,
+                                     u32 unk7, u32 unk8) {
++  REXKRNL_WARN("XamCreateEnumeratorHandle({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) not implemented",
++               unk1, unk2, unk3, unk4, unk5, unk6, unk7, unk8);
+   return X_ERROR_INVALID_PARAMETER;
+ }
+ 
 diff --git a/sdk/src/kernel/xam/xam_misc.cpp b/sdk/src/kernel/xam/xam_misc.cpp
 index ff6cb56..a7b6b87 100644
 --- a/sdk/src/kernel/xam/xam_misc.cpp
@@ -1719,10 +1743,35 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..33d7d5b 100644
+index 58e36a4..e790b34 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
-@@ -436,6 +436,18 @@ struct XnAddrStatus {
+@@ -12,6 +12,7 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <atomic>
+ #include <cstring>
+ 
+ #if REX_PLATFORM_MAC
+@@ -50,6 +51,16 @@ namespace xam {
+ using namespace rex::system;
+ using namespace rex::system::xam;
+ 
++// Hardware-run trace for online_fake_live: the first few answers of each call are logged at warn
++// level, which is flushed at once, so they reach the log even if the game crashes right after.
++#define FAKE_LIVE_TRACE(...)                    \
++  do {                                          \
++    static std::atomic<int> trace_count{0};     \
++    if (trace_count.fetch_add(1) < 5) {         \
++      REXKRNL_WARN(__VA_ARGS__);                \
++    }                                           \
++  } while (0)
++
+ // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
+ enum {
+   XNCALLER_INVALID = 0x0,
+@@ -436,6 +447,19 @@ struct XnAddrStatus {
  };
  
  u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
@@ -1735,13 +1784,14 @@ index 58e36a4..33d7d5b 100644
 +    std::memcpy(addr_ptr->abEnet, identity.mac, sizeof(addr_ptr->abEnet));
 +    const auto online_id = fake_live::OnlineId(identity);
 +    std::memcpy(addr_ptr->abOnline, online_id.data(), online_id.size());
++    FAKE_LIVE_TRACE("fake Live: XNetGetTitleXnAddr -> status {:#x}", fake_live::XnAddrStatus(true));
 +    return fake_live::XnAddrStatus(true);
 +  }
 +
    // Just return a loopback address atm.
    addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
    addr_ptr->inaOnline.s_addr = 0;
-@@ -505,10 +517,25 @@ struct XEthernetStatus {
+@@ -505,10 +529,36 @@ struct XEthernetStatus {
    static const uint32_t XNET_ETHERNET_LINK_HALF_DUPLEX = 0x10;
  };
  
@@ -1752,23 +1802,34 @@ index 58e36a4..33d7d5b 100644
 +  if (machine_id_ptr && user_profile->fake_live()) {
 +    *machine_id_ptr = user_profile->fake_identity().machine_id;
 +  }
++  if (user_profile->fake_live()) {
++    FAKE_LIVE_TRACE("fake Live: XNetLogonGetMachineID -> 0");
++  }
    return 0;
  }
  
 +// The argument is a service category (the game passes 2 and 5) and the result goes into the same
 +// request. Off: hand the argument back, as the old stub did. On: the game's own title id (a guess).
 +u32 XNetLogonGetTitleID_entry(u32 service) {
-+  return REX_KERNEL_STATE()->user_profile()->fake_live() ? 0x454107EC : service;
++  if (REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    FAKE_LIVE_TRACE("fake Live: XNetLogonGetTitleID({}) -> 0x454107EC", service);
++    return 0x454107EC;
++  }
++  return service;
 +}
 +
 +u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
-+  return fake_live::EthernetLinkStatus(REX_KERNEL_STATE()->user_profile()->fake_live());
++  const bool live = REX_KERNEL_STATE()->user_profile()->fake_live();
++  if (live) {
++    FAKE_LIVE_TRACE("fake Live: XNetGetEthernetLinkStatus -> {:#x}", fake_live::EthernetLinkStatus(true));
++  }
++  return fake_live::EthernetLinkStatus(live);
 +}
 +
  u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle, mapped_u32 pdns) {
    // TODO(gibbed): actually implement this
    if (pdns) {
-@@ -963,6 +990,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+@@ -963,6 +1013,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
             rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
@@ -1778,10 +1839,35 @@ index 58e36a4..33d7d5b 100644
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
 diff --git a/sdk/src/kernel/xam/xam_user.cpp b/sdk/src/kernel/xam/xam_user.cpp
-index 8778066..b352212 100644
+index 8778066..9fef1b1 100644
 --- a/sdk/src/kernel/xam/xam_user.cpp
 +++ b/sdk/src/kernel/xam/xam_user.cpp
-@@ -50,11 +50,11 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
+@@ -12,6 +12,7 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <atomic>
+ #include <cstring>
+ 
+ #include <rex/cvar.h>
+@@ -30,6 +31,16 @@
+ 
+ REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
+ 
++// Hardware-run trace for online_fake_live: the first few answers of each call are logged at warn
++// level, which is flushed at once, so they reach the log even if the game crashes right after.
++#define FAKE_LIVE_TRACE(...)                    \
++  do {                                          \
++    static std::atomic<int> trace_count{0};     \
++    if (trace_count.fetch_add(1) < 5) {         \
++      REXKRNL_WARN(__VA_ARGS__);                \
++    }                                           \
++  } while (0)
++
+ namespace rex {
+ namespace kernel {
+ namespace xam {
+@@ -50,11 +61,11 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
        auto type = user_profile->type() & type_mask;
        if (type & (2 | 4)) {
          // maybe online profile?
@@ -1795,7 +1881,17 @@ index 8778066..b352212 100644
          result = X_E_SUCCESS;
        }
      }
-@@ -97,9 +97,9 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
+@@ -71,6 +82,9 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
+     if (user_index == 0) {
+       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+       signin_state = user_profile->signin_state();
++      if (user_profile->fake_live()) {
++        FAKE_LIVE_TRACE("fake Live: XamUserGetSigninState(0) -> {}", signin_state);
++      }
+     }
+   }
+   return signin_state;
+@@ -97,9 +111,9 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
    }
  
    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
@@ -1807,7 +1903,7 @@ index 8778066..b352212 100644
    return X_E_SUCCESS;
  }
  
-@@ -113,7 +113,7 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
+@@ -113,7 +127,7 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
    }
  
    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
@@ -1816,7 +1912,7 @@ index 8778066..b352212 100644
    rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
    return X_E_SUCCESS;
  }
-@@ -132,7 +132,7 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
+@@ -132,7 +146,7 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
    }
  
    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
@@ -1825,7 +1921,7 @@ index 8778066..b352212 100644
    rex::string::copy_and_swap_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
    return X_E_SUCCESS;
  }
-@@ -156,7 +156,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
+@@ -156,7 +170,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
      assert_not_null(xuids);
      // TODO(gibbed): allow proper lookup of arbitrary XUIDs
      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
@@ -1834,7 +1930,7 @@ index 8778066..b352212 100644
      // TODO(gibbed): we assert here, but in case a title passes xuid_count > 1
      // until it's implemented for release builds...
      xuid_count = 1;
-@@ -264,7 +264,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
+@@ -264,7 +278,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
      std::memset(out_setting, 0, sizeof(X_USER_PROFILE_SETTING));
      out_setting->from = !setting || !setting->is_set ? 0 : setting->is_title_specific() ? 2 : 1;
      if (xuids) {
@@ -1843,7 +1939,7 @@ index 8778066..b352212 100644
      } else {
        out_setting->user_index = static_cast<uint32_t>(user_index);
      }
-@@ -382,8 +382,10 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value)
+@@ -382,8 +396,14 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value)
      }
    }
  
@@ -1853,10 +1949,14 @@ index 8778066..b352212 100644
 +  // the first user is granted the online privileges instead.
 +  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
 +  *out_value = rex::system::xam::fake_live::PrivilegeValue(user_profile->fake_live(), mask);
++  if (user_profile->fake_live()) {
++    FAKE_LIVE_TRACE("fake Live: XamUserCheckPrivilege({:#x}, {}) -> {}", user_index, mask,
++                    static_cast<uint32_t>(*out_value));
++  }
    return X_ERROR_SUCCESS;
  }
  
-@@ -598,6 +600,8 @@ class XStaticAchievementEnumerator : public XEnumerator {
+@@ -598,6 +618,8 @@ class XStaticAchievementEnumerator : public XEnumerator {
  u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 xuid, u32 flags,
                                               u32 offset, u32 count, mapped_u32 buffer_size_ptr,
                                               mapped_u32 handle_ptr) {
@@ -2708,10 +2808,10 @@ index 78826a6..e715bb3 100644
  
  }  // namespace xam
 diff --git a/sdk/src/system/xam/user_profile.cpp b/sdk/src/system/xam/user_profile.cpp
-index a77f5e6..bbeb384 100644
+index a77f5e6..f5dba70 100644
 --- a/sdk/src/system/xam/user_profile.cpp
 +++ b/sdk/src/system/xam/user_profile.cpp
-@@ -13,14 +13,28 @@
+@@ -13,14 +13,30 @@
  
  #include <fmt/format.h>
  
@@ -2731,10 +2831,12 @@ index a77f5e6..bbeb384 100644
 +  if (!REXCVAR_GET(online_fake_live)) {
 +    return;
 +  }
++  REXSYS_WARN("fake Live: setting is on, loading identity from {}", user_data_root.string());
 +  const auto seed = fake_live::LoadOrCreateSeed(user_data_root / "online_identity.bin");
 +  fake_identity_ = fake_live::MakeIdentity(seed);
 +  fake_live_ = true;
-+  REXSYS_INFO("fake Live on: {} {:016x}", online_name(), online_xuid());
++  // Warn level on purpose: it is flushed at once, so it survives a crash.
++  REXSYS_WARN("fake Live on: {} {:016x}", online_name(), online_xuid());
 +}
 +
  UserProfile::UserProfile() {

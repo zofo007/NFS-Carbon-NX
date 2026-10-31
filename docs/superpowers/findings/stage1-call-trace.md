@@ -35,11 +35,24 @@ Both appear in the same function (generated `nfscarbon_recomp.125.cpp` near line
 5. The next step (`sub_829182E0`) continues building the request; this is the first thing Stage 2 should look at,
    because it likely produces the `/xuacs/...` or `/xstats/...` HTTP calls the game's strings mention.
 
-## Runtime: to be filled in after the first run
+## Runtime: hardware runs on 2026-10-31 (Standard, 1.1.0 plus the online patch)
 
-Please run with `online_fake_live = true` and `log_level = "info"`, open the online entry in the main menu, and send
-the log. What to look for, in this order:
+**Run 1 (crash at launch).** `fake Live on: Racer8236 0009f4eb2ae72e16` appeared, the game read sign-in state 2, then
+crashed 16 ms later on a worker thread. The crash log put it in a game `strstr` called from `sub_82937B00`, a function
+that lists entries from a private enumerator in a 2080-byte stack buffer (10 entries of 208 bytes). The port rejects
+that enumerator, and `XamEnumerate` then returned an **uninitialized** item count on the bad handle, so the game walked
+off the end of its stack. Fixed in `xam_enum.cpp` (`dummy = 0`). Only reachable when signed in to Live, which is why the
+control run (setting off) booted fine.
 
-- `fake Live on: Racer#### <xuid>` at startup (the fake identity is active).
-- `STUB` warnings naming `Xam`, `XNet`, `NetDll` or `XSession` calls, in the order they appear.
-- Whether the online screen opened, or which message appeared instead.
+**Run 2 (no crash, about 3 minutes).** The owner reached the online entry, it was clickable, and the game tried to
+connect to EA's servers. Milestone 1 is met. From the log:
+
+- The game polls `XNetGetEthernetLinkStatus` about every 30 s and gets `0x0B`.
+- `XamCreateEnumeratorHandle(0xffffffff, 0xfc, 0x58039, 0x5803a, 0xd4, 0xa, 0x0, ptr)` is called and rejected (seen at
+  17:25:47, 17:26:32, 17:27:40, 17:27:51). `0xd4` = 212 bytes per entry and `0xa` = 10 entries per call. **Guess:** a
+  friends-list enumerator (the size is close to an `XONLINE_FRIEND` record).
+- `NetDll_XNetUnregisterKey` is an unimplemented stub, called right before 3 of the 4 enumerator calls.
+- No `XamUserCheckPrivilege`, `XNetLogonGetMachineID` or `XNetLogonGetTitleID` call was traced, so the title's own
+  logon path has not run.
+- The log does not name the host or port the game tried to reach: socket and DNS calls that are implemented do not log.
+  That is the first thing Stage 2 needs.
