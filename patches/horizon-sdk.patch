@@ -682,24 +682,27 @@ index ec37017..68d9484 100644
    std::unordered_map<uint32_t, Setting*> settings_;
    KernelState* kernel_state_ = nullptr;
 diff --git a/sdk/include/rex/system/xsocket.h b/sdk/include/rex/system/xsocket.h
-index a1b4443..7458a35 100644
+index a1b4443..f7b2c15 100644
 --- a/sdk/include/rex/system/xsocket.h
 +++ b/sdk/include/rex/system/xsocket.h
-@@ -103,6 +103,9 @@ class XSocket : public XObject {
+@@ -103,6 +103,11 @@ class XSocket : public XObject {
    X_STATUS IOControl(uint32_t cmd, uint8_t* arg_ptr);
  
    X_STATUS Connect(N_XSOCKADDR* name, int name_len);
 +  // The Winsock error code of the last failed Connect (0 if it did not fail), kept so the caller
 +  // can report "in progress" or "refused" instead of a generic failure.
 +  uint32_t last_connect_error() const { return last_connect_error_; }
++  // The raw host error (errno, or the Winsock code on Windows) behind it, for the hardware trace.
++  int last_native_errno() const { return last_native_errno_; }
    X_STATUS Bind(N_XSOCKADDR_IN* name, int name_len);
    X_STATUS Listen(int backlog);
    object_ref<XSocket> Accept(N_XSOCKADDR* name, int* name_len);
-@@ -135,6 +138,7 @@ class XSocket : public XObject {
+@@ -135,6 +140,8 @@ class XSocket : public XObject {
    Type type_;           // Type (DGRAM/Stream/etc)
    Protocol proto_;      // Protocol (TCP/UDP/etc)
    bool secure_ = true;  // Secure socket (encryption enabled)
 +  uint32_t last_connect_error_ = 0;
++  int last_native_errno_ = 0;
  
    bool bound_ = false;  // Explicitly bound to an IP address?
    uint16_t bound_port_ = 0;
@@ -2049,7 +2052,7 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..85766e5 100644
+index 58e36a4..695a0b2 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
 @@ -12,7 +12,9 @@
@@ -2289,7 +2292,7 @@ index 58e36a4..85766e5 100644
    XSocket* socket = new XSocket(REX_KERNEL_STATE());
    X_STATUS result =
        socket->Initialize(XSocket::AddressFamily((uint32_t)af), XSocket::Type((uint32_t)type),
-@@ -687,10 +856,33 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -687,10 +856,34 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
      return -1;
    }
  
@@ -2310,11 +2313,12 @@ index 58e36a4..85766e5 100644
 +  N_XSOCKADDR native_name(raw);
    X_STATUS status = socket->Connect(&native_name, namelen);
 +  if (fake_live) {
-+    FAKE_LIVE_TRACE_UP_TO(20, "fake Live: connect socket {} to {}:{} (asked {}) -> {} (winsock {})",
++    FAKE_LIVE_TRACE_UP_TO(20, "fake Live: connect socket {} to {}:{} (asked {}) -> {} (winsock {}, errno {})",
 +                          socket_handle, Ipv4ToString(sin->sin_addr),
 +                          static_cast<uint32_t>(patched.sin_port),
 +                          static_cast<uint32_t>(sin->sin_port),
-+                          XFAILED(status) ? "failed" : "ok", socket->last_connect_error());
++                          XFAILED(status) ? "failed" : "ok", socket->last_connect_error(),
++                          socket->last_native_errno());
 +  }
    if (XFAILED(status)) {
 -    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
@@ -2325,7 +2329,7 @@ index 58e36a4..85766e5 100644
      return -1;
    }
  
-@@ -903,6 +1095,10 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -903,6 +1096,10 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -2336,7 +2340,7 @@ index 58e36a4..85766e5 100644
    return socket->Send(buf_ptr, buf_len, flags);
  }
  
-@@ -915,6 +1111,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+@@ -915,6 +1112,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
      return -1;
    }
  
@@ -2350,7 +2354,7 @@ index 58e36a4..85766e5 100644
    N_XSOCKADDR_IN native_to(to_ptr);
    return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
  }
-@@ -963,6 +1166,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+@@ -963,6 +1167,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
             rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
@@ -2359,7 +2363,7 @@ index 58e36a4..85766e5 100644
  REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
-@@ -1030,12 +1235,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,12 +1236,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -2374,7 +2378,7 @@ index 58e36a4..85766e5 100644
  REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
  REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
  REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
-@@ -1048,7 +1253,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
+@@ -1048,7 +1254,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
  REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
  REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
  REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
@@ -3633,7 +3637,7 @@ index d358f39..e3bee26 100644
      switch (result) {
        case rex::thread::WaitResult::kSuccess:
 diff --git a/sdk/src/system/xsocket.cpp b/sdk/src/system/xsocket.cpp
-index 2d13ac8..6ee233b 100644
+index 2d13ac8..7aba757 100644
 --- a/sdk/src/system/xsocket.cpp
 +++ b/sdk/src/system/xsocket.cpp
 @@ -9,6 +9,7 @@
@@ -3644,21 +3648,85 @@ index 2d13ac8..6ee233b 100644
  #include <cstring>
  
  #include <rex/kernel/xam/module.h>
-@@ -103,8 +104,14 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
+@@ -100,17 +101,57 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
+   return X_STATUS_SUCCESS;
+ }
+ 
++#if !REX_PLATFORM_WIN32
++// The host's own sockaddr_in, built from the guest's address bytes (port, then IPv4 address, both
++// already in network order). Passing the guest's struct through breaks on platforms whose sockaddr
++// starts with a length byte and an 8-bit family, such as the Switch's BSD stack (the 16-bit family
++// reads as 0 and connect fails).
++static sockaddr_in HostSockaddrIn(const uint8_t* port_bytes, const uint8_t* address_bytes) {
++  sockaddr_in host{};
++#if defined(__SWITCH__)
++  host.sin_len = sizeof(host);
++#endif
++  host.sin_family = AF_INET;
++  std::memcpy(&host.sin_port, port_bytes, 2);
++  std::memcpy(&host.sin_addr, address_bytes, 4);
++  return host;
++}
++#endif
++
  X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
++#if REX_PLATFORM_WIN32
    int ret = connect(native_handle_, (sockaddr*)name, name_len);
++#else
++  const sockaddr_in host =
++      HostSockaddrIn(reinterpret_cast<const uint8_t*>(name->sa_data),
++                     reinterpret_cast<const uint8_t*>(name->sa_data) + 2);
++  int ret = connect(native_handle_, reinterpret_cast<const sockaddr*>(&host), sizeof(host));
++#endif
    if (ret < 0) {
 +#if REX_PLATFORM_WIN32
 +    last_connect_error_ = static_cast<uint32_t>(WSAGetLastError());
++    last_native_errno_ = static_cast<int>(last_connect_error_);
 +#else
++    last_native_errno_ = errno;
 +    last_connect_error_ = system::xam::fake_live::WinsockErrorFromErrno(errno);
 +#endif
      return X_STATUS_UNSUCCESSFUL;
    }
 +  last_connect_error_ = 0;
++  last_native_errno_ = 0;
  
    return X_STATUS_SUCCESS;
  }
+ 
+ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
++#if REX_PLATFORM_WIN32
+   int ret = bind(native_handle_, (sockaddr*)name, name_len);
++#else
++  const sockaddr_in host =
++      HostSockaddrIn(reinterpret_cast<const uint8_t*>(&name->sin_port),
++                     reinterpret_cast<const uint8_t*>(&name->sin_addr));
++  int ret = bind(native_handle_, reinterpret_cast<const sockaddr*>(&host), sizeof(host));
++#endif
+   if (ret < 0) {
+     return X_STATUS_UNSUCCESSFUL;
+   }
+@@ -221,12 +262,20 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
+   }
+   */
+ 
++#if REX_PLATFORM_WIN32
+   sockaddr_in nto;
+   if (to) {
+     nto.sin_addr.s_addr = to->sin_addr;
+     nto.sin_family = to->sin_family;
+     nto.sin_port = to->sin_port;
+   }
++#else
++  sockaddr_in nto{};
++  if (to) {
++    nto = HostSockaddrIn(reinterpret_cast<const uint8_t*>(&to->sin_port),
++                         reinterpret_cast<const uint8_t*>(&to->sin_addr));
++  }
++#endif
+ 
+   return sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
+                 to ? (sockaddr*)&nto : nullptr, to_len);
 diff --git a/sdk/src/system/xthread.cpp b/sdk/src/system/xthread.cpp
 index af02bc0..b2de00e 100644
 --- a/sdk/src/system/xthread.cpp
