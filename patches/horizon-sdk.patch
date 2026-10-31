@@ -234,6 +234,46 @@ index 0000000..f8d1430
 +}
 +
 +}  // namespace rex::filesystem
+diff --git a/sdk/include/rex/hook.h b/sdk/include/rex/hook.h
+index 4ce4f9b..a27dc93 100644
+--- a/sdk/include/rex/hook.h
++++ b/sdk/include/rex/hook.h
+@@ -17,6 +17,8 @@
+ 
+ #include <fmt/format.h>
+ 
++#include <atomic>
++
+ #include <rex/logging.h>
+ #include <rex/ppc/context.h>
+ #include <rex/ppc/function.h>
+@@ -68,9 +70,25 @@
+     ctx.r3.u64 = (value);                                                                 \
+   }
+ 
++namespace rex::ppc::detail {
++// Logs the first calls (name and r3..r6) of an online-related export while online_fake_live is on.
++void TraceOnlineCall(const char* name, const PPCContext& ctx, std::atomic<int>& count);
++}  // namespace rex::ppc::detail
++
++// Same as REX_HOOK, plus the online call trace for the networking and user exports. The name test
++// is a compile-time constant, so other exports pay nothing.
++#define REX_HOOK_TRACED(subroutine, function)                                   \
++  extern "C" REX_FUNC(subroutine) {                                             \
++    if constexpr (rex::system::xam::fake_live::IsOnlineCallName(#subroutine)) { \
++      static std::atomic<int> trace_count{0};                                   \
++      rex::ppc::detail::TraceOnlineCall(#subroutine, ctx, trace_count);         \
++    }                                                                           \
++    rex::ppc::HostToGuestFunction<function>(ctx, base);                         \
++  }
++
+ // Export: hook + register in global registry for kernel ordinal lookup.
+ #define REX_EXPORT(name, function) \
+-  REX_HOOK(name, function)         \
++  REX_HOOK_TRACED(name, function)  \
+   static rex::ppc::detail::PPCFuncRegistrar _ppc_reg_##name(#name, &name);
+ 
+ #define REX_EXPORT_STUB(name) \
 diff --git a/sdk/include/rex/system/kernel_state.h b/sdk/include/rex/system/kernel_state.h
 index 9b9cf9e..d853a94 100644
 --- a/sdk/include/rex/system/kernel_state.h
@@ -289,10 +329,10 @@ index 9b9cf9e..d853a94 100644
  
 diff --git a/sdk/include/rex/system/xam/fake_live.h b/sdk/include/rex/system/xam/fake_live.h
 new file mode 100644
-index 0000000..1373de3
+index 0000000..68eb181
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/fake_live.h
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,182 @@
 +#pragma once
 +
 +// Values the kernel reports when the profile is made to look signed in to Xbox Live.
@@ -362,6 +402,31 @@ index 0000000..1373de3
 +    }
 +  }
 +  return host.size() == kDomain.size() || host[host.size() - kDomain.size() - 1] == '.';
++}
++
++namespace detail {
++
++constexpr bool StartsWith(std::string_view text, std::string_view prefix) {
++  return text.size() >= prefix.size() && text.substr(0, prefix.size()) == prefix;
++}
++
++}  // namespace detail
++
++// Names of the kernel exports worth tracing on a hardware run with the fake on: networking and
++// user/session/notification calls, not content or file I/O.
++constexpr bool IsOnlineCallName(std::string_view name) {
++  constexpr std::string_view kPrefixes[] = {
++      "__imp__NetDll_",    "__imp__XNet",        "__imp__XNotify",     "__imp__XUser",
++      "__imp__XOnline",    "__imp__XLive",       "__imp__XSession",    "__imp__XamUser",
++      "__imp__XamShow",    "__imp__XamNotify",   "__imp__XamEnumerate", "__imp__XamSession",
++      "__imp__XamVoice",   "__imp__XamParty",    "__imp__XamLoader",
++  };
++  for (const std::string_view prefix : kPrefixes) {
++    if (detail::StartsWith(name, prefix)) {
++      return true;
++    }
++  }
++  return false;
 +}
 +
 +// Address the title reports for itself: 10.0.0.2 (host order), Live's usual port 3074.
@@ -3022,10 +3087,15 @@ index 78826a6..e715bb3 100644
  
  }  // namespace xam
 diff --git a/sdk/src/system/xam/user_profile.cpp b/sdk/src/system/xam/user_profile.cpp
-index a77f5e6..9281e73 100644
+index a77f5e6..0fdfc50 100644
 --- a/sdk/src/system/xam/user_profile.cpp
 +++ b/sdk/src/system/xam/user_profile.cpp
-@@ -13,14 +13,35 @@
+@@ -9,18 +9,57 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
+ #include <sstream>
  
  #include <fmt/format.h>
  
@@ -3042,6 +3112,22 @@ index a77f5e6..9281e73 100644
 +                      "when online_fake_live is on; empty means no redirect")
 +    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 +
++static std::atomic<bool> g_trace_online_calls{false};
++
++namespace rex::ppc::detail {
++void TraceOnlineCall(const char* name, const PPCContext& ctx, std::atomic<int>& count) {
++  if (!g_trace_online_calls.load(std::memory_order_relaxed)) {
++    return;
++  }
++  const int n = count.fetch_add(1);
++  if (n >= 40) {
++    return;
++  }
++  REXKRNL_WARN("fake Live: call {} #{} ({:#x}, {:#x}, {:#x}, {:#x})", name, n + 1, ctx.r3.u32,
++               ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
++}
++}  // namespace rex::ppc::detail
++
  namespace rex {
  namespace system {
  namespace xam {
@@ -3054,6 +3140,7 @@ index a77f5e6..9281e73 100644
 +  const auto seed = fake_live::LoadOrCreateSeed(user_data_root / "online_identity.bin");
 +  fake_identity_ = fake_live::MakeIdentity(seed);
 +  fake_live_ = true;
++  g_trace_online_calls = true;
 +  // Warn level on purpose: it is flushed at once, so it survives a crash.
 +  REXSYS_WARN("fake Live on: {} {:016x}", online_name(), online_xuid());
 +}

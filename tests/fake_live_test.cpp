@@ -90,6 +90,25 @@ void EaServiceHosts() {
   CHECK(fl::kDnsHostNotFound == 11001);
 }
 
+void OnlineCallNames() {
+  CHECK(fl::IsOnlineCallName("__imp__NetDll_socket"));
+  CHECK(fl::IsOnlineCallName("__imp__NetDll_XNetGetTitleXnAddr"));
+  CHECK(fl::IsOnlineCallName("__imp__XNetLogonGetMachineID"));
+  CHECK(fl::IsOnlineCallName("__imp__XamUserGetSigninState"));
+  CHECK(fl::IsOnlineCallName("__imp__XamUserReadProfileSettings"));
+  CHECK(fl::IsOnlineCallName("__imp__XamShowSigninUI"));
+  CHECK(fl::IsOnlineCallName("__imp__XamEnumerate"));
+  CHECK(fl::IsOnlineCallName("__imp__XNotifyGetNext"));
+  CHECK(fl::IsOnlineCallName("__imp__XSessionCreate"));
+  CHECK(!fl::IsOnlineCallName("__imp__XamContentCreate"));
+  CHECK(!fl::IsOnlineCallName("__imp__XamAlloc"));
+  CHECK(!fl::IsOnlineCallName("__imp__NtCreateFile"));
+  CHECK(!fl::IsOnlineCallName("__imp__KeQueryPerformanceFrequency"));
+  CHECK(!fl::IsOnlineCallName("NetDll_socket"));
+  CHECK(!fl::IsOnlineCallName(""));
+  static_assert(fl::IsOnlineCallName("__imp__NetDll_connect"));
+}
+
 void SeedPersists(const fs::path& folder) {
   const fs::path file = folder / "online_identity.bin";
   const uint64_t first = fl::LoadOrCreateSeed(file);
@@ -123,6 +142,7 @@ int main(int argc, char** argv) {
   IdentityStable();
   OnlineIdBytes();
   EaServiceHosts();
+  OnlineCallNames();
   SeedPersists(folder);
   SeedRepairs(folder);
   std::cout << "fake_live: all checks passed\n";
