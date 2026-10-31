@@ -1,5 +1,6 @@
 #include <rex/system/xam/fake_live.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -147,6 +148,20 @@ void ConnectStatusValues() {
   CHECK(fl::kConnectLost == 3);
 }
 
+void WinsockErrors() {
+  // What a Winsock caller sees for a failed connect: in progress for a non-blocking socket,
+  // refused, timed out, unreachable; anything else is a generic network failure.
+  CHECK(fl::WinsockErrorFromErrno(EINPROGRESS) == 10036);
+  CHECK(fl::WinsockErrorFromErrno(EWOULDBLOCK) == 10035);
+  CHECK(fl::WinsockErrorFromErrno(EALREADY) == 10037);
+  CHECK(fl::WinsockErrorFromErrno(ECONNREFUSED) == 10061);
+  CHECK(fl::WinsockErrorFromErrno(ETIMEDOUT) == 10060);
+  CHECK(fl::WinsockErrorFromErrno(ENETUNREACH) == 10051);
+  CHECK(fl::WinsockErrorFromErrno(EHOSTUNREACH) == 10065);
+  CHECK(fl::WinsockErrorFromErrno(EISCONN) == 10056);
+  CHECK(fl::WinsockErrorFromErrno(ENOENT) == 10050);  // WSAENETDOWN for anything unlisted
+}
+
 void SeedPersists(const fs::path& folder) {
   const fs::path file = folder / "online_identity.bin";
   const uint64_t first = fl::LoadOrCreateSeed(file);
@@ -184,6 +199,7 @@ int main(int argc, char** argv) {
   InitialNotifications();
   ServiceInfoBytes();
   ConnectStatusValues();
+  WinsockErrors();
   SeedPersists(folder);
   SeedRepairs(folder);
   std::cout << "fake_live: all checks passed\n";

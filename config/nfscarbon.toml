@@ -39,6 +39,8 @@ audio_xma_profile = false
 # online_fake_live = false
 # Host or IPv4 address that EA's service names (fesl.ea.com, ...) are redirected to. Empty = no redirect.
 # online_server_host = ""
+# TCP port to use instead of the game's own when it connects to online_server_host. 0 = the game's port.
+# online_server_port = 0
 
 # Texture memory (MiB) above which the least recently used textures are freed. Default 704 on the Switch.
 # carbon_gpu_texture_budget_mb = 704

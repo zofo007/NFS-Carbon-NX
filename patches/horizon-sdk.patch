@@ -381,10 +381,10 @@ index 9b9cf9e..d853a94 100644
  
 diff --git a/sdk/include/rex/system/xam/fake_live.h b/sdk/include/rex/system/xam/fake_live.h
 new file mode 100644
-index 0000000..6c061ee
+index 0000000..cfc4e70
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/fake_live.h
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,251 @@
 +#pragma once
 +
 +// Values the kernel reports when the profile is made to look signed in to Xbox Live.
@@ -393,6 +393,7 @@ index 0000000..6c061ee
 +#include <rex/filesystem/atomic_file.h>
 +
 +#include <array>
++#include <cerrno>
 +#include <cstdint>
 +#include <cstring>
 +#include <filesystem>
@@ -521,6 +522,33 @@ index 0000000..6c061ee
 +constexpr uint32_t kConnectPending = 1;
 +constexpr uint32_t kConnectConnected = 2;
 +constexpr uint32_t kConnectLost = 3;
++
++// The Winsock error code a caller sees for a native errno from connect: the game's sockets are
++// non-blocking, so "in progress" must read as WSAEINPROGRESS/WSAEWOULDBLOCK, not a generic failure.
++inline uint32_t WinsockErrorFromErrno(int native_errno) {
++  switch (native_errno) {
++    case EINPROGRESS:
++      return 10036;  // WSAEINPROGRESS
++    case EALREADY:
++      return 10037;  // WSAEALREADY
++    case ECONNREFUSED:
++      return 10061;  // WSAECONNREFUSED
++    case ETIMEDOUT:
++      return 10060;  // WSAETIMEDOUT
++    case ENETUNREACH:
++      return 10051;  // WSAENETUNREACH
++    case EHOSTUNREACH:
++      return 10065;  // WSAEHOSTUNREACH
++    case EISCONN:
++      return 10056;  // WSAEISCONN
++    default:
++      break;
++  }
++  if (native_errno == EWOULDBLOCK) {
++    return 10035;  // WSAEWOULDBLOCK
++  }
++  return 10050;  // WSAENETDOWN
++}
 +
 +// Address the title reports for itself: 10.0.0.2 (host order), Live's usual port 3074.
 +constexpr uint32_t kFakeIpv4 = 0x0A000002;
@@ -653,6 +681,28 @@ index ec37017..68d9484 100644
    std::vector<std::unique_ptr<Setting>> setting_list_;
    std::unordered_map<uint32_t, Setting*> settings_;
    KernelState* kernel_state_ = nullptr;
+diff --git a/sdk/include/rex/system/xsocket.h b/sdk/include/rex/system/xsocket.h
+index a1b4443..7458a35 100644
+--- a/sdk/include/rex/system/xsocket.h
++++ b/sdk/include/rex/system/xsocket.h
+@@ -103,6 +103,9 @@ class XSocket : public XObject {
+   X_STATUS IOControl(uint32_t cmd, uint8_t* arg_ptr);
+ 
+   X_STATUS Connect(N_XSOCKADDR* name, int name_len);
++  // The Winsock error code of the last failed Connect (0 if it did not fail), kept so the caller
++  // can report "in progress" or "refused" instead of a generic failure.
++  uint32_t last_connect_error() const { return last_connect_error_; }
+   X_STATUS Bind(N_XSOCKADDR_IN* name, int name_len);
+   X_STATUS Listen(int backlog);
+   object_ref<XSocket> Accept(N_XSOCKADDR* name, int* name_len);
+@@ -135,6 +138,7 @@ class XSocket : public XObject {
+   Type type_;           // Type (DGRAM/Stream/etc)
+   Protocol proto_;      // Protocol (TCP/UDP/etc)
+   bool secure_ = true;  // Secure socket (encryption enabled)
++  uint32_t last_connect_error_ = 0;
+ 
+   bool bound_ = false;  // Explicitly bound to an IP address?
+   uint16_t bound_port_ = 0;
 diff --git a/sdk/include/rex/system/xthread.h b/sdk/include/rex/system/xthread.h
 index a72911e..e0c27c2 100644
 --- a/sdk/include/rex/system/xthread.h
@@ -1999,7 +2049,7 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..8159f6a 100644
+index 58e36a4..85766e5 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
 @@ -12,7 +12,9 @@
@@ -2020,7 +2070,7 @@ index 58e36a4..8159f6a 100644
  #include <rex/kernel/xam/private.h>
  #include <rex/kernel/xboxkrnl/error.h>
  #include <rex/kernel/xboxkrnl/threading.h>
-@@ -37,19 +40,79 @@
+@@ -37,19 +40,80 @@
  // NOTE: must be included last as it expects windows.h to already be included.
  #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
  #include <winsock2.h>                    // NOLINT(build/include_order)
@@ -2034,6 +2084,7 @@ index 58e36a4..8159f6a 100644
  #endif
  
 +REXCVAR_DECLARE(std::string, online_server_host);
++REXCVAR_DECLARE(int32_t, online_server_port);
 +
 +#if defined(__SWITCH__)
 +// src/core/switch_network.c
@@ -2100,7 +2151,7 @@ index 58e36a4..8159f6a 100644
  // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
  enum {
    XNCALLER_INVALID = 0x0,
-@@ -436,6 +499,19 @@ struct XnAddrStatus {
+@@ -436,6 +500,19 @@ struct XnAddrStatus {
  };
  
  u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
@@ -2120,7 +2171,7 @@ index 58e36a4..8159f6a 100644
    // Just return a loopback address atm.
    addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
    addr_ptr->inaOnline.s_addr = 0;
-@@ -505,16 +581,100 @@ struct XEthernetStatus {
+@@ -505,16 +582,100 @@ struct XEthernetStatus {
    static const uint32_t XNET_ETHERNET_LINK_HALF_DUPLEX = 0x10;
  };
  
@@ -2223,21 +2274,58 @@ index 58e36a4..8159f6a 100644
      *pdns = dns_guest;
    }
    if (event_handle) {
-@@ -689,6 +849,13 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -579,6 +740,14 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
+ }
  
-   N_XSOCKADDR native_name(name);
+ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
++#if defined(__SWITCH__)
++  // The game connects by address, without a DNS lookup, so start the Switch socket service here
++  // as well (only when online_fake_live and online_server_host are set; it is started once).
++  if (REX_KERNEL_STATE()->user_profile()->fake_live() && !REXCVAR_GET(online_server_host).empty()) {
++    const unsigned int network_result = rex_switch_network_start();
++    FAKE_LIVE_TRACE("fake Live: Switch socket service start -> {:#x}", network_result);
++  }
++#endif
+   XSocket* socket = new XSocket(REX_KERNEL_STATE());
+   X_STATUS result =
+       socket->Initialize(XSocket::AddressFamily((uint32_t)af), XSocket::Type((uint32_t)type),
+@@ -687,10 +856,33 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+     return -1;
+   }
+ 
+-  N_XSOCKADDR native_name(name);
++  const bool fake_live = REX_KERNEL_STATE()->user_profile()->fake_live();
++  const XSOCKADDR* raw = name;
++  const auto* sin = reinterpret_cast<const XSOCKADDR_IN*>(raw);
++  // With online_server_port set, connections to the redirected server use that port (the 360 game
++  // dials its own login port, the PC server listens elsewhere).
++  XSOCKADDR_IN patched = *sin;
++  uint32_t server_address = 0;
++  const int32_t port_override = REXCVAR_GET(online_server_port);
++  if (fake_live && port_override > 0 && xeOnlineServerAddress(&server_address) &&
++      static_cast<uint32_t>(sin->sin_addr) == server_address) {
++    patched.sin_port = static_cast<uint16_t>(port_override);
++    raw = reinterpret_cast<const XSOCKADDR*>(&patched);
++  }
++  N_XSOCKADDR native_name(raw);
    X_STATUS status = socket->Connect(&native_name, namelen);
-+  if (REX_KERNEL_STATE()->user_profile()->fake_live()) {
-+    const XSOCKADDR* raw = name;
-+    const auto* sin = reinterpret_cast<const XSOCKADDR_IN*>(raw);
-+    FAKE_LIVE_TRACE_UP_TO(20, "fake Live: connect socket {} to {}:{} -> {}", socket_handle,
-+                          Ipv4ToString(sin->sin_addr), static_cast<uint32_t>(sin->sin_port),
-+                          XFAILED(status) ? "failed" : "ok");
++  if (fake_live) {
++    FAKE_LIVE_TRACE_UP_TO(20, "fake Live: connect socket {} to {}:{} (asked {}) -> {} (winsock {})",
++                          socket_handle, Ipv4ToString(sin->sin_addr),
++                          static_cast<uint32_t>(patched.sin_port),
++                          static_cast<uint32_t>(sin->sin_port),
++                          XFAILED(status) ? "failed" : "ok", socket->last_connect_error());
 +  }
    if (XFAILED(status)) {
-     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
+-    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
++    // With the fake on, report the real reason (in progress, refused, ...) as the game's
++    // non-blocking sockets expect; otherwise keep the generic code.
++    XThread::SetLastError(fake_live ? socket->last_connect_error()
++                                    : xboxkrnl::xeRtlNtStatusToDosError(status));
      return -1;
-@@ -903,6 +1070,10 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+   }
+ 
+@@ -903,6 +1095,10 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -2248,7 +2336,7 @@ index 58e36a4..8159f6a 100644
    return socket->Send(buf_ptr, buf_len, flags);
  }
  
-@@ -915,6 +1086,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+@@ -915,6 +1111,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
      return -1;
    }
  
@@ -2262,7 +2350,7 @@ index 58e36a4..8159f6a 100644
    N_XSOCKADDR_IN native_to(to_ptr);
    return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
  }
-@@ -963,6 +1141,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+@@ -963,6 +1166,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
             rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
@@ -2271,7 +2359,7 @@ index 58e36a4..8159f6a 100644
  REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
-@@ -1030,12 +1210,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,12 +1235,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -2286,7 +2374,7 @@ index 58e36a4..8159f6a 100644
  REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
  REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
  REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
-@@ -1048,7 +1228,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
+@@ -1048,7 +1253,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
  REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
  REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
  REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
@@ -3363,10 +3451,10 @@ index 78826a6..e715bb3 100644
  
  }  // namespace xam
 diff --git a/sdk/src/system/xam/user_profile.cpp b/sdk/src/system/xam/user_profile.cpp
-index a77f5e6..2d26819 100644
+index a77f5e6..908c8b8 100644
 --- a/sdk/src/system/xam/user_profile.cpp
 +++ b/sdk/src/system/xam/user_profile.cpp
-@@ -9,18 +9,66 @@
+@@ -9,18 +9,73 @@
   * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
@@ -3390,6 +3478,13 @@ index a77f5e6..2d26819 100644
 +    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 +
 +static std::atomic<bool> g_trace_online_calls{false};
++
++REXCVAR_DEFINE_INT32(online_server_port, 0, "Online",
++                     "When not 0, connections the game makes to the online_server_host address use this "
++                     "TCP port instead of the one the game picked (the 360 game dials 18220, the PC "
++                     "server listens on 18210)")
++    .range(0, 65535)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 +
 +namespace rex::ppc::detail {
 +void TraceOnlineCall(const char* name, const PPCContext& ctx, std::atomic<int>& count,
@@ -3537,6 +3632,33 @@ index d358f39..e3bee26 100644
      XThread::CheckTitleTermination();
      switch (result) {
        case rex::thread::WaitResult::kSuccess:
+diff --git a/sdk/src/system/xsocket.cpp b/sdk/src/system/xsocket.cpp
+index 2d13ac8..6ee233b 100644
+--- a/sdk/src/system/xsocket.cpp
++++ b/sdk/src/system/xsocket.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cerrno>
+ #include <cstring>
+ 
+ #include <rex/kernel/xam/module.h>
+@@ -103,8 +104,14 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
+ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
+   int ret = connect(native_handle_, (sockaddr*)name, name_len);
+   if (ret < 0) {
++#if REX_PLATFORM_WIN32
++    last_connect_error_ = static_cast<uint32_t>(WSAGetLastError());
++#else
++    last_connect_error_ = system::xam::fake_live::WinsockErrorFromErrno(errno);
++#endif
+     return X_STATUS_UNSUCCESSFUL;
+   }
++  last_connect_error_ = 0;
+ 
+   return X_STATUS_SUCCESS;
+ }
 diff --git a/sdk/src/system/xthread.cpp b/sdk/src/system/xthread.cpp
 index af02bc0..b2de00e 100644
 --- a/sdk/src/system/xthread.cpp
