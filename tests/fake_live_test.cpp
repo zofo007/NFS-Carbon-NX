@@ -124,6 +124,21 @@ void InitialNotifications() {
   CHECK(((notes[0].id >> 25) & 0x3F) == 0);  // system area (0x1)
 }
 
+void ServiceInfoBytes() {
+  CHECK(fl::kEaServiceId == 0x45410004);
+  CHECK(fl::kEaServicePort == 18210);
+  // XONLINE_SERVICE_INFO: id (be32), IPv4 (network order), port (be16), reserved (be16 = 0).
+  const auto bytes = fl::EncodeServiceInfo(fl::kEaServiceId, 0xC0A80001, 18210);
+  const uint8_t expected[12] = {0x45, 0x41, 0x00, 0x04, 0xC0, 0xA8, 0x00, 0x01,
+                                0x47, 0x22, 0x00, 0x00};
+  CHECK(bytes.size() == 12);
+  CHECK(std::memcmp(bytes.data(), expected, 12) == 0);
+  const auto other = fl::EncodeServiceInfo(0x16, 0x0A000002, 80);
+  const uint8_t expected_other[12] = {0x00, 0x00, 0x00, 0x16, 0x0A, 0x00, 0x00, 0x02,
+                                      0x00, 0x50, 0x00, 0x00};
+  CHECK(std::memcmp(other.data(), expected_other, 12) == 0);
+}
+
 void SeedPersists(const fs::path& folder) {
   const fs::path file = folder / "online_identity.bin";
   const uint64_t first = fl::LoadOrCreateSeed(file);
@@ -159,6 +174,7 @@ int main(int argc, char** argv) {
   EaServiceHosts();
   OnlineCallNames();
   InitialNotifications();
+  ServiceInfoBytes();
   SeedPersists(folder);
   SeedRepairs(folder);
   std::cout << "fake_live: all checks passed\n";

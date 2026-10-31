@@ -277,10 +277,10 @@ index 4ce4f9b..ac29d0f 100644
  
  #define REX_EXPORT_STUB(name) \
 diff --git a/sdk/include/rex/kernel/xam/private.h b/sdk/include/rex/kernel/xam/private.h
-index 3df4776..65b28ce 100644
+index 3df4776..1d5e30b 100644
 --- a/sdk/include/rex/kernel/xam/private.h
 +++ b/sdk/include/rex/kernel/xam/private.h
-@@ -10,9 +10,35 @@
+@@ -10,15 +10,45 @@
   * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
@@ -316,6 +316,16 @@ index 3df4776..65b28ce 100644
  namespace rex {
  namespace kernel {
  namespace xam {
+ 
+ bool xeXamIsUIActive();
+ 
++// The IPv4 address (as a plain integer, 192.168.0.1 = 0xC0A80001) of the host named by the
++// online_server_host setting; false when it is empty or does not resolve.
++bool xeOnlineServerAddress(uint32_t* ipv4_host_order);
++
+ rex::runtime::Export* RegisterExport_xam(rex::runtime::Export* export_entry);
+ 
+ // Registration functions, one per file.
 diff --git a/sdk/include/rex/system/kernel_state.h b/sdk/include/rex/system/kernel_state.h
 index 9b9cf9e..d853a94 100644
 --- a/sdk/include/rex/system/kernel_state.h
@@ -371,10 +381,10 @@ index 9b9cf9e..d853a94 100644
  
 diff --git a/sdk/include/rex/system/xam/fake_live.h b/sdk/include/rex/system/xam/fake_live.h
 new file mode 100644
-index 0000000..63992d7
+index 0000000..41dd4a7
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/fake_live.h
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,217 @@
 +#pragma once
 +
 +// Values the kernel reports when the profile is made to look signed in to Xbox Live.
@@ -484,6 +494,26 @@ index 0000000..63992d7
 +// Values are from memory of the Xbox 360 SDK headers; the hardware run is what confirms them.
 +inline std::array<Notification, 3> InitialNotifications() {
 +  return {{{0x0000000A, 1}, {0x02000001, 0x001510F0}, {0x02000003, 1}}};
++}
++
++// The service id the game asks XOnlineGetServiceInfo for when it looks for EA's online service
++// (seen on hardware: XLiveBase message 0x58007 with 0x45410004), and the port of EA's FESL login.
++constexpr uint32_t kEaServiceId = 0x45410004;
++constexpr uint16_t kEaServicePort = 18210;
++
++// XONLINE_SERVICE_INFO as the guest reads it: service id (big-endian 32 bit), IPv4 address in
++// network order, port (big-endian 16 bit), reserved 16 bits = 0. `ipv4_host_order` is the address
++// as a plain integer (192.168.0.1 = 0xC0A80001).
++inline std::array<uint8_t, 12> EncodeServiceInfo(uint32_t service_id, uint32_t ipv4_host_order,
++                                                 uint16_t port) {
++  std::array<uint8_t, 12> bytes{};
++  for (int i = 0; i < 4; ++i) {
++    bytes[i] = static_cast<uint8_t>(service_id >> (24 - 8 * i));
++    bytes[4 + i] = static_cast<uint8_t>(ipv4_host_order >> (24 - 8 * i));
++  }
++  bytes[8] = static_cast<uint8_t>(port >> 8);
++  bytes[9] = static_cast<uint8_t>(port);
++  return bytes;
 +}
 +
 +// Address the title reports for itself: 10.0.0.2 (host order), Live's usual port 3074.
@@ -1843,6 +1873,43 @@ index ccf5e2a..ee36923 100644
      const uint64_t bit = uint64_t(1) << i;
      const bool ahora = modificador && (held & kAtajos[i].boton) != 0;
      const bool antes = (slot.menu_shortcuts & bit) != 0;
+diff --git a/sdk/src/kernel/xam/apps/xlivebase_app.cpp b/sdk/src/kernel/xam/apps/xlivebase_app.cpp
+index 3593403..bed934b 100644
+--- a/sdk/src/kernel/xam/apps/xlivebase_app.cpp
++++ b/sdk/src/kernel/xam/apps/xlivebase_app.cpp
+@@ -9,7 +9,10 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cstring>
++
+ #include <rex/kernel/xam/apps/xlivebase_app.h>
++#include <rex/kernel/xam/private.h>
+ #include <rex/logging.h>
+ #include <rex/thread.h>
+ 
+@@ -48,6 +51,21 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
+       // and pServiceInfo. pServiceInfo should contain pointer to
+       // XONLINE_SERVICE_INFO structure.
+       REXKRNL_DEBUG("CXLiveLogon::GetServiceInfo({:08X}, {:08X})", buffer_ptr, buffer_length);
++      // Seen on hardware: the first argument is the service id, the second the guest pointer to
++      // the XONLINE_SERVICE_INFO to fill. With online_fake_live on and online_server_host set,
++      // EA's service (0x45410004) is the configured server; everything else stays an error.
++      uint32_t server_address = 0;
++      if (kernel_state_->user_profile()->fake_live() && buffer_ptr == fake_live::kEaServiceId &&
++          buffer_length && xeOnlineServerAddress(&server_address)) {
++        const auto info = fake_live::EncodeServiceInfo(buffer_ptr, server_address,
++                                                       fake_live::kEaServicePort);
++        std::memcpy(memory_->TranslateVirtual(buffer_length), info.data(), info.size());
++        FAKE_LIVE_TRACE("fake Live: GetServiceInfo({:#x}) -> {}.{}.{}.{}:{}", buffer_ptr,
++                        (server_address >> 24) & 0xFF, (server_address >> 16) & 0xFF,
++                        (server_address >> 8) & 0xFF, server_address & 0xFF,
++                        fake_live::kEaServicePort);
++        return X_E_SUCCESS;
++      }
+       return 0x80151802;  // ERROR_CONNECTION_INVALID
+     }
+     case 0x00058020: {
 diff --git a/sdk/src/kernel/xam/xam_content.cpp b/sdk/src/kernel/xam/xam_content.cpp
 index 78734b4..454f1ad 100644
 --- a/sdk/src/kernel/xam/xam_content.cpp
@@ -1926,7 +1993,7 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..31bdda3 100644
+index 58e36a4..f619c81 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
 @@ -12,7 +12,9 @@
@@ -2047,7 +2114,7 @@ index 58e36a4..31bdda3 100644
    // Just return a loopback address atm.
    addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
    addr_ptr->inaOnline.s_addr = 0;
-@@ -505,16 +581,64 @@ struct XEthernetStatus {
+@@ -505,16 +581,74 @@ struct XEthernetStatus {
    static const uint32_t XNET_ETHERNET_LINK_HALF_DUPLEX = 0x10;
  };
  
@@ -2080,6 +2147,16 @@ index 58e36a4..31bdda3 100644
 +    FAKE_LIVE_TRACE("fake Live: XNetGetEthernetLinkStatus -> {:#x}", fake_live::EthernetLinkStatus(true));
 +  }
 +  return fake_live::EthernetLinkStatus(live);
++}
++
++bool xeOnlineServerAddress(uint32_t* ipv4_host_order) {
++  const std::string configured = REXCVAR_GET(online_server_host);
++  in_addr address{};
++  if (configured.empty() || !ResolveIpv4(configured, &address)) {
++    return false;
++  }
++  *ipv4_host_order = ntohl(address.s_addr);
++  return true;
 +}
 +
  u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle, mapped_u32 pdns) {
@@ -2115,7 +2192,7 @@ index 58e36a4..31bdda3 100644
      *pdns = dns_guest;
    }
    if (event_handle) {
-@@ -689,6 +813,13 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -689,6 +823,13 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
  
    N_XSOCKADDR native_name(name);
    X_STATUS status = socket->Connect(&native_name, namelen);
@@ -2129,7 +2206,7 @@ index 58e36a4..31bdda3 100644
    if (XFAILED(status)) {
      XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
      return -1;
-@@ -903,6 +1034,10 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -903,6 +1044,10 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -2140,7 +2217,7 @@ index 58e36a4..31bdda3 100644
    return socket->Send(buf_ptr, buf_len, flags);
  }
  
-@@ -915,6 +1050,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+@@ -915,6 +1060,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
      return -1;
    }
  
@@ -2154,7 +2231,7 @@ index 58e36a4..31bdda3 100644
    N_XSOCKADDR_IN native_to(to_ptr);
    return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
  }
-@@ -963,6 +1105,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+@@ -963,6 +1115,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
             rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
