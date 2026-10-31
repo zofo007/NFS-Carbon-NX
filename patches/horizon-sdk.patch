@@ -429,7 +429,7 @@ index 0000000..ba9a9db
 +
 +}  // namespace rex::system::xam::fake_live
 diff --git a/sdk/include/rex/system/xam/user_profile.h b/sdk/include/rex/system/xam/user_profile.h
-index ec37017..b77e63c 100644
+index ec37017..68d9484 100644
 --- a/sdk/include/rex/system/xam/user_profile.h
 +++ b/sdk/include/rex/system/xam/user_profile.h
 @@ -20,6 +20,7 @@
@@ -440,16 +440,23 @@ index ec37017..b77e63c 100644
  #include <rex/system/xtypes.h>
  
  namespace rex::system {
-@@ -218,9 +219,15 @@ class UserProfile {
+@@ -216,11 +217,22 @@ class UserProfile {
  
+   UserProfile();
+ 
++  // The offline identity. Saves and per-profile settings are stored under it, so it never changes.
    uint64_t xuid() const { return xuid_; }
    std::string name() const { return name_; }
 -  uint32_t signin_state() const { return 1; }
++  // What the game is told through the Xam user calls: the fake Live identity when it is on.
++  uint64_t online_xuid() const { return fake_live_ ? fake_identity_.xuid : xuid_; }
++  std::string online_name() const { return fake_live_ ? fake_identity_.gamertag : name_; }
 +  uint32_t signin_state() const { return fake_live::SigninState(fake_live_); }
    uint32_t type() const { return 1 | 2; /* local | online profile? */ }
  
-+  // When the online_fake_live setting is on, replaces the profile's name and XUID with a made-up
-+  // identity stored under `user_data_root` and reports the profile as signed in to Live.
++  // When the online_fake_live setting is on, makes up an identity stored under `user_data_root`,
++  // reports it through online_xuid()/online_name() and reports the profile as signed in to Live.
++  // xuid() and name() are left alone so existing saves stay where they are.
 +  void MaybeEnableFakeLive(const std::filesystem::path& user_data_root);
 +  bool fake_live() const { return fake_live_; }
 +  const fake_live::Identity& fake_identity() const { return fake_identity_; }
@@ -457,7 +464,7 @@ index ec37017..b77e63c 100644
    void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
  
    void AddSetting(std::unique_ptr<Setting> setting);
-@@ -229,6 +236,8 @@ class UserProfile {
+@@ -229,6 +241,8 @@ class UserProfile {
   private:
    uint64_t xuid_;
    std::string name_;
@@ -1771,9 +1778,71 @@ index 58e36a4..33d7d5b 100644
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
 diff --git a/sdk/src/kernel/xam/xam_user.cpp b/sdk/src/kernel/xam/xam_user.cpp
-index 8778066..f1ac1e4 100644
+index 8778066..b352212 100644
 --- a/sdk/src/kernel/xam/xam_user.cpp
 +++ b/sdk/src/kernel/xam/xam_user.cpp
+@@ -50,11 +50,11 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
+       auto type = user_profile->type() & type_mask;
+       if (type & (2 | 4)) {
+         // maybe online profile?
+-        xuid = user_profile->xuid();
++        xuid = user_profile->online_xuid();
+         result = X_E_SUCCESS;
+       } else if (type & 1) {
+         // maybe offline profile?
+-        xuid = user_profile->xuid();
++        xuid = user_profile->online_xuid();
+         result = X_E_SUCCESS;
+       }
+     }
+@@ -97,9 +97,9 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
+   }
+ 
+   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+-  info->xuid = user_profile->xuid();
++  info->xuid = user_profile->online_xuid();
+   info->signin_state = user_profile->signin_state();
+-  rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
++  rex::string::copy_truncating(info->name, user_profile->online_name(), rex::countof(info->name));
+   return X_E_SUCCESS;
+ }
+ 
+@@ -113,7 +113,7 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
+   }
+ 
+   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+-  const auto& user_name = user_profile->name();
++  const auto& user_name = user_profile->online_name();
+   rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
+   return X_E_SUCCESS;
+ }
+@@ -132,7 +132,7 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
+   }
+ 
+   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+-  auto user_name = rex::string::to_utf16(user_profile->name());
++  auto user_name = rex::string::to_utf16(user_profile->online_name());
+   rex::string::copy_and_swap_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
+   return X_E_SUCCESS;
+ }
+@@ -156,7 +156,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
+     assert_not_null(xuids);
+     // TODO(gibbed): allow proper lookup of arbitrary XUIDs
+     const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+-    assert_true(static_cast<uint64_t>(xuids[0]) == user_profile->xuid());
++    assert_true(static_cast<uint64_t>(xuids[0]) == user_profile->online_xuid());
+     // TODO(gibbed): we assert here, but in case a title passes xuid_count > 1
+     // until it's implemented for release builds...
+     xuid_count = 1;
+@@ -264,7 +264,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
+     std::memset(out_setting, 0, sizeof(X_USER_PROFILE_SETTING));
+     out_setting->from = !setting || !setting->is_set ? 0 : setting->is_title_specific() ? 2 : 1;
+     if (xuids) {
+-      out_setting->xuid = user_profile->xuid();
++      out_setting->xuid = user_profile->online_xuid();
+     } else {
+       out_setting->user_index = static_cast<uint32_t>(user_index);
+     }
 @@ -382,8 +382,10 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value)
      }
    }
@@ -2639,10 +2708,10 @@ index 78826a6..e715bb3 100644
  
  }  // namespace xam
 diff --git a/sdk/src/system/xam/user_profile.cpp b/sdk/src/system/xam/user_profile.cpp
-index a77f5e6..9b3b5cc 100644
+index a77f5e6..bbeb384 100644
 --- a/sdk/src/system/xam/user_profile.cpp
 +++ b/sdk/src/system/xam/user_profile.cpp
-@@ -13,14 +13,30 @@
+@@ -13,14 +13,28 @@
  
  #include <fmt/format.h>
  
@@ -2664,10 +2733,8 @@ index a77f5e6..9b3b5cc 100644
 +  }
 +  const auto seed = fake_live::LoadOrCreateSeed(user_data_root / "online_identity.bin");
 +  fake_identity_ = fake_live::MakeIdentity(seed);
-+  xuid_ = fake_identity_.xuid;
-+  name_ = fake_identity_.gamertag;
 +  fake_live_ = true;
-+  REXSYS_INFO("fake Live on: {} {:016x}", name_, xuid_);
++  REXSYS_INFO("fake Live on: {} {:016x}", online_name(), online_xuid());
 +}
 +
  UserProfile::UserProfile() {
