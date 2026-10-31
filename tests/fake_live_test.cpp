@@ -139,6 +139,14 @@ void ServiceInfoBytes() {
   CHECK(std::memcmp(other.data(), expected_other, 12) == 0);
 }
 
+void ConnectStatusValues() {
+  // XNET_CONNECT_STATUS_*: the game polls XNetGetConnectStatus and moves on at CONNECTED (2).
+  CHECK(fl::kConnectIdle == 0);
+  CHECK(fl::kConnectPending == 1);
+  CHECK(fl::kConnectConnected == 2);
+  CHECK(fl::kConnectLost == 3);
+}
+
 void SeedPersists(const fs::path& folder) {
   const fs::path file = folder / "online_identity.bin";
   const uint64_t first = fl::LoadOrCreateSeed(file);
@@ -175,6 +183,7 @@ int main(int argc, char** argv) {
   OnlineCallNames();
   InitialNotifications();
   ServiceInfoBytes();
+  ConnectStatusValues();
   SeedPersists(folder);
   SeedRepairs(folder);
   std::cout << "fake_live: all checks passed\n";

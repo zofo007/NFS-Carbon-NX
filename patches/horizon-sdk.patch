@@ -381,10 +381,10 @@ index 9b9cf9e..d853a94 100644
  
 diff --git a/sdk/include/rex/system/xam/fake_live.h b/sdk/include/rex/system/xam/fake_live.h
 new file mode 100644
-index 0000000..41dd4a7
+index 0000000..6c061ee
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/fake_live.h
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,223 @@
 +#pragma once
 +
 +// Values the kernel reports when the profile is made to look signed in to Xbox Live.
@@ -515,6 +515,12 @@ index 0000000..41dd4a7
 +  bytes[9] = static_cast<uint8_t>(port);
 +  return bytes;
 +}
++
++// XNET_CONNECT_STATUS_*: what XNetGetConnectStatus reports for a secure-address connection.
++constexpr uint32_t kConnectIdle = 0;
++constexpr uint32_t kConnectPending = 1;
++constexpr uint32_t kConnectConnected = 2;
++constexpr uint32_t kConnectLost = 3;
 +
 +// Address the title reports for itself: 10.0.0.2 (host order), Live's usual port 3074.
 +constexpr uint32_t kFakeIpv4 = 0x0A000002;
@@ -1993,7 +1999,7 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..f619c81 100644
+index 58e36a4..8159f6a 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
 @@ -12,7 +12,9 @@
@@ -2114,11 +2120,10 @@ index 58e36a4..f619c81 100644
    // Just return a loopback address atm.
    addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
    addr_ptr->inaOnline.s_addr = 0;
-@@ -505,16 +581,74 @@ struct XEthernetStatus {
+@@ -505,16 +581,100 @@ struct XEthernetStatus {
    static const uint32_t XNET_ETHERNET_LINK_HALF_DUPLEX = 0x10;
  };
  
--u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
 +// The game calls this while building a request for Live's web services and only checks the sign.
 +u32 XNetLogonGetMachineID_entry(mapped_u64 machine_id_ptr) {
 +  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
@@ -2128,9 +2133,9 @@ index 58e36a4..f619c81 100644
 +  if (user_profile->fake_live()) {
 +    FAKE_LIVE_TRACE("fake Live: XNetLogonGetMachineID -> 0");
 +  }
-   return 0;
- }
- 
++  return 0;
++}
++
 +// The argument is a service category (the game passes 2 and 5) and the result goes into the same
 +// request. Off: hand the argument back, as the old stub did. On: the game's own title id (a guess).
 +u32 XNetLogonGetTitleID_entry(u32 service) {
@@ -2141,12 +2146,38 @@ index 58e36a4..f619c81 100644
 +  return service;
 +}
 +
-+u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
+ u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
 +  const bool live = REX_KERNEL_STATE()->user_profile()->fake_live();
 +  if (live) {
 +    FAKE_LIVE_TRACE("fake Live: XNetGetEthernetLinkStatus -> {:#x}", fake_live::EthernetLinkStatus(true));
 +  }
 +  return fake_live::EthernetLinkStatus(live);
++}
++
++// Secure connections to the Live "service" address are pretended. With online_fake_live on,
++// XNetConnect succeeds at once and the connection reads as connected, so the game goes on to its
++// own TCP connection to the server. Off: return the first argument, as the old stubs did.
++u32 NetDll_XNetConnect_entry(u32 caller, u32 ina) {
++  if (!REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    return caller;
++  }
++  FAKE_LIVE_TRACE("fake Live: XNetConnect({:#x}) -> 0", ina);
+   return 0;
+ }
+ 
++u32 NetDll_XNetGetConnectStatus_entry(u32 caller, u32 ina) {
++  if (!REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    return caller;
++  }
++  FAKE_LIVE_TRACE("fake Live: XNetGetConnectStatus({:#x}) -> connected", ina);
++  return fake_live::kConnectConnected;
++}
++
++u32 NetDll_XNetUnregisterKey_entry(u32 caller, u32 xnkid_ptr) {
++  if (!REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    return caller;
++  }
++  return 0;
 +}
 +
 +bool xeOnlineServerAddress(uint32_t* ipv4_host_order) {
@@ -2192,7 +2223,7 @@ index 58e36a4..f619c81 100644
      *pdns = dns_guest;
    }
    if (event_handle) {
-@@ -689,6 +823,13 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -689,6 +849,13 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
  
    N_XSOCKADDR native_name(name);
    X_STATUS status = socket->Connect(&native_name, namelen);
@@ -2206,7 +2237,7 @@ index 58e36a4..f619c81 100644
    if (XFAILED(status)) {
      XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
      return -1;
-@@ -903,6 +1044,10 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -903,6 +1070,10 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -2217,7 +2248,7 @@ index 58e36a4..f619c81 100644
    return socket->Send(buf_ptr, buf_len, flags);
  }
  
-@@ -915,6 +1060,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+@@ -915,6 +1086,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
      return -1;
    }
  
@@ -2231,7 +2262,7 @@ index 58e36a4..f619c81 100644
    N_XSOCKADDR_IN native_to(to_ptr);
    return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
  }
-@@ -963,6 +1115,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+@@ -963,6 +1141,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
             rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
@@ -2240,6 +2271,30 @@ index 58e36a4..f619c81 100644
  REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
+@@ -1030,12 +1210,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+ REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
+ REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
+ REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
+-REX_EXPORT_STUB(__imp__NetDll_XNetConnect);
++REX_EXPORT(__imp__NetDll_XNetConnect, rex::kernel::xam::NetDll_XNetConnect_entry)
+ REX_EXPORT_STUB(__imp__NetDll_XNetCreateKey);
+ REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
+ REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseRelease);
+ REX_EXPORT_STUB(__imp__NetDll_XNetGetBroadcastVersionStatus);
+-REX_EXPORT_STUB(__imp__NetDll_XNetGetConnectStatus);
++REX_EXPORT(__imp__NetDll_XNetGetConnectStatus, rex::kernel::xam::NetDll_XNetGetConnectStatus_entry)
+ REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
+ REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
+ REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
+@@ -1048,7 +1228,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
+ REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
+ REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
+ REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
+-REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterKey);
++REX_EXPORT(__imp__NetDll_XNetUnregisterKey, rex::kernel::xam::NetDll_XNetUnregisterKey_entry)
+ REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
+ REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
+ REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
 diff --git a/sdk/src/kernel/xam/xam_notify.cpp b/sdk/src/kernel/xam/xam_notify.cpp
 index 9abcef6..c9968ab 100644
 --- a/sdk/src/kernel/xam/xam_notify.cpp
