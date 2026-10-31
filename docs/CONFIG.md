@@ -28,6 +28,8 @@ editing. The release file ships the values below under "Shipped"; everything els
 |---|---|---|
 | `online_fake_live` | `false` | `true` makes the game see a profile signed in to Xbox Live, with online privileges and a live network link, so the online menus open. The profile gets a made-up gamertag and XUID, generated once and kept in `user/online_identity.bin`. Nothing connects to any server yet. Existing saves and profile settings are not affected (they stay under the offline profile). Tried on a Switch: the online entry opens and the game then tries to connect to EA's servers, which no longer exist, so it cannot go further yet. |
 
+| `online_server_host` | `""` | With `online_fake_live` on, the game's lookups of EA's service names (`fesl.ea.com`, `messaging.ea.com`, anything under `ea.com`) resolve to this host or IPv4 address, so the game connects there instead. Empty means no redirect. Starts the Switch network service when first used. Only point it at a server whose operator agreed. |
+
 ## Quality and speed
 
 | Setting | Default | Effect |
