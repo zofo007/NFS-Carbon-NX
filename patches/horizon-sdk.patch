@@ -371,7 +371,7 @@ index 9b9cf9e..d853a94 100644
  
 diff --git a/sdk/include/rex/system/xam/fake_live.h b/sdk/include/rex/system/xam/fake_live.h
 new file mode 100644
-index 0000000..1bc5e13
+index 0000000..63992d7
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/fake_live.h
 @@ -0,0 +1,197 @@
@@ -461,7 +461,7 @@ index 0000000..1bc5e13
 +      "__imp__NetDll_",    "__imp__XNet",        "__imp__XNotify",     "__imp__XUser",
 +      "__imp__XOnline",    "__imp__XLive",       "__imp__XSession",    "__imp__XamUser",
 +      "__imp__XamShow",    "__imp__XamNotify",   "__imp__XamEnumerate", "__imp__XamSession",
-+      "__imp__XamVoice",   "__imp__XamParty",    "__imp__XamLoader",
++      "__imp__XamVoice",   "__imp__XamParty",    "__imp__XamLoader",   "__imp__XMsg",
 +  };
 +  for (const std::string_view prefix : kPrefixes) {
 +    if (detail::StartsWith(name, prefix)) {
@@ -2678,6 +2678,81 @@ index 697399c..f8c6a3a 100644
  object_ref<XThread> KernelState::GetThreadByID(uint32_t thread_id) {
    auto global_lock = global_critical_region_.Acquire();
    XThread* thread = nullptr;
+diff --git a/sdk/src/system/xam/app_manager.cpp b/sdk/src/system/xam/app_manager.cpp
+index 9b882af..b99d1b5 100644
+--- a/sdk/src/system/xam/app_manager.cpp
++++ b/sdk/src/system/xam/app_manager.cpp
+@@ -9,6 +9,10 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <map>
++#include <mutex>
++
++#include <rex/logging.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xam/app_manager.h>
+ 
+@@ -16,6 +20,27 @@ namespace rex {
+ namespace system {
+ namespace xam {
+ 
++namespace {
++// With online_fake_live on: log the first few messages of each (app, message) pair with their
++// arguments and result, so a hardware run shows which Live service calls the game makes.
++void TraceAppMessage(const char* kind, uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
++                     uint32_t buffer_length, uint32_t result, bool found) {
++  if (!REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    return;
++  }
++  static std::mutex lock;
++  static std::map<uint64_t, int> seen;
++  {
++    std::lock_guard<std::mutex> guard(lock);
++    if (++seen[(uint64_t(app_id) << 32) | message] > 5) {
++      return;
++    }
++  }
++  REXSYS_WARN("fake Live: {} app {:#x} msg {:#x} ({:#x}, {:#x}) -> {:#x}{}", kind, app_id, message,
++              buffer_ptr, buffer_length, result, found ? "" : " (no such app)");
++}
++}  // namespace
++
+ App::App(KernelState* kernel_state, uint32_t app_id)
+     : kernel_state_(kernel_state), memory_(kernel_state->memory()), app_id_(app_id) {}
+ 
+@@ -31,11 +56,14 @@ X_HRESULT AppManager::DispatchMessageSync(uint32_t app_id, uint32_t message, uin
+   {
+     auto it = app_lookup_.find(app_id);
+     if (it == app_lookup_.end()) {
++      TraceAppMessage("sync", app_id, message, buffer_ptr, buffer_length, X_E_NOTFOUND, false);
+       return X_E_NOTFOUND;
+     }
+     app = it->second;
+   }
+-  return app->DispatchMessageSync(message, buffer_ptr, buffer_length);
++  const X_HRESULT result = app->DispatchMessageSync(message, buffer_ptr, buffer_length);
++  TraceAppMessage("sync", app_id, message, buffer_ptr, buffer_length, result, true);
++  return result;
+ }
+ 
+ X_HRESULT AppManager::DispatchMessageAsync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
+@@ -44,11 +72,14 @@ X_HRESULT AppManager::DispatchMessageAsync(uint32_t app_id, uint32_t message, ui
+   {
+     auto it = app_lookup_.find(app_id);
+     if (it == app_lookup_.end()) {
++      TraceAppMessage("async", app_id, message, buffer_ptr, buffer_length, X_E_NOTFOUND, false);
+       return X_E_NOTFOUND;
+     }
+     app = it->second;
+   }
+-  return app->DispatchMessageSync(message, buffer_ptr, buffer_length);
++  const X_HRESULT result = app->DispatchMessageSync(message, buffer_ptr, buffer_length);
++  TraceAppMessage("async", app_id, message, buffer_ptr, buffer_length, result, true);
++  return result;
+ }
+ 
+ }  // namespace xam
 diff --git a/sdk/src/system/xam/content_manager.cpp b/sdk/src/system/xam/content_manager.cpp
 index 78826a6..e715bb3 100644
 --- a/sdk/src/system/xam/content_manager.cpp

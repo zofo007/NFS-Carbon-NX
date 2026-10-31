@@ -100,6 +100,9 @@ void OnlineCallNames() {
   CHECK(fl::IsOnlineCallName("__imp__XamEnumerate"));
   CHECK(fl::IsOnlineCallName("__imp__XNotifyGetNext"));
   CHECK(fl::IsOnlineCallName("__imp__XSessionCreate"));
+  CHECK(fl::IsOnlineCallName("__imp__XMsgInProcessCall"));
+  CHECK(fl::IsOnlineCallName("__imp__XMsgStartIORequestEx"));
+  CHECK(fl::IsOnlineCallName("__imp__XMsgSystemProcessCall"));
   CHECK(!fl::IsOnlineCallName("__imp__XamContentCreate"));
   CHECK(!fl::IsOnlineCallName("__imp__XamAlloc"));
   CHECK(!fl::IsOnlineCallName("__imp__NtCreateFile"));
