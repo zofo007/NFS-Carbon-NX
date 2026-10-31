@@ -235,7 +235,7 @@ index 0000000..f8d1430
 +
 +}  // namespace rex::filesystem
 diff --git a/sdk/include/rex/hook.h b/sdk/include/rex/hook.h
-index 4ce4f9b..a27dc93 100644
+index 4ce4f9b..ac29d0f 100644
 --- a/sdk/include/rex/hook.h
 +++ b/sdk/include/rex/hook.h
 @@ -17,6 +17,8 @@
@@ -247,13 +247,14 @@ index 4ce4f9b..a27dc93 100644
  #include <rex/logging.h>
  #include <rex/ppc/context.h>
  #include <rex/ppc/function.h>
-@@ -68,9 +70,25 @@
+@@ -68,9 +70,27 @@
      ctx.r3.u64 = (value);                                                                 \
    }
  
 +namespace rex::ppc::detail {
 +// Logs the first calls (name and r3..r6) of an online-related export while online_fake_live is on.
-+void TraceOnlineCall(const char* name, const PPCContext& ctx, std::atomic<int>& count);
++void TraceOnlineCall(const char* name, const PPCContext& ctx, std::atomic<int>& count,
++                     std::atomic<int64_t>& last_logged_ms);
 +}  // namespace rex::ppc::detail
 +
 +// Same as REX_HOOK, plus the online call trace for the networking and user exports. The name test
@@ -262,7 +263,8 @@ index 4ce4f9b..a27dc93 100644
 +  extern "C" REX_FUNC(subroutine) {                                             \
 +    if constexpr (rex::system::xam::fake_live::IsOnlineCallName(#subroutine)) { \
 +      static std::atomic<int> trace_count{0};                                   \
-+      rex::ppc::detail::TraceOnlineCall(#subroutine, ctx, trace_count);         \
++      static std::atomic<int64_t> trace_last_ms{0};                             \
++      rex::ppc::detail::TraceOnlineCall(#subroutine, ctx, trace_count, trace_last_ms); \
 +    }                                                                           \
 +    rex::ppc::HostToGuestFunction<function>(ctx, base);                         \
 +  }
@@ -274,6 +276,46 @@ index 4ce4f9b..a27dc93 100644
    static rex::ppc::detail::PPCFuncRegistrar _ppc_reg_##name(#name, &name);
  
  #define REX_EXPORT_STUB(name) \
+diff --git a/sdk/include/rex/kernel/xam/private.h b/sdk/include/rex/kernel/xam/private.h
+index 3df4776..65b28ce 100644
+--- a/sdk/include/rex/kernel/xam/private.h
++++ b/sdk/include/rex/kernel/xam/private.h
+@@ -10,9 +10,35 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++
++#include <rex/logging.h>
+ #include <rex/system/export_resolver.h>
+ #include <rex/system/kernel_state.h>
+ 
++// Hardware-run trace for online_fake_live. The first `limit` uses of a call site are logged, then at
++// most one line per second, so polled calls stay visible over a long wait without flooding the log.
++// Warn level on purpose: it is flushed at once and survives a crash right after.
++#define FAKE_LIVE_TRACE_UP_TO(limit, ...)                                                      \
++  do {                                                                                         \
++    static std::atomic<int> trace_count{0};                                                    \
++    static std::atomic<int64_t> trace_last_ms{0};                                              \
++    bool trace_now = trace_count.fetch_add(1) < (limit);                                       \
++    if (!trace_now) {                                                                          \
++      const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(            \
++                                 std::chrono::steady_clock::now().time_since_epoch())          \
++                                 .count();                                                     \
++      int64_t last_ms = trace_last_ms.load();                                                  \
++      trace_now = now_ms - last_ms >= 1000 && trace_last_ms.compare_exchange_strong(last_ms, now_ms); \
++    }                                                                                          \
++    if (trace_now) {                                                                           \
++      REXKRNL_WARN(__VA_ARGS__);                                                               \
++    }                                                                                          \
++  } while (0)
++#define FAKE_LIVE_TRACE(...) FAKE_LIVE_TRACE_UP_TO(5, __VA_ARGS__)
++
+ namespace rex {
+ namespace kernel {
+ namespace xam {
 diff --git a/sdk/include/rex/system/kernel_state.h b/sdk/include/rex/system/kernel_state.h
 index 9b9cf9e..d853a94 100644
 --- a/sdk/include/rex/system/kernel_state.h
@@ -1884,7 +1926,7 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..82e0cfe 100644
+index 58e36a4..31bdda3 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
 @@ -12,7 +12,9 @@
@@ -1905,7 +1947,7 @@ index 58e36a4..82e0cfe 100644
  #include <rex/kernel/xam/private.h>
  #include <rex/kernel/xboxkrnl/error.h>
  #include <rex/kernel/xboxkrnl/threading.h>
-@@ -37,19 +40,90 @@
+@@ -37,19 +40,79 @@
  // NOTE: must be included last as it expects windows.h to already be included.
  #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
  #include <winsock2.h>                    // NOLINT(build/include_order)
@@ -1931,17 +1973,6 @@ index 58e36a4..82e0cfe 100644
  using namespace rex::system;
  using namespace rex::system::xam;
  
-+// Hardware-run trace for online_fake_live: the first few answers of each call are logged at warn
-+// level, which is flushed at once, so they reach the log even if the game crashes right after.
-+#define FAKE_LIVE_TRACE_UP_TO(limit, ...)         \
-+  do {                                            \
-+    static std::atomic<int> trace_count{0};       \
-+    if (trace_count.fetch_add(1) < (limit)) {     \
-+      REXKRNL_WARN(__VA_ARGS__);                  \
-+    }                                             \
-+  } while (0)
-+#define FAKE_LIVE_TRACE(...) FAKE_LIVE_TRACE_UP_TO(5, __VA_ARGS__)
-+
 +static std::string Ipv4ToString(uint32_t host_order_address) {
 +  return std::to_string((host_order_address >> 24) & 0xFF) + "." +
 +         std::to_string((host_order_address >> 16) & 0xFF) + "." +
@@ -1996,7 +2027,7 @@ index 58e36a4..82e0cfe 100644
  // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
  enum {
    XNCALLER_INVALID = 0x0,
-@@ -436,6 +510,19 @@ struct XnAddrStatus {
+@@ -436,6 +499,19 @@ struct XnAddrStatus {
  };
  
  u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
@@ -2016,7 +2047,7 @@ index 58e36a4..82e0cfe 100644
    // Just return a loopback address atm.
    addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
    addr_ptr->inaOnline.s_addr = 0;
-@@ -505,16 +592,64 @@ struct XEthernetStatus {
+@@ -505,16 +581,64 @@ struct XEthernetStatus {
    static const uint32_t XNET_ETHERNET_LINK_HALF_DUPLEX = 0x10;
  };
  
@@ -2084,7 +2115,7 @@ index 58e36a4..82e0cfe 100644
      *pdns = dns_guest;
    }
    if (event_handle) {
-@@ -689,6 +824,13 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -689,6 +813,13 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
  
    N_XSOCKADDR native_name(name);
    X_STATUS status = socket->Connect(&native_name, namelen);
@@ -2098,7 +2129,7 @@ index 58e36a4..82e0cfe 100644
    if (XFAILED(status)) {
      XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
      return -1;
-@@ -903,6 +1045,10 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -903,6 +1034,10 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -2109,7 +2140,7 @@ index 58e36a4..82e0cfe 100644
    return socket->Send(buf_ptr, buf_len, flags);
  }
  
-@@ -915,6 +1061,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+@@ -915,6 +1050,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
      return -1;
    }
  
@@ -2123,7 +2154,7 @@ index 58e36a4..82e0cfe 100644
    N_XSOCKADDR_IN native_to(to_ptr);
    return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
  }
-@@ -963,6 +1116,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+@@ -963,6 +1105,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
             rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
@@ -2133,7 +2164,7 @@ index 58e36a4..82e0cfe 100644
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
 diff --git a/sdk/src/kernel/xam/xam_notify.cpp b/sdk/src/kernel/xam/xam_notify.cpp
-index 9abcef6..c93d792 100644
+index 9abcef6..c9968ab 100644
 --- a/sdk/src/kernel/xam/xam_notify.cpp
 +++ b/sdk/src/kernel/xam/xam_notify.cpp
 @@ -33,6 +33,14 @@ uint32_t xeXamNotifyCreateListener(uint64_t mask, uint32_t is_system, uint32_t m
@@ -2151,8 +2182,21 @@ index 9abcef6..c93d792 100644
    // Handle ref is incremented, so return that.
    uint32_t handle = listener->handle();
  
+@@ -80,6 +88,12 @@ u32 XNotifyGetNext_entry(u32 handle, u32 match_id, mapped_u32 id_ptr, mapped_u32
+     dequeued = listener->DequeueNotification(&id, &param);
+   }
+ 
++  if (REX_KERNEL_STATE()->user_profile()->fake_live() && (dequeued || match_id != 0x2000002)) {
++    // The invite poll (0x2000002) is constant and uninteresting; everything else shows what the
++    // game waits for and what it was given.
++    FAKE_LIVE_TRACE_UP_TO(40, "fake Live: XNotifyGetNext({:#x}, match {:#x}) -> {} id {:#x} param {:#x}",
++                          uint32_t(handle), uint32_t(match_id), dequeued ? "got" : "empty", id, param);
++  }
+   *id_ptr = dequeued ? id : 0;
+   // param_ptr may be null - 555307F0 Demo explicitly passes nullptr in the
+   // code.
 diff --git a/sdk/src/kernel/xam/xam_user.cpp b/sdk/src/kernel/xam/xam_user.cpp
-index 8778066..9fef1b1 100644
+index 8778066..ff6a4ce 100644
 --- a/sdk/src/kernel/xam/xam_user.cpp
 +++ b/sdk/src/kernel/xam/xam_user.cpp
 @@ -12,6 +12,7 @@
@@ -2163,24 +2207,15 @@ index 8778066..9fef1b1 100644
  #include <cstring>
  
  #include <rex/cvar.h>
-@@ -30,6 +31,16 @@
+@@ -30,6 +31,7 @@
  
  REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
  
-+// Hardware-run trace for online_fake_live: the first few answers of each call are logged at warn
-+// level, which is flushed at once, so they reach the log even if the game crashes right after.
-+#define FAKE_LIVE_TRACE(...)                    \
-+  do {                                          \
-+    static std::atomic<int> trace_count{0};     \
-+    if (trace_count.fetch_add(1) < 5) {         \
-+      REXKRNL_WARN(__VA_ARGS__);                \
-+    }                                           \
-+  } while (0)
 +
  namespace rex {
  namespace kernel {
  namespace xam {
-@@ -50,11 +61,11 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
+@@ -50,11 +52,11 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
        auto type = user_profile->type() & type_mask;
        if (type & (2 | 4)) {
          // maybe online profile?
@@ -2194,7 +2229,7 @@ index 8778066..9fef1b1 100644
          result = X_E_SUCCESS;
        }
      }
-@@ -71,6 +82,9 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
+@@ -71,6 +73,9 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
      if (user_index == 0) {
        const auto& user_profile = REX_KERNEL_STATE()->user_profile();
        signin_state = user_profile->signin_state();
@@ -2204,7 +2239,7 @@ index 8778066..9fef1b1 100644
      }
    }
    return signin_state;
-@@ -97,9 +111,9 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
+@@ -97,9 +102,9 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
    }
  
    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
@@ -2216,7 +2251,7 @@ index 8778066..9fef1b1 100644
    return X_E_SUCCESS;
  }
  
-@@ -113,7 +127,7 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
+@@ -113,7 +118,7 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
    }
  
    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
@@ -2225,7 +2260,7 @@ index 8778066..9fef1b1 100644
    rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
    return X_E_SUCCESS;
  }
-@@ -132,7 +146,7 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
+@@ -132,7 +137,7 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
    }
  
    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
@@ -2234,7 +2269,7 @@ index 8778066..9fef1b1 100644
    rex::string::copy_and_swap_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
    return X_E_SUCCESS;
  }
-@@ -156,7 +170,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
+@@ -156,7 +161,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
      assert_not_null(xuids);
      // TODO(gibbed): allow proper lookup of arbitrary XUIDs
      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
@@ -2243,7 +2278,7 @@ index 8778066..9fef1b1 100644
      // TODO(gibbed): we assert here, but in case a title passes xuid_count > 1
      // until it's implemented for release builds...
      xuid_count = 1;
-@@ -264,7 +278,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
+@@ -264,7 +269,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
      std::memset(out_setting, 0, sizeof(X_USER_PROFILE_SETTING));
      out_setting->from = !setting || !setting->is_set ? 0 : setting->is_title_specific() ? 2 : 1;
      if (xuids) {
@@ -2252,7 +2287,7 @@ index 8778066..9fef1b1 100644
      } else {
        out_setting->user_index = static_cast<uint32_t>(user_index);
      }
-@@ -382,8 +396,14 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value)
+@@ -382,8 +387,14 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value)
      }
    }
  
@@ -2269,7 +2304,7 @@ index 8778066..9fef1b1 100644
    return X_ERROR_SUCCESS;
  }
  
-@@ -598,6 +618,8 @@ class XStaticAchievementEnumerator : public XEnumerator {
+@@ -598,6 +609,8 @@ class XStaticAchievementEnumerator : public XEnumerator {
  u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 xuid, u32 flags,
                                               u32 offset, u32 count, mapped_u32 buffer_size_ptr,
                                               mapped_u32 handle_ptr) {
@@ -3121,14 +3156,15 @@ index 78826a6..e715bb3 100644
  
  }  // namespace xam
 diff --git a/sdk/src/system/xam/user_profile.cpp b/sdk/src/system/xam/user_profile.cpp
-index a77f5e6..0fdfc50 100644
+index a77f5e6..2d26819 100644
 --- a/sdk/src/system/xam/user_profile.cpp
 +++ b/sdk/src/system/xam/user_profile.cpp
-@@ -9,18 +9,57 @@
+@@ -9,18 +9,66 @@
   * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
 +#include <atomic>
++#include <chrono>
  #include <sstream>
  
  #include <fmt/format.h>
@@ -3149,13 +3185,21 @@ index a77f5e6..0fdfc50 100644
 +static std::atomic<bool> g_trace_online_calls{false};
 +
 +namespace rex::ppc::detail {
-+void TraceOnlineCall(const char* name, const PPCContext& ctx, std::atomic<int>& count) {
++void TraceOnlineCall(const char* name, const PPCContext& ctx, std::atomic<int>& count,
++                     std::atomic<int64_t>& last_logged_ms) {
 +  if (!g_trace_online_calls.load(std::memory_order_relaxed)) {
 +    return;
 +  }
 +  const int n = count.fetch_add(1);
 +  if (n >= 40) {
-+    return;
++    // After the first 40, one line per second per export keeps a long wait visible.
++    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                               std::chrono::steady_clock::now().time_since_epoch())
++                               .count();
++    int64_t last_ms = last_logged_ms.load();
++    if (now_ms - last_ms < 1000 || !last_logged_ms.compare_exchange_strong(last_ms, now_ms)) {
++      return;
++    }
 +  }
 +  REXKRNL_WARN("fake Live: call {} #{} ({:#x}, {:#x}, {:#x}, {:#x})", name, n + 1, ctx.r3.u32,
 +               ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
