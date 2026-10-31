@@ -287,6 +287,185 @@ index 9b9cf9e..d853a94 100644
    std::vector<object_ref<XNotifyListener>> notify_listeners_;
    bool has_notified_startup_ = false;
  
+diff --git a/sdk/include/rex/system/xam/fake_live.h b/sdk/include/rex/system/xam/fake_live.h
+new file mode 100644
+index 0000000..ba9a9db
+--- /dev/null
++++ b/sdk/include/rex/system/xam/fake_live.h
+@@ -0,0 +1,135 @@
++#pragma once
++
++// Values the kernel reports when the profile is made to look signed in to Xbox Live.
++// Pure functions only, no kernel state, so tests/fake_live_test.cpp can compile it on its own.
++
++#include <rex/filesystem/atomic_file.h>
++
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <random>
++#include <system_error>
++
++namespace rex::system::xam::fake_live {
++
++constexpr uint32_t kSigninLocal = 1;
++constexpr uint32_t kSigninLive = 2;
++constexpr uint32_t kNatOpen = 1;
++
++// XPRIVILEGE_COMMUNICATIONS_FRIENDS_ONLY: granting it restricts the user, so it stays denied.
++constexpr uint32_t kPrivilegeFriendsOnly = 251;
++
++inline uint32_t SigninState(bool live) {
++  return live ? kSigninLive : kSigninLocal;
++}
++
++inline uint32_t PrivilegeValue(bool live, uint32_t privilege_id) {
++  return live && privilege_id != kPrivilegeFriendsOnly ? 1 : 0;
++}
++
++// XNET_ETHERNET_LINK_ACTIVE | _100MBPS | _FULL_DUPLEX
++inline uint32_t EthernetLinkStatus(bool live) {
++  return live ? (0x01 | 0x02 | 0x08) : 0;
++}
++
++// XNET_GET_XNADDR_STATIC, plus ETHERNET | GATEWAY | DNS | ONLINE when live.
++inline uint32_t XnAddrStatus(bool live) {
++  return live ? (0x04 | 0x02 | 0x20 | 0x40 | 0x80) : 0x04;
++}
++
++struct Identity {
++  uint64_t xuid;
++  char gamertag[16];
++  uint8_t mac[6];
++  uint64_t machine_id;
++};
++
++// Address the title reports for itself: 10.0.0.2 (host order), Live's usual port 3074.
++constexpr uint32_t kFakeIpv4 = 0x0A000002;
++constexpr uint16_t kFakeOnlinePort = 3074;
++
++// The 20-byte XNADDR::abOnline: the machine id (little-endian) followed by zeros.
++inline std::array<uint8_t, 20> OnlineId(const Identity& id) {
++  std::array<uint8_t, 20> bytes{};
++  for (int i = 0; i < 8; ++i) {
++    bytes[i] = static_cast<uint8_t>(id.machine_id >> (8 * i));
++  }
++  return bytes;
++}
++
++namespace detail {
++
++inline uint64_t Mix(uint64_t& state) {
++  uint64_t z = (state += 0x9E3779B97F4A7C15ull);
++  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
++  z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
++  return z ^ (z >> 31);
++}
++
++}  // namespace detail
++
++inline Identity MakeIdentity(uint64_t seed) {
++  uint64_t state = seed;
++  Identity id{};
++  id.xuid = (uint64_t{0x0009} << 48) | (detail::Mix(state) & 0x0000FFFFFFFFFFFFull);
++  std::memcpy(id.gamertag, "Racer", 5);
++  uint64_t digits = detail::Mix(state) % 10000;
++  for (int i = 8; i >= 5; --i) {
++    id.gamertag[i] = static_cast<char>('0' + digits % 10);
++    digits /= 10;
++  }
++  const uint64_t mac_bits = detail::Mix(state);
++  id.mac[0] = 0x02;
++  for (int i = 1; i < 6; ++i) {
++    id.mac[i] = static_cast<uint8_t>(mac_bits >> (8 * (i - 1)));
++  }
++  id.machine_id = detail::Mix(state) | 1;
++  return id;
++}
++
++// Returns the 8-byte seed stored in `file`. A missing, unreadable or wrong-sized file gets a new
++// random nonzero seed, written back if possible; a failed write still returns the new seed.
++inline uint64_t LoadOrCreateSeed(const std::filesystem::path& file) {
++  std::error_code ec;
++  if (std::filesystem::file_size(file, ec) == 8 && !ec) {
++    std::ifstream in(file, std::ios::binary);
++    uint8_t bytes[8] = {};
++    if (in.read(reinterpret_cast<char*>(bytes), 8) && in.gcount() == 8) {
++      uint64_t seed = 0;
++      for (int i = 7; i >= 0; --i) {
++        seed = (seed << 8) | bytes[i];
++      }
++      if (seed != 0) {
++        return seed;
++      }
++    }
++  }
++
++  std::random_device device;
++  uint64_t seed = 0;
++  while (seed == 0) {
++    seed = (static_cast<uint64_t>(device()) << 32) | device();
++  }
++
++  std::filesystem::create_directories(file.parent_path(), ec);
++  auto temporary = file;
++  temporary += ".tmp";
++  {
++    std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
++    uint8_t bytes[8];
++    for (int i = 0; i < 8; ++i) {
++      bytes[i] = static_cast<uint8_t>(seed >> (8 * i));
++    }
++    out.write(reinterpret_cast<const char*>(bytes), 8);
++    if (!out) {
++      return seed;
++    }
++  }
++  rex::filesystem::CommitFile(temporary, file, ec);
++  return seed;
++}
++
++}  // namespace rex::system::xam::fake_live
+diff --git a/sdk/include/rex/system/xam/user_profile.h b/sdk/include/rex/system/xam/user_profile.h
+index ec37017..b77e63c 100644
+--- a/sdk/include/rex/system/xam/user_profile.h
++++ b/sdk/include/rex/system/xam/user_profile.h
+@@ -20,6 +20,7 @@
+ 
+ #include <rex/memory.h>
+ #include <rex/stream.h>
++#include <rex/system/xam/fake_live.h>
+ #include <rex/system/xtypes.h>
+ 
+ namespace rex::system {
+@@ -218,9 +219,15 @@ class UserProfile {
+ 
+   uint64_t xuid() const { return xuid_; }
+   std::string name() const { return name_; }
+-  uint32_t signin_state() const { return 1; }
++  uint32_t signin_state() const { return fake_live::SigninState(fake_live_); }
+   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
+ 
++  // When the online_fake_live setting is on, replaces the profile's name and XUID with a made-up
++  // identity stored under `user_data_root` and reports the profile as signed in to Live.
++  void MaybeEnableFakeLive(const std::filesystem::path& user_data_root);
++  bool fake_live() const { return fake_live_; }
++  const fake_live::Identity& fake_identity() const { return fake_identity_; }
++
+   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
+ 
+   void AddSetting(std::unique_ptr<Setting> setting);
+@@ -229,6 +236,8 @@ class UserProfile {
+  private:
+   uint64_t xuid_;
+   std::string name_;
++  bool fake_live_ = false;
++  fake_live::Identity fake_identity_{};
+   std::vector<std::unique_ptr<Setting>> setting_list_;
+   std::unordered_map<uint32_t, Setting*> settings_;
+   KernelState* kernel_state_ = nullptr;
 diff --git a/sdk/include/rex/system/xthread.h b/sdk/include/rex/system/xthread.h
 index a72911e..e0c27c2 100644
 --- a/sdk/include/rex/system/xthread.h
@@ -1514,11 +1693,101 @@ index 78734b4..454f1ad 100644
          auto item = e->AppendItem();
          *item = content_data;
        }
+diff --git a/sdk/src/kernel/xam/xam_misc.cpp b/sdk/src/kernel/xam/xam_misc.cpp
+index ff6cb56..a7b6b87 100644
+--- a/sdk/src/kernel/xam/xam_misc.cpp
++++ b/sdk/src/kernel/xam/xam_misc.cpp
+@@ -237,13 +237,11 @@ REX_EXPORT_STUB(__imp__XNetLogonGetExtendedStatus);
+ REX_EXPORT_STUB(__imp__XNetLogonGetFlowToken);
+ REX_EXPORT_STUB(__imp__XNetLogonGetLastUPnPStatus);
+ REX_EXPORT_STUB(__imp__XNetLogonGetLoggedOnUsers);
+-REX_EXPORT_STUB(__imp__XNetLogonGetMachineID);
+ REX_EXPORT_STUB(__imp__XNetLogonGetNatType);
+ REX_EXPORT_STUB(__imp__XNetLogonGetServiceInfo);
+ REX_EXPORT_STUB(__imp__XNetLogonGetServiceNetworkID);
+ REX_EXPORT_STUB(__imp__XNetLogonGetState);
+ REX_EXPORT_STUB(__imp__XNetLogonGetTicketOpt);
+-REX_EXPORT_STUB(__imp__XNetLogonGetTitleID);
+ REX_EXPORT_STUB(__imp__XNetLogonGetTitleVersion);
+ REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
+ REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
+diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
+index 58e36a4..33d7d5b 100644
+--- a/sdk/src/kernel/xam/xam_net.cpp
++++ b/sdk/src/kernel/xam/xam_net.cpp
+@@ -436,6 +436,18 @@ struct XnAddrStatus {
+ };
+ 
+ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
++  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
++  if (user_profile->fake_live()) {
++    const auto& identity = user_profile->fake_identity();
++    addr_ptr->ina.s_addr = htonl(fake_live::kFakeIpv4);
++    addr_ptr->inaOnline.s_addr = htonl(fake_live::kFakeIpv4);
++    addr_ptr->wPortOnline = fake_live::kFakeOnlinePort;
++    std::memcpy(addr_ptr->abEnet, identity.mac, sizeof(addr_ptr->abEnet));
++    const auto online_id = fake_live::OnlineId(identity);
++    std::memcpy(addr_ptr->abOnline, online_id.data(), online_id.size());
++    return fake_live::XnAddrStatus(true);
++  }
++
+   // Just return a loopback address atm.
+   addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
+   addr_ptr->inaOnline.s_addr = 0;
+@@ -505,10 +517,25 @@ struct XEthernetStatus {
+   static const uint32_t XNET_ETHERNET_LINK_HALF_DUPLEX = 0x10;
+ };
+ 
+-u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
++// The game calls this while building a request for Live's web services and only checks the sign.
++u32 XNetLogonGetMachineID_entry(mapped_u64 machine_id_ptr) {
++  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
++  if (machine_id_ptr && user_profile->fake_live()) {
++    *machine_id_ptr = user_profile->fake_identity().machine_id;
++  }
+   return 0;
+ }
+ 
++// The argument is a service category (the game passes 2 and 5) and the result goes into the same
++// request. Off: hand the argument back, as the old stub did. On: the game's own title id (a guess).
++u32 XNetLogonGetTitleID_entry(u32 service) {
++  return REX_KERNEL_STATE()->user_profile()->fake_live() ? 0x454107EC : service;
++}
++
++u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
++  return fake_live::EthernetLinkStatus(REX_KERNEL_STATE()->user_profile()->fake_live());
++}
++
+ u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle, mapped_u32 pdns) {
+   // TODO(gibbed): actually implement this
+   if (pdns) {
+@@ -963,6 +990,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+            rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
+ REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
+            rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
++REX_EXPORT(__imp__XNetLogonGetMachineID, rex::kernel::xam::XNetLogonGetMachineID_entry)
++REX_EXPORT(__imp__XNetLogonGetTitleID, rex::kernel::xam::XNetLogonGetTitleID_entry)
+ REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
+ REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
+ REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
 diff --git a/sdk/src/kernel/xam/xam_user.cpp b/sdk/src/kernel/xam/xam_user.cpp
-index 8778066..93f380f 100644
+index 8778066..f1ac1e4 100644
 --- a/sdk/src/kernel/xam/xam_user.cpp
 +++ b/sdk/src/kernel/xam/xam_user.cpp
-@@ -598,6 +598,8 @@ class XStaticAchievementEnumerator : public XEnumerator {
+@@ -382,8 +382,10 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value)
+     }
+   }
+ 
+-  // If we deny everything, games should hopefully not try to do stuff.
+-  *out_value = 0;
++  // If we deny everything, games should hopefully not try to do stuff. With online_fake_live on,
++  // the first user is granted the online privileges instead.
++  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
++  *out_value = rex::system::xam::fake_live::PrivilegeValue(user_profile->fake_live(), mask);
+   return X_ERROR_SUCCESS;
+ }
+ 
+@@ -598,6 +600,8 @@ class XStaticAchievementEnumerator : public XEnumerator {
  u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 xuid, u32 flags,
                                               u32 offset, u32 count, mapped_u32 buffer_size_ptr,
                                               mapped_u32 handle_ptr) {
@@ -1690,7 +1959,7 @@ index f4e0efd..3fe81be 100644
  }
  
 diff --git a/sdk/src/system/kernel_state.cpp b/sdk/src/system/kernel_state.cpp
-index 697399c..33ee983 100644
+index 697399c..f8c6a3a 100644
 --- a/sdk/src/system/kernel_state.cpp
 +++ b/sdk/src/system/kernel_state.cpp
 @@ -23,6 +23,7 @@
@@ -1711,7 +1980,15 @@ index 697399c..33ee983 100644
  
  namespace rex::system {
  
-@@ -121,6 +125,9 @@ KernelState::KernelState(Runtime* emulator)
+@@ -72,6 +76,7 @@ KernelState::KernelState(Runtime* emulator)
+   if (!user_data_root.empty()) {
+     user_data_root = std::filesystem::absolute(user_data_root);
+   }
++  user_profile_->MaybeEnableFakeLive(user_data_root);
+   content_manager_ = std::make_unique<xam::ContentManager>(this, user_data_root);
+ 
+   if (shared_kernel_state_ != nullptr) {
+@@ -121,6 +126,9 @@ KernelState::KernelState(Runtime* emulator)
    // SetExecutableModule() (e.g. XMA decoder) can link into its thread_list.
    // SetExecutableModule() will re-initialize it fully with XEX header values.
    InitializeProcess(&globals->title_process, X_PROCTYPE_USER, 0, 0, 0);
@@ -1721,7 +1998,7 @@ index 697399c..33ee983 100644
  }
  
  void KernelState::InitializeProcess(X_KPROCESS* process, uint32_t process_type, uint8_t unk_18,
-@@ -161,14 +168,30 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
+@@ -161,14 +169,30 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
  }
  
  KernelState::~KernelState() {
@@ -1755,7 +2032,7 @@ index 697399c..33ee983 100644
  
    // Unload through UnloadUserModule so the recompiled-DLL teardown runs.
    // call_entry=false because guest DllMain is unsafe at shutdown.
-@@ -649,14 +672,14 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
+@@ -649,14 +673,14 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
      dispatch_thread_running_ = true;
      dispatch_thread_ = object_ref<XHostThread>(new XHostThread(this, 128 * 1024, 0, [this]() {
        auto global_lock = global_critical_region_.AcquireDeferred();
@@ -1777,7 +2054,7 @@ index 697399c..33ee983 100644
          }
          auto fn = std::move(dispatch_queue_.front());
          dispatch_queue_.pop_front();
-@@ -1070,10 +1093,106 @@ void KernelState::OnThreadExit(XThread* thread) {
+@@ -1070,10 +1094,106 @@ void KernelState::OnThreadExit(XThread* thread) {
    // Must be called on executing thread.
    assert_true(XThread::GetCurrentThread() == thread);
  
@@ -2361,6 +2638,41 @@ index 78826a6..e715bb3 100644
  }
  
  }  // namespace xam
+diff --git a/sdk/src/system/xam/user_profile.cpp b/sdk/src/system/xam/user_profile.cpp
+index a77f5e6..9b3b5cc 100644
+--- a/sdk/src/system/xam/user_profile.cpp
++++ b/sdk/src/system/xam/user_profile.cpp
+@@ -13,14 +13,30 @@
+ 
+ #include <fmt/format.h>
+ 
++#include <rex/cvar.h>
+ #include <rex/logging.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xam/user_profile.h>
+ 
++REXCVAR_DEFINE_BOOL(online_fake_live, false, "Online",
++                    "Pretend the profile is signed in to Xbox Live so the online menus open");
++
+ namespace rex {
+ namespace system {
+ namespace xam {
+ 
++void UserProfile::MaybeEnableFakeLive(const std::filesystem::path& user_data_root) {
++  if (!REXCVAR_GET(online_fake_live)) {
++    return;
++  }
++  const auto seed = fake_live::LoadOrCreateSeed(user_data_root / "online_identity.bin");
++  fake_identity_ = fake_live::MakeIdentity(seed);
++  xuid_ = fake_identity_.xuid;
++  name_ = fake_identity_.gamertag;
++  fake_live_ = true;
++  REXSYS_INFO("fake Live on: {} {:016x}", name_, xuid_);
++}
++
+ UserProfile::UserProfile() {
+   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
+   // if non-zero, it prevents the user from playing the game.
 diff --git a/sdk/src/system/xobject.cpp b/sdk/src/system/xobject.cpp
 index d358f39..e3bee26 100644
 --- a/sdk/src/system/xobject.cpp
