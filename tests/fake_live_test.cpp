@@ -76,6 +76,20 @@ void OnlineIdBytes() {
   CHECK(fl::kFakeOnlinePort == 3074);
 }
 
+void EaServiceHosts() {
+  CHECK(fl::IsEaServiceHost("fesl.ea.com"));
+  CHECK(fl::IsEaServiceHost("MESSAGING.EA.COM"));
+  CHECK(fl::IsEaServiceHost("ea.com"));
+  CHECK(fl::IsEaServiceHost("a.b.ea.com"));
+  CHECK(!fl::IsEaServiceHost(""));
+  CHECK(!fl::IsEaServiceHost("notea.com"));
+  CHECK(!fl::IsEaServiceHost("ea.com.evil.example"));
+  CHECK(!fl::IsEaServiceHost("example.com"));
+  CHECK(!fl::IsEaServiceHost("fesl.ea.co"));
+  CHECK(fl::kDnsOk == 0);
+  CHECK(fl::kDnsHostNotFound == 11001);
+}
+
 void SeedPersists(const fs::path& folder) {
   const fs::path file = folder / "online_identity.bin";
   const uint64_t first = fl::LoadOrCreateSeed(file);
@@ -108,6 +122,7 @@ int main(int argc, char** argv) {
   IdentityShape();
   IdentityStable();
   OnlineIdBytes();
+  EaServiceHosts();
   SeedPersists(folder);
   SeedRepairs(folder);
   std::cout << "fake_live: all checks passed\n";
