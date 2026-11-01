@@ -4525,15 +4525,16 @@ index 78826a6..e715bb3 100644
  
  }  // namespace xam
 diff --git a/sdk/src/system/xam/user_profile.cpp b/sdk/src/system/xam/user_profile.cpp
-index a77f5e6..32c880e 100644
+index a77f5e6..8a064a2 100644
 --- a/sdk/src/system/xam/user_profile.cpp
 +++ b/sdk/src/system/xam/user_profile.cpp
-@@ -9,18 +9,115 @@
+@@ -9,18 +9,124 @@
   * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
 +#include <atomic>
 +#include <chrono>
++#include <exception>
 +#include <functional>
 +#include <mutex>
  #include <sstream>
@@ -4577,24 +4578,32 @@ index a77f5e6..32c880e 100644
 +static void StartCallWatchdog() {
 +  static std::once_flag started;
 +  std::call_once(started, [] {
-+    std::thread([] {
-+      int64_t reported_for = 0;
-+      for (;;) {
-+        std::this_thread::sleep_for(std::chrono::seconds(2));
-+        const int64_t last = g_call_ring.LastCallMs();
-+        const int64_t now = NowMs();
-+        if (last == 0 || now - last < 6000 || reported_for == last) {
-+          continue;
++    try {
++      // Never detached or destroyed: on the Switch std::thread::detach() throws std::system_error (see
++      // xma_context.cpp), and a joinable std::thread destroyed at exit would terminate. A failure to
++      // start is only logged: this is a diagnostic and must never stop the game.
++      static std::thread* watchdog = new std::thread([] {
++        int64_t reported_for = 0;
++        for (;;) {
++          std::this_thread::sleep_for(std::chrono::seconds(2));
++          const int64_t last = g_call_ring.LastCallMs();
++          const int64_t now = NowMs();
++          if (last == 0 || now - last < 6000 || reported_for == last) {
++            continue;
++          }
++          reported_for = last;
++          REXKRNL_WARN("fake Live: no traced kernel calls for {} ms; the last calls were:", now - last);
++          for (const auto& call : g_call_ring.Snapshot(40)) {
++            REXKRNL_WARN("fake Live:   -{} ms thread {:x} {} ({:#x}, {:#x}, {:#x}, {:#x})",
++                         now - call.time_ms, call.thread & 0xFFFFFF, call.name, call.args[0],
++                         call.args[1], call.args[2], call.args[3]);
++          }
 +        }
-+        reported_for = last;
-+        REXKRNL_WARN("fake Live: no traced kernel calls for {} ms; the last calls were:", now - last);
-+        for (const auto& call : g_call_ring.Snapshot(40)) {
-+          REXKRNL_WARN("fake Live:   -{} ms thread {:x} {} ({:#x}, {:#x}, {:#x}, {:#x})",
-+                       now - call.time_ms, call.thread & 0xFFFFFF, call.name, call.args[0],
-+                       call.args[1], call.args[2], call.args[3]);
-+        }
-+      }
-+    }).detach();
++      });
++      (void)watchdog;
++    } catch (const std::exception& error) {
++      REXKRNL_WARN("fake Live: the call watchdog did not start: {}", error.what());
++    }
 +  });
 +}
 +
