@@ -483,10 +483,10 @@ index 0000000..62fe8f2
 +}  // namespace rex::system
 diff --git a/sdk/include/rex/system/xam/fake_live.h b/sdk/include/rex/system/xam/fake_live.h
 new file mode 100644
-index 0000000..ea078bf
+index 0000000..c7fd4f5
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/fake_live.h
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,268 @@
 +#pragma once
 +
 +// Values the kernel reports when the profile is made to look signed in to Xbox Live.
@@ -603,6 +603,17 @@ index 0000000..ea078bf
 +// (seen on hardware: XLiveBase message 0x58007 with 0x45410004), and the port of EA's FESL login.
 +constexpr uint32_t kEaServiceId = 0x45410004;
 +constexpr uint16_t kEaServicePort = 18210;
++
++// The port the 360 game dials for its account service (seen on hardware). The PC server listens
++// on online_server_port instead; Theater (18215) and the messenger (13505) use the ports its
++// greeting announces, which must be left alone.
++constexpr uint16_t kGameLoginPort = 18220;
++
++inline uint16_t RedirectedPort(uint16_t asked_port, int32_t online_server_port) {
++  return (online_server_port > 0 && asked_port == kGameLoginPort)
++             ? static_cast<uint16_t>(online_server_port)
++             : asked_port;
++}
 +
 +// XONLINE_SERVICE_INFO as the guest reads it: service id (big-endian 32 bit), IPv4 address in
 +// network order, port (big-endian 16 bit), reserved 16 bits = 0. `ipv4_host_order` is the address
@@ -2686,7 +2697,7 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..d50b8cc 100644
+index 58e36a4..45caf37 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
 @@ -12,7 +12,11 @@
@@ -3000,7 +3011,7 @@ index 58e36a4..d50b8cc 100644
 +  const int32_t port_override = REXCVAR_GET(online_server_port);
 +  if (fake_live && port_override > 0 && xeOnlineServerAddress(&server_address) &&
 +      static_cast<uint32_t>(sin->sin_addr) == server_address) {
-+    patched.sin_port = static_cast<uint16_t>(port_override);
++    patched.sin_port = fake_live::RedirectedPort(static_cast<uint16_t>(sin->sin_port), port_override);
 +    raw = reinterpret_cast<const XSOCKADDR*>(&patched);
 +  }
 +  N_XSOCKADDR native_name(raw);

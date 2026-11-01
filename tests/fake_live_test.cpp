@@ -438,6 +438,14 @@ void ServerGarbageIsForwardedUntouched() {
   CHECK(Text(FromServer(shim, memcheck).to_game) == memcheck);  // still raw once it stopped parsing
 }
 
+void ServerPortReplacesOnlyTheLoginPort() {
+  CHECK(fl::RedirectedPort(18220, 18210) == 18210);  // the 360's account port becomes the server's
+  CHECK(fl::RedirectedPort(18215, 18210) == 18215);  // Theater keeps the port the server announced
+  CHECK(fl::RedirectedPort(13505, 18210) == 13505);  // so does the messenger
+  CHECK(fl::RedirectedPort(18220, 0) == 18220);      // no override set
+  CHECK(fl::RedirectedPort(18220, -5) == 18220);
+}
+
 std::string HelloReply(uint32_t word) {
   return fesl::EncodeFrame("fsys", word,
                            "domainPartition.domain=eagames\nmessengerIp=188.27.48.18\nmessengerPort=13505\n"
@@ -646,6 +654,7 @@ int main(int argc, char** argv) {
   LoginWithTakenNameReportsTheLoginError();
   ServerFramesPassThroughToTheGame();
   ServerGarbageIsForwardedUntouched();
+  ServerPortReplacesOnlyTheLoginPort();
   HelloPointsTheaterAndMessengerAtTheReachableHost();
   HelloIsUntouchedWithoutAHost();
   OtherFeslFramesKeepTheirAddresses();
