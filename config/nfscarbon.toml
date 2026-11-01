@@ -41,6 +41,8 @@ audio_xma_profile = false
 # online_server_host = ""
 # TCP port to use instead of the game's own when it connects to online_server_host. 0 = the game's port.
 # online_server_port = 0
+# With online_fake_live on, create the game's UDP tunnel in its encrypted mode so a PC community server's race transport accepts it (standard edition).
+# online_tunnel_rc4 = true
 
 # Texture memory (MiB) above which the least recently used textures are freed. Default 704 on the Switch.
 # carbon_gpu_texture_budget_mb = 704

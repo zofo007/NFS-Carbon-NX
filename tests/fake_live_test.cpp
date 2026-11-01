@@ -473,6 +473,21 @@ void OtherFragmentedCommandsAreNotTraced() {
   CHECK(shim.TakeTrace().empty());
 }
 
+void CallRingKeepsTheLastCallsOldestFirst() {
+  fl::CallRing<4> ring;
+  CHECK(ring.Snapshot(3).empty());
+  for (uint32_t i = 1; i <= 6; ++i) {
+    ring.Record(i * 10, 7, "Call", {i, 0, 0, 0});
+  }
+  const auto last_three = ring.Snapshot(3);
+  CHECK(last_three.size() == 3);
+  CHECK(last_three[0].args[0] == 4 && last_three[1].args[0] == 5 && last_three[2].args[0] == 6);
+  CHECK(last_three[2].time_ms == 60 && last_three[2].thread == 7);
+  CHECK(std::string(last_three[0].name) == "Call");
+  CHECK(ring.Snapshot(100).size() == 4);  // never more than it holds
+  CHECK(ring.LastCallMs() == 60);
+}
+
 void ServerPortReplacesOnlyTheLoginPort() {
   CHECK(fl::RedirectedPort(18220, 18210) == 18210);  // the 360's account port becomes the server's
   CHECK(fl::RedirectedPort(18215, 18210) == 18215);  // Theater keeps the port the server announced
@@ -727,6 +742,7 @@ int main(int argc, char** argv) {
   Base64Decodes();
   FragmentedMatchRequestIsDecodedForTheTrace();
   OtherFragmentedCommandsAreNotTraced();
+  CallRingKeepsTheLastCallsOldestFirst();
   TheaterAddressesAreRewrittenToTheReachableHost();
   TheaterFramesWithoutTheAnnouncedAddressAreUntouched();
   TheaterIsUntouchedWithoutAHost();

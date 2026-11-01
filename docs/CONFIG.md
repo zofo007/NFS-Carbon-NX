@@ -29,7 +29,8 @@ editing. The release file ships the values below under "Shipped"; everything els
 | `online_fake_live` | `false` | `true` makes the game see a profile signed in to Xbox Live, with online privileges and a live network link, so the online menus open. The profile gets a made-up gamertag and XUID, generated once and kept in `user/online_identity.bin`. Nothing connects to any server yet. Existing saves and profile settings are not affected (they stay under the offline profile). Tried on a Switch: the online entry opens and the game then tries to connect to EA's servers, which no longer exist, so it cannot go further yet. |
 
 | `online_server_host` | `""` | With `online_fake_live` on, the game's lookups of EA's service names (`fesl.ea.com`, `messaging.ea.com`, anything under `ea.com`) resolve to this host or IPv4 address, so the game connects there instead. Empty means no redirect. Starts the Switch network service when first used. Only point it at a server whose operator agreed. |
-| `online_server_port` | `0` | With `online_server_host` set, connections the game makes to that server use this TCP port instead of the one the game picked (the game's own login port is 18220; a PC-style server listens on 18210). `0` keeps the game's port. |
+| `online_server_port` | `0` | With `online_server_host` set, the game's login connection (it dials port 18220; a PC-style server listens on 18210) goes to this TCP port. Its other connections (Theater 18215, messenger 13505) keep the ports the server announces. `0` keeps the game's port. |
+| `online_tunnel_rc4` | `true` | With `online_fake_live` on, the game's UDP tunnel is created in its encrypted mode, which a PC community server's race transport needs (the console sends it in clear text). Standard edition. |
 
 ## Quality and speed
 

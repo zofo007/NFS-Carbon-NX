@@ -483,10 +483,10 @@ index 0000000..62fe8f2
 +}  // namespace rex::system
 diff --git a/sdk/include/rex/system/xam/fake_live.h b/sdk/include/rex/system/xam/fake_live.h
 new file mode 100644
-index 0000000..c7fd4f5
+index 0000000..9238c65
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/fake_live.h
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,314 @@
 +#pragma once
 +
 +// Values the kernel reports when the profile is made to look signed in to Xbox Live.
@@ -500,9 +500,11 @@ index 0000000..c7fd4f5
 +#include <cstring>
 +#include <filesystem>
 +#include <fstream>
++#include <mutex>
 +#include <random>
 +#include <string_view>
 +#include <system_error>
++#include <vector>
 +
 +namespace rex::system::xam::fake_live {
 +
@@ -530,6 +532,50 @@ index 0000000..c7fd4f5
 +inline uint32_t XnAddrStatus(bool live) {
 +  return live ? (0x04 | 0x02 | 0x20 | 0x40 | 0x80) : 0x04;
 +}
++
++// The most recent kernel calls the game made, kept so a hang can be read afterwards: when the game
++// stops calling anything for a while, the last few entries show what it was doing.
++struct CallRecord {
++  int64_t time_ms = 0;
++  uint64_t thread = 0;
++  const char* name = "";
++  std::array<uint32_t, 4> args{};
++};
++
++template <size_t Capacity>
++class CallRing {
++ public:
++  void Record(int64_t time_ms, uint64_t thread, const char* name, std::array<uint32_t, 4> args) {
++    std::lock_guard<std::mutex> guard(lock_);
++    entries_[next_ % Capacity] = CallRecord{time_ms, thread, name, args};
++    ++next_;
++    last_call_ms_ = time_ms;
++  }
++
++  // The last `count` calls (fewer if fewer were made), oldest first.
++  std::vector<CallRecord> Snapshot(size_t count) const {
++    std::lock_guard<std::mutex> guard(lock_);
++    const size_t held = next_ < Capacity ? next_ : Capacity;
++    const size_t take = count < held ? count : held;
++    std::vector<CallRecord> out;
++    out.reserve(take);
++    for (size_t i = next_ - take; i < next_; ++i) {
++      out.push_back(entries_[i % Capacity]);
++    }
++    return out;
++  }
++
++  int64_t LastCallMs() const {
++    std::lock_guard<std::mutex> guard(lock_);
++    return last_call_ms_;
++  }
++
++ private:
++  mutable std::mutex lock_;
++  std::array<CallRecord, Capacity> entries_{};
++  size_t next_ = 0;
++  int64_t last_call_ms_ = 0;
++};
 +
 +struct Identity {
 +  uint64_t xuid;
@@ -4479,16 +4525,19 @@ index 78826a6..e715bb3 100644
  
  }  // namespace xam
 diff --git a/sdk/src/system/xam/user_profile.cpp b/sdk/src/system/xam/user_profile.cpp
-index a77f5e6..e2cb8ea 100644
+index a77f5e6..32c880e 100644
 --- a/sdk/src/system/xam/user_profile.cpp
 +++ b/sdk/src/system/xam/user_profile.cpp
-@@ -9,18 +9,74 @@
+@@ -9,18 +9,115 @@
   * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
 +#include <atomic>
 +#include <chrono>
++#include <functional>
++#include <mutex>
  #include <sstream>
++#include <thread>
  
  #include <fmt/format.h>
  
@@ -4508,11 +4557,46 @@ index a77f5e6..e2cb8ea 100644
 +static std::atomic<bool> g_trace_online_calls{false};
 +
 +REXCVAR_DEFINE_INT32(online_server_port, 0, "Online",
-+                     "When not 0, connections the game makes to the online_server_host address use this "
-+                     "TCP port instead of the one the game picked (the 360 game dials 18220, the PC "
-+                     "server listens on 18210)")
++                     "When not 0, the game's login connection to the online_server_host address (it dials "
++                     "port 18220) uses this TCP port instead (the PC server listens on 18210); its "
++                     "other connections keep the ports the server announces")
 +    .range(0, 65535)
 +    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++// The last traced kernel calls, whatever the log rate limit hides; read back when the game goes quiet.
++static rex::system::xam::fake_live::CallRing<256> g_call_ring;
++
++static int64_t NowMs() {
++  return std::chrono::duration_cast<std::chrono::milliseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++
++// A hang shows as the game making no traced call at all (it polls the network every frame while it
++// runs). After 6 s of silence the last calls are written to the log, once per silence.
++static void StartCallWatchdog() {
++  static std::once_flag started;
++  std::call_once(started, [] {
++    std::thread([] {
++      int64_t reported_for = 0;
++      for (;;) {
++        std::this_thread::sleep_for(std::chrono::seconds(2));
++        const int64_t last = g_call_ring.LastCallMs();
++        const int64_t now = NowMs();
++        if (last == 0 || now - last < 6000 || reported_for == last) {
++          continue;
++        }
++        reported_for = last;
++        REXKRNL_WARN("fake Live: no traced kernel calls for {} ms; the last calls were:", now - last);
++        for (const auto& call : g_call_ring.Snapshot(40)) {
++          REXKRNL_WARN("fake Live:   -{} ms thread {:x} {} ({:#x}, {:#x}, {:#x}, {:#x})",
++                       now - call.time_ms, call.thread & 0xFFFFFF, call.name, call.args[0],
++                       call.args[1], call.args[2], call.args[3]);
++        }
++      }
++    }).detach();
++  });
++}
 +
 +namespace rex::ppc::detail {
 +void TraceOnlineCall(const char* name, const PPCContext& ctx, std::atomic<int>& count,
@@ -4520,6 +4604,8 @@ index a77f5e6..e2cb8ea 100644
 +  if (!g_trace_online_calls.load(std::memory_order_relaxed)) {
 +    return;
 +  }
++  g_call_ring.Record(NowMs(), std::hash<std::thread::id>()(std::this_thread::get_id()), name,
++                     {ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32});
 +  const int n = count.fetch_add(1);
 +  if (n >= 40) {
 +    // After the first 40, one line per second per export keeps a long wait visible.
@@ -4550,6 +4636,7 @@ index a77f5e6..e2cb8ea 100644
 +  fake_account_secret_ = fake_live::LoadOrCreateSeed(user_data_root / "online_account.bin");
 +  fake_live_ = true;
 +  g_trace_online_calls = true;
++  StartCallWatchdog();
 +  // Warn level on purpose: it is flushed at once, so it survives a crash.
 +  REXSYS_WARN("fake Live on: {} {:016x}", online_name(), online_xuid());
 +}
