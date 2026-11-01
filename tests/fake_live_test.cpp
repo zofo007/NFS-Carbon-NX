@@ -438,6 +438,40 @@ void ServerGarbageIsForwardedUntouched() {
   CHECK(Text(FromServer(shim, memcheck).to_game) == memcheck);  // still raw once it stopped parsing
 }
 
+void Base64Decodes() {
+  CHECK(fesl::Base64Decode("VFhOPVN0YXJ0") == "TXN=Start");
+  CHECK(fesl::Base64Decode("W109MQpwbGF5ZXJzLjAub3duZXJJZD03Cg==") == "[]=1\nplayers.0.ownerId=7\n");
+  CHECK(fesl::Base64Decode("").empty());
+}
+
+// A request the game splits over frames: each carries "size=<decoded bytes>" and a slice of base64.
+std::string Fragment(const std::string& command, uint32_t word, const std::string& slice) {
+  return fesl::EncodeFrame(command, word, "size=43\ndata=" + slice + "\n");
+}
+
+void FragmentedMatchRequestIsDecodedForTheTrace() {
+  fesl::Shim shim(1, "Racer0001", kSecret);
+  const std::string first = Fragment("pnow", 0xB000000E, "VFhOPVN0YXJ0CnBsYXllcnMu");
+  const std::string second = Fragment("pnow", 0xB000000E, "W109MQpwbGF5ZXJzLjAub3duZXJJZD03Cg==");
+  fesl::Translation out = shim.FromGame(Bytes(first).data(), first.size());
+  CHECK(Text(out.to_server) == first);  // the server still gets every byte as sent
+  CHECK(shim.TakeTrace().empty());      // nothing to show until the last piece arrives
+  out = shim.FromGame(Bytes(second).data(), second.size());
+  CHECK(Text(out.to_server) == second);
+  const std::vector<std::string> trace = shim.TakeTrace();
+  CHECK(trace.size() == 1);
+  CHECK(trace[0].find("pnow") != std::string::npos);
+  CHECK(trace[0].find("TXN=Start|players.[]=1|players.0.ownerId=7|") != std::string::npos);
+  CHECK(shim.TakeTrace().empty());  // taken once
+}
+
+void OtherFragmentedCommandsAreNotTraced() {
+  fesl::Shim shim(1, "Racer0001", kSecret);
+  const std::string whole = Fragment("mtrx", 0xB0000006, "VFhOPVN0YXJ0CnBsYXllcnMuW109MQpwbGF5ZXJzLjAub3duZXJJZD03Cg==");
+  shim.FromGame(Bytes(whole).data(), whole.size());
+  CHECK(shim.TakeTrace().empty());
+}
+
 void ServerPortReplacesOnlyTheLoginPort() {
   CHECK(fl::RedirectedPort(18220, 18210) == 18210);  // the 360's account port becomes the server's
   CHECK(fl::RedirectedPort(18215, 18210) == 18215);  // Theater keeps the port the server announced
@@ -654,6 +688,9 @@ int main(int argc, char** argv) {
   LoginWithTakenNameReportsTheLoginError();
   ServerFramesPassThroughToTheGame();
   ServerGarbageIsForwardedUntouched();
+  Base64Decodes();
+  FragmentedMatchRequestIsDecodedForTheTrace();
+  OtherFragmentedCommandsAreNotTraced();
   ServerPortReplacesOnlyTheLoginPort();
   HelloPointsTheaterAndMessengerAtTheReachableHost();
   HelloIsUntouchedWithoutAHost();
