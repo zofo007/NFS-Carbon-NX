@@ -746,10 +746,10 @@ index 0000000..ea078bf
 +}  // namespace rex::system::xam::fake_live
 diff --git a/sdk/include/rex/system/xam/fesl_shim.h b/sdk/include/rex/system/xam/fesl_shim.h
 new file mode 100644
-index 0000000..a4e896f
+index 0000000..7f47603
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/fesl_shim.h
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,377 @@
 +#pragma once
 +/**
 + * Translation between the Xbox 360 build's online account protocol and the PC one.
@@ -831,10 +831,16 @@ index 0000000..a4e896f
 +
 +class Shim {
 + public:
-+  Shim(uint64_t own_xuid, std::string own_gamertag, uint64_t account_secret = 0)
++  // `service_host` is the address the server was reached at (dotted decimal). The server's greeting
++  // announces its own idea of the Theater and messenger addresses, which may not answer from here
++  // (it announced 188.27.48.18 while the name resolves to 188.27.34.215); with a host given, the
++  // greeting is rewritten to point them at the address that is known to work.
++  Shim(uint64_t own_xuid, std::string own_gamertag, uint64_t account_secret = 0,
++       std::string service_host = {})
 +      : own_xuid_(own_xuid),
 +        own_gamertag_(std::move(own_gamertag)),
-+        password_(AccountPassword(account_secret)) {}
++        password_(AccountPassword(account_secret)),
++        service_host_(std::move(service_host)) {}
 +
 +  // Bytes the game sent. Whole frames are handled one by one; a partial frame waits for the rest.
 +  Translation FromGame(const uint8_t* data, size_t size) {
@@ -945,6 +951,14 @@ index 0000000..a4e896f
 +
 +  void HandleServerFrame(const uint8_t* frame, size_t length, Translation* out) {
 +    const std::string_view command(reinterpret_cast<const char*>(frame), 4);
++    if (command == "fsys" && !service_host_.empty()) {
++      const std::string_view hello_body(reinterpret_cast<const char*>(frame) + kHeaderSize,
++                                        length - kHeaderSize);
++      if (Field(hello_body, "TXN") == "Hello") {
++        Append(&out->to_game, RewriteHello(ReadBigEndian32(frame + 4), hello_body));
++        return;
++      }
++    }
 +    const auto found = pending_.find(ReadBigEndian32(frame + 4));
 +    if (command != "acct" || found == pending_.end()) {
 +      out->to_game.insert(out->to_game.end(), frame, frame + length);
@@ -955,6 +969,32 @@ index 0000000..a4e896f
 +    Job job = std::move(found->second);
 +    pending_.erase(found);
 +    Continue(std::move(job), body, out);
++  }
++
++  // The greeting with theaterIp and messengerIp replaced by the address that is known to answer;
++  // every other line, and the transaction word, stay as the server sent them.
++  std::string RewriteHello(uint32_t word, std::string_view body) const {
++    std::string lines;
++    size_t start = 0;
++    while (start < body.size()) {
++      size_t end = body.find('\n', start);
++      if (end == std::string_view::npos) {
++        end = body.size();
++      }
++      std::string_view line = body.substr(start, end - start);
++      while (!line.empty() && (line.back() == '\0' || line.back() == '\r')) {
++        line.remove_suffix(1);
++      }
++      if (line.substr(0, 10) == "theaterIp=") {
++        lines += "theaterIp=" + service_host_ + "\n";
++      } else if (line.substr(0, 12) == "messengerIp=") {
++        lines += "messengerIp=" + service_host_ + "\n";
++      } else if (!line.empty()) {
++        lines += std::string(line) + "\n";
++      }
++      start = end + 1;
++    }
++    return EncodeFrame("fsys", word, lines);
 +  }
 +
 +  void StartJob(uint32_t game_word, std::string game_txn, std::string_view body, Translation* out) {
@@ -1077,6 +1117,7 @@ index 0000000..a4e896f
 +  uint64_t own_xuid_;
 +  std::string own_gamertag_;
 +  std::string password_;
++  std::string service_host_;
 +  std::vector<uint8_t> game_pending_;
 +  std::vector<uint8_t> server_pending_;
 +  bool game_passthrough_ = false;
@@ -1193,7 +1234,7 @@ index 0000000..da81337
 +
 +}  // namespace rex::system::xam::xlive_async
 diff --git a/sdk/include/rex/system/xsocket.h b/sdk/include/rex/system/xsocket.h
-index a1b4443..67f0174 100644
+index a1b4443..5078abc 100644
 --- a/sdk/include/rex/system/xsocket.h
 +++ b/sdk/include/rex/system/xsocket.h
 @@ -11,9 +11,13 @@
@@ -1210,7 +1251,7 @@ index a1b4443..67f0174 100644
  #include <rex/system/xobject.h>
  #include <rex/types.h>
  
-@@ -101,13 +105,28 @@ class XSocket : public XObject {
+@@ -101,13 +105,30 @@ class XSocket : public XObject {
  
    X_STATUS SetOption(uint32_t level, uint32_t optname, void* optval_ptr, uint32_t optlen);
    X_STATUS IOControl(uint32_t cmd, uint8_t* arg_ptr);
@@ -1231,15 +1272,17 @@ index a1b4443..67f0174 100644
  
 +  // Puts the 360-to-PC account translation on this connection (see xam/fesl_shim.h). Frames the PC
 +  // server cannot answer are answered locally and handed to the game by Recv.
-+  void EnableFeslShim(uint64_t own_xuid, std::string own_gamertag, uint64_t account_secret) {
-+    shim_ = std::make_unique<xam::fesl::Shim>(own_xuid, std::move(own_gamertag), account_secret);
++  void EnableFeslShim(uint64_t own_xuid, std::string own_gamertag, uint64_t account_secret,
++                      std::string service_host) {
++    shim_ = std::make_unique<xam::fesl::Shim>(own_xuid, std::move(own_gamertag), account_secret,
++                                              std::move(service_host));
 +  }
 +  bool has_fesl_shim() const { return shim_ != nullptr; }
 +
    int Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags);
    int Send(const uint8_t* buf, uint32_t buf_len, uint32_t flags);
  
-@@ -135,12 +154,17 @@ class XSocket : public XObject {
+@@ -135,12 +156,17 @@ class XSocket : public XObject {
    Type type_;           // Type (DGRAM/Stream/etc)
    Protocol proto_;      // Protocol (TCP/UDP/etc)
    bool secure_ = true;  // Secure socket (encryption enabled)
@@ -2643,7 +2686,7 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..cd9bb08 100644
+index 58e36a4..d50b8cc 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
 @@ -12,7 +12,11 @@
@@ -2969,7 +3012,7 @@ index 58e36a4..cd9bb08 100644
 +    socket->EnableFeslShim(
 +        identity.xuid,
 +        std::string(identity.gamertag, strnlen(identity.gamertag, sizeof(identity.gamertag))),
-+        REX_KERNEL_STATE()->user_profile()->fake_account_secret());
++        REX_KERNEL_STATE()->user_profile()->fake_account_secret(), Ipv4ToString(server_address));
 +  }
 +  if (fake_live) {
 +    FAKE_LIVE_TRACE_UP_TO(20, "fake Live: connect socket {} to {}:{} (asked {}) -> {} (winsock {}, errno {})",

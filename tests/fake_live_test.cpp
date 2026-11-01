@@ -438,6 +438,44 @@ void ServerGarbageIsForwardedUntouched() {
   CHECK(Text(FromServer(shim, memcheck).to_game) == memcheck);  // still raw once it stopped parsing
 }
 
+std::string HelloReply(uint32_t word) {
+  return fesl::EncodeFrame("fsys", word,
+                           "domainPartition.domain=eagames\nmessengerIp=188.27.48.18\nmessengerPort=13505\n"
+                           "domainPartition.subDomain=NFS-2007\nTXN=Hello\nactivityTimeoutSecs=0\n"
+                           "theaterIp=188.27.48.18\ntheaterPort=18215\n");
+}
+
+void HelloPointsTheaterAndMessengerAtTheReachableHost() {
+  fesl::Shim shim(1, "Racer0001", kSecret, "188.27.34.215");
+  const std::string reply = Text(FromServer(shim, HelloReply(0x80000001)).to_game);
+  CHECK(reply.substr(0, 4) == "fsys" && WordOf(reply) == 0x80000001);
+  CHECK(Value(reply, "theaterIp") == "188.27.34.215");
+  CHECK(Value(reply, "messengerIp") == "188.27.34.215");
+  CHECK(Value(reply, "theaterPort") == "18215");  // ports stay as the server gave them
+  CHECK(Value(reply, "messengerPort") == "13505");
+  CHECK(Value(reply, "TXN") == "Hello");
+  CHECK(Value(reply, "domainPartition.subDomain") == "NFS-2007");
+  const uint32_t length = (uint32_t{static_cast<uint8_t>(reply[8])} << 24) |
+                          (uint32_t{static_cast<uint8_t>(reply[9])} << 16) |
+                          (uint32_t{static_cast<uint8_t>(reply[10])} << 8) |
+                          uint32_t{static_cast<uint8_t>(reply[11])};
+  CHECK(length == reply.size());  // the header length matches the rewritten body
+  CHECK(reply.back() == '\0');
+}
+
+void HelloIsUntouchedWithoutAHost() {
+  fesl::Shim shim(1, "Racer0001", kSecret);
+  const std::string hello = HelloReply(0x80000001);
+  CHECK(Text(FromServer(shim, hello).to_game) == hello);
+}
+
+void OtherFeslFramesKeepTheirAddresses() {
+  fesl::Shim shim(1, "Racer0001", kSecret, "188.27.34.215");
+  const std::string other =
+      fesl::EncodeFrame("fsys", 0x80000004, "TXN=GetPingSites\ntheaterIp=188.27.48.18\n");
+  CHECK(Text(FromServer(shim, other).to_game) == other);
+}
+
 void SeedPersists(const fs::path& folder) {
   const fs::path file = folder / "online_identity.bin";
   const uint64_t first = fl::LoadOrCreateSeed(file);
@@ -608,6 +646,9 @@ int main(int argc, char** argv) {
   LoginWithTakenNameReportsTheLoginError();
   ServerFramesPassThroughToTheGame();
   ServerGarbageIsForwardedUntouched();
+  HelloPointsTheaterAndMessengerAtTheReachableHost();
+  HelloIsUntouchedWithoutAHost();
+  OtherFeslFramesKeepTheirAddresses();
   SeedPersists(folder);
   SeedRepairs(folder);
   std::cout << "fake_live: all checks passed\n";
