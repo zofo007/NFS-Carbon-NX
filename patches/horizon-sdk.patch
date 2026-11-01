@@ -326,55 +326,6 @@ index 3df4776..1d5e30b 100644
  rex::runtime::Export* RegisterExport_xam(rex::runtime::Export* export_entry);
  
  // Registration functions, one per file.
-diff --git a/sdk/include/rex/system/adjustor_thunk.h b/sdk/include/rex/system/adjustor_thunk.h
-new file mode 100644
-index 0000000..784c166
---- /dev/null
-+++ b/sdk/include/rex/system/adjustor_thunk.h
-@@ -0,0 +1,43 @@
-+#pragma once
-+/**
-+ * C++ adjustor thunks: the six instructions the compiler emits to call a method through a
-+ * member-function delegate. They load an offset, a target and a base from the delegate object
-+ * (r3 + 4, + 8, + 12), move `this` by offset + base and jump to the target:
-+ *
-+ *   lwz r10,4(r3); lwz r11,12(r3); lwz r9,8(r3); add r3,r11,r10; mtctr r9; bctr
-+ *
-+ * The recompiler only registers a function it finds a direct call to. These thunks are reached
-+ * through function pointers stored in tables, so many were never registered and the first
-+ * indirect call into one stopped the game. The dispatcher uses this header to recognise such a
-+ * call and run the thunk instead.
-+ *
-+ * Header-only and free of kernel dependencies so it can be unit-tested on the host.
-+ */
-+
-+#include <cstddef>
-+#include <cstdint>
-+#include <cstring>
-+
-+namespace rex::system {
-+
-+constexpr size_t kAdjustorThunkSize = 24;
-+
-+// True when the 24 bytes of guest code (big-endian) are exactly the thunk above.
-+inline bool IsAdjustorThunk(const uint8_t* code) {
-+  static constexpr uint8_t kThunk[kAdjustorThunkSize] = {
-+      0x81, 0x43, 0x00, 0x04, 0x81, 0x63, 0x00, 0x0C, 0x81, 0x23, 0x00, 0x08,
-+      0x7C, 0x6B, 0x52, 0x14, 0x7D, 0x29, 0x03, 0xA6, 0x4E, 0x80, 0x04, 0x20};
-+  return std::memcmp(code, kThunk, kAdjustorThunkSize) == 0;
-+}
-+
-+struct AdjustorStep {
-+  uint64_t r3;      // the adjusted `this` (the recompiled add is 64-bit)
-+  uint32_t target;  // where the thunk jumps
-+};
-+
-+// What the thunk computes from the delegate's words at +4 (offset), +8 (target) and +12 (base).
-+inline AdjustorStep ApplyAdjustor(uint32_t offset, uint32_t target, uint32_t base) {
-+  return {static_cast<uint64_t>(base) + offset, target};
-+}
-+
-+}  // namespace rex::system
 diff --git a/sdk/include/rex/system/kernel_state.h b/sdk/include/rex/system/kernel_state.h
 index 9b9cf9e..d853a94 100644
 --- a/sdk/include/rex/system/kernel_state.h
@@ -428,6 +379,108 @@ index 9b9cf9e..d853a94 100644
    std::vector<object_ref<XNotifyListener>> notify_listeners_;
    bool has_notified_startup_ = false;
  
+diff --git a/sdk/include/rex/system/tail_call_thunk.h b/sdk/include/rex/system/tail_call_thunk.h
+new file mode 100644
+index 0000000..62fe8f2
+--- /dev/null
++++ b/sdk/include/rex/system/tail_call_thunk.h
+@@ -0,0 +1,96 @@
++#pragma once
++/**
++ * Short guest functions that only compute a jump target and tail-call it, such as:
++ *
++ *   virtual call:  lwz r12,0(r3); lwz r11,68(r12); mtctr r11; bctr
++ *   adjustor:      lwz r10,4(r3); lwz r11,12(r3); lwz r9,8(r3); add r3,r11,r10; mtctr r9; bctr
++ *
++ * The recompiler only registers a function it finds a direct call to. These thunks are reached
++ * through vtables and delegate tables, so about 250 in the game were never registered and the
++ * first indirect call into one stopped the game. The dispatcher uses RunTailCallThunk to execute
++ * such a function from the guest code itself.
++ *
++ * Only a straight run of loads, adds, moves and immediate arithmetic that ends in `mtctr; bctr` is
++ * accepted, and only on r0-r12 (the volatile registers a caller does not expect to survive).
++ * Anything else, including stores and branches, is refused so the caller can stop as before.
++ *
++ * Header-only and free of kernel dependencies so it can be unit-tested on the host.
++ */
++
++#include <cstddef>
++#include <cstdint>
++
++namespace rex::system {
++
++constexpr size_t kMaxTailCallThunkWords = 16;
++constexpr int kTailCallThunkRegisters = 13;  // r0-r12
++
++// Runs `code_size` bytes of big-endian guest code against `regs` (r0-r12, updated in place).
++// `load32(address)` reads a guest word. On success sets *target (the value of ctr) and returns true;
++// on anything unsupported returns false, leaving `regs` partly updated (callers use a copy).
++template <typename Load32>
++bool RunTailCallThunk(const uint8_t* code, size_t code_size, uint64_t* regs, Load32&& load32,
++                      uint32_t* target) {
++  constexpr uint32_t kBctr = 0x4E800420;
++  uint64_t ctr = 0;
++  bool ctr_set = false;
++  const size_t words = code_size / 4 < kMaxTailCallThunkWords ? code_size / 4 : kMaxTailCallThunkWords;
++  for (size_t i = 0; i < words; ++i) {
++    const uint8_t* p = code + i * 4;
++    const uint32_t w = (uint32_t{p[0]} << 24) | (uint32_t{p[1]} << 16) | (uint32_t{p[2]} << 8) |
++                       uint32_t{p[3]};
++    if (w == kBctr) {
++      if (!ctr_set) return false;
++      *target = static_cast<uint32_t>(ctr);
++      return true;
++    }
++    const uint32_t op = w >> 26;
++    const uint32_t rt = (w >> 21) & 31;  // rt, or rs for the store-form encodings below
++    const uint32_t ra = (w >> 16) & 31;
++    const uint32_t rb = (w >> 11) & 31;
++    const int64_t d = static_cast<int16_t>(w & 0xFFFF);
++    const auto base_of = [&](uint32_t reg) -> uint64_t { return reg == 0 ? 0 : regs[reg]; };
++    // Every form below names its registers in these fields (mtctr keeps 9 in `ra`); r13 and up
++    // (small-data base, stack) are not modelled.
++    if (rt >= kTailCallThunkRegisters || ra >= kTailCallThunkRegisters) {
++      return false;
++    }
++    switch (op) {
++      case 32: {  // lwz rt,d(ra)
++        regs[rt] = load32(static_cast<uint32_t>(base_of(ra)) + static_cast<uint32_t>(d));
++        break;
++      }
++      case 14:  // addi rt,ra,d
++        regs[rt] = base_of(ra) + static_cast<uint64_t>(d);
++        break;
++      case 15:  // addis rt,ra,d
++        regs[rt] = base_of(ra) + static_cast<uint64_t>(d * 65536);
++        break;
++      case 24:  // ori ra,rs,imm
++        regs[ra] = regs[rt] | (w & 0xFFFF);
++        break;
++      case 31: {
++        const uint32_t xo = (w >> 1) & 0x3FF;
++        if ((w & 1) != 0) return false;  // Rc: no condition register updates
++        if (xo == 266 && (w & 0x400) == 0) {  // add rt,ra,rb
++          if (rb >= kTailCallThunkRegisters) return false;
++          regs[rt] = regs[ra] + regs[rb];
++        } else if (xo == 444) {  // or ra,rs,rb (mr when rs == rb)
++          if (rb >= kTailCallThunkRegisters) return false;
++          regs[ra] = regs[rt] | regs[rb];
++        } else if (xo == 467 && (((w >> 16) & 31) | (((w >> 11) & 31) << 5)) == 9) {  // mtctr rs
++          ctr = regs[rt];
++          ctr_set = true;
++        } else {
++          return false;
++        }
++        break;
++      }
++      default:
++        return false;
++    }
++  }
++  return false;
++}
++
++}  // namespace rex::system
 diff --git a/sdk/include/rex/system/xam/fake_live.h b/sdk/include/rex/system/xam/fake_live.h
 new file mode 100644
 index 0000000..ea078bf
@@ -3126,18 +3179,18 @@ index f4e0efd..3fe81be 100644
  }
  
 diff --git a/sdk/src/system/function_dispatcher.cpp b/sdk/src/system/function_dispatcher.cpp
-index bd43109..a040a17 100644
+index bd43109..a54a20e 100644
 --- a/sdk/src/system/function_dispatcher.cpp
 +++ b/sdk/src/system/function_dispatcher.cpp
 @@ -20,6 +20,7 @@
  #include <rex/memory.h>
  #include <rex/ppc/context.h>
  #include <rex/runtime.h>
-+#include <rex/system/adjustor_thunk.h>
++#include <rex/system/tail_call_thunk.h>
  #include <rex/system/function_dispatcher.h>
  #include <rex/system/thread_state.h>
  
-@@ -34,9 +35,25 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
+@@ -34,9 +35,33 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
  
  }  // namespace
  
@@ -3146,19 +3199,27 @@ index bd43109..a040a17 100644
 -            ctx.last_indirect_target);
 +static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* base) {
 +  const uint32_t address = ctx.last_indirect_target;
-+  // An adjustor thunk nobody called directly was never registered: run it here.
-+  if (rex::system::IsAdjustorThunk(base + address)) {
-+    const uint32_t delegate = ctx.r3.u32;
-+    ctx.r10.u64 = memory::load_and_swap<uint32_t>(base + delegate + 4);
-+    ctx.r11.u64 = memory::load_and_swap<uint32_t>(base + delegate + 12);
-+    ctx.r9.u64 = memory::load_and_swap<uint32_t>(base + delegate + 8);
-+    const rex::system::AdjustorStep step =
-+        rex::system::ApplyAdjustor(ctx.r10.u32, ctx.r9.u32, ctx.r11.u32);
-+    ctx.r3.u64 = step.r3;
++  // A short vtable or delegate thunk nobody called directly was never registered: run it from its
++  // own code (see rex/system/tail_call_thunk.h) and carry on to where it jumps.
++  PPCRegister* const gpr[rex::system::kTailCallThunkRegisters] = {
++      &ctx.r0, &ctx.r1, &ctx.r2, &ctx.r3, &ctx.r4,  &ctx.r5,  &ctx.r6,
++      &ctx.r7, &ctx.r8, &ctx.r9, &ctx.r10, &ctx.r11, &ctx.r12};
++  uint64_t regs[rex::system::kTailCallThunkRegisters];
++  for (int i = 0; i < rex::system::kTailCallThunkRegisters; ++i) {
++    regs[i] = gpr[i]->u64;
++  }
++  uint32_t target = 0;
++  if (rex::system::RunTailCallThunk(
++          base + address, rex::system::kMaxTailCallThunkWords * 4, regs,
++          [base](uint32_t guest) { return memory::load_and_swap<uint32_t>(base + guest); },
++          &target)) {
++    for (int i = 0; i < rex::system::kTailCallThunkRegisters; ++i) {
++      gpr[i]->u64 = regs[i];
++    }
 +    const auto saved_ctr = ctx.ctr;
-+    ctx.ctr.u64 = step.target;
-+    ctx.last_indirect_target = step.target;
-+    ResolveIndirectFunction(step.target)(ctx, base);
++    ctx.ctr.u64 = target;
++    ctx.last_indirect_target = target;
++    ResolveIndirectFunction(target)(ctx, base);
 +    ctx.ctr = saved_ctr;
 +    return;
 +  }

@@ -1,4 +1,4 @@
-#include <rex/system/adjustor_thunk.h>
+#include <rex/system/tail_call_thunk.h>
 #include <rex/system/xam/fake_live.h>
 #include <rex/system/xam/fesl_shim.h>
 
@@ -8,7 +8,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -275,35 +277,87 @@ void SeedRepairs(const fs::path& folder) {
   CHECK(fl::LoadOrCreateSeed(folder / "missing-folder" / "x.bin") != 0);
 }
 
-// The six instructions at 0x82A30D40 in the Standard image (big-endian bytes).
-const uint8_t kRealThunk[24] = {0x81, 0x43, 0x00, 0x04, 0x81, 0x63, 0x00, 0x0C, 0x81, 0x23, 0x00, 0x08,
-                                0x7C, 0x6B, 0x52, 0x14, 0x7D, 0x29, 0x03, 0xA6, 0x4E, 0x80, 0x04, 0x20};
-
-void AdjustorThunkIsRecognised() {
-  CHECK(rex::system::IsAdjustorThunk(kRealThunk));
+// Guest code as big-endian bytes, and a small guest memory for the thunks to read.
+std::vector<uint8_t> Code(std::initializer_list<uint32_t> words) {
+  std::vector<uint8_t> bytes;
+  for (uint32_t word : words) {
+    for (int shift = 24; shift >= 0; shift -= 8) {
+      bytes.push_back(static_cast<uint8_t>(word >> shift));
+    }
+  }
+  return bytes;
 }
 
-void OtherCodeIsNotAnAdjustorThunk() {
-  uint8_t returns[24];
-  std::memcpy(returns, kRealThunk, sizeof(returns));
-  returns[20] = 0x4E;  // the last word becomes blr (4e800020): a normal return, not a tail call
-  returns[21] = 0x80;
-  returns[22] = 0x00;
-  returns[23] = 0x20;
-  CHECK(!rex::system::IsAdjustorThunk(returns));
-  uint8_t other_field[24];
-  std::memcpy(other_field, kRealThunk, sizeof(other_field));
-  other_field[3] = 0x10;  // lwz r10,16(r3): a different adjustment slot
-  CHECK(!rex::system::IsAdjustorThunk(other_field));
+struct ThunkRun {
+  bool ok = false;
+  uint32_t target = 0;
+  uint64_t regs[13] = {};
+  std::map<uint32_t, uint32_t> memory;
+  bool Run(const std::vector<uint8_t>& code) {
+    return ok = rex::system::RunTailCallThunk(
+               code.data(), code.size(), regs,
+               [this](uint32_t address) { return memory.at(address); }, &target);
+  }
+};
+
+void AdjustorThunkMovesThisAndJumps() {
+  // lwz r10,4(r3); lwz r11,12(r3); lwz r9,8(r3); add r3,r11,r10; mtctr r9; bctr (0x82A30D40)
+  ThunkRun run;
+  run.regs[3] = 0x3000;
+  run.memory = {{0x3004, 0x10}, {0x3008, 0x82A30D58}, {0x300C, 0x7000}};
+  CHECK(run.Run(Code({0x81430004, 0x8163000C, 0x81230008, 0x7C6B5214, 0x7D2903A6, 0x4E800420})));
+  CHECK(run.regs[3] == 0x7010);
+  CHECK(run.target == 0x82A30D58);
+  CHECK(run.regs[10] == 0x10 && run.regs[11] == 0x7000 && run.regs[9] == 0x82A30D58);
 }
 
-void AdjustorThunkMovesThisAndPicksTarget() {
-  // lwz r10,4(r3); lwz r11,12(r3); lwz r9,8(r3); add r3,r11,r10; mtctr r9; bctr
-  const rex::system::AdjustorStep step = rex::system::ApplyAdjustor(0x10, 0x82A30D58, 0x7000);
-  CHECK(step.r3 == 0x7010);
-  CHECK(step.target == 0x82A30D58);
-  const rex::system::AdjustorStep wrapped = rex::system::ApplyAdjustor(0xFFFFFFFF, 0x1, 0x2);
-  CHECK(wrapped.r3 == 0x100000001ull);  // the recompiled add is 64-bit
+void VirtualCallThunkReadsTheVtableSlot() {
+  // lwz r12,0(r3); lwz r11,68(r12); mtctr r11; bctr (0x82A2BD58)
+  ThunkRun run;
+  run.regs[3] = 0x1000;
+  run.memory = {{0x1000, 0x2000}, {0x2044, 0x82AB0000}};
+  CHECK(run.Run(Code({0x81830000, 0x816C0044, 0x7D6903A6, 0x4E800420})));
+  CHECK(run.target == 0x82AB0000);
+  CHECK(run.regs[12] == 0x2000);
+  CHECK(run.regs[3] == 0x1000);  // untouched: the real method still gets its own this
+}
+
+void MoveAndAddThunkKeepsArguments() {
+  // or r11,r5,r5; or r5,r6,r6; add r11,r3,r11; lwz r11,0(r11); mtctr r11; bctr
+  ThunkRun run;
+  run.regs[3] = 0x100;
+  run.regs[5] = 0x10;
+  run.regs[6] = 0x20;
+  run.memory = {{0x110, 0x82001234}};
+  CHECK(run.Run(Code({0x7CAB2B78, 0x7CC53378, 0x7D635A14, 0x816B0000, 0x7D6903A6, 0x4E800420})));
+  CHECK(run.regs[5] == 0x20);
+  CHECK(run.target == 0x82001234);
+}
+
+void AddressArithmeticThunk() {
+  // lis r11,0x82c6; ori r11,r11,0x8000; lwz r11,4(r11); mtctr r11; bctr
+  ThunkRun run;
+  run.memory = {{0x82C68004u, 0x82777777}};
+  CHECK(run.Run(Code({0x3D6082C6, 0x616B8000, 0x816B0004, 0x7D6903A6, 0x4E800420})));
+  CHECK(run.target == 0x82777777);
+}
+
+void CodeThatIsNotAPureTailCallIsRefused() {
+  ThunkRun run;
+  run.regs[3] = 0x1000;
+  run.memory = {{0x1000, 0x2000}, {0x2044, 0x82AB0000}};
+  CHECK(!run.Run(Code({0x4E800020})));                                          // blr
+  CHECK(!run.Run(Code({0x81830000, 0x816C0044, 0x7D6903A6, 0x4E800421})));      // bctrl
+  CHECK(!run.Run(Code({0x81830000, 0x90830000, 0x7D6903A6, 0x4E800420})));      // stw
+  CHECK(!run.Run(Code({0x48000001, 0x4E800420})));                              // bl
+  CHECK(!run.Run(Code({0x81A30000, 0x7DA903A6, 0x4E800420})));                  // reads r13
+  CHECK(!run.Run(Code({0x81830000, 0x816C0044, 0x7D6903A6})));                  // runs out of code
+  std::vector<uint32_t> loop(40, 0x39600001);                                   // never reaches bctr
+  std::vector<uint8_t> long_code;
+  for (uint32_t word : loop) {
+    for (int shift = 24; shift >= 0; shift -= 8) long_code.push_back(static_cast<uint8_t>(word >> shift));
+  }
+  CHECK(!run.Run(long_code));
 }
 
 int main(int argc, char** argv) {
@@ -327,9 +381,11 @@ int main(int argc, char** argv) {
   SplitFramesAreHeldUntilComplete();
   TwoFramesInOneBuffer();
   GarbageIsForwardedUntouched();
-  AdjustorThunkIsRecognised();
-  OtherCodeIsNotAnAdjustorThunk();
-  AdjustorThunkMovesThisAndPicksTarget();
+  AdjustorThunkMovesThisAndJumps();
+  VirtualCallThunkReadsTheVtableSlot();
+  MoveAndAddThunkKeepsArguments();
+  AddressArithmeticThunk();
+  CodeThatIsNotAPureTailCallIsRefused();
   SeedPersists(folder);
   SeedRepairs(folder);
   std::cout << "fake_live: all checks passed\n";
