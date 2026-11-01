@@ -3007,7 +3007,7 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..c1cff4c 100644
+index 58e36a4..137a4c3 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
 @@ -12,7 +12,13 @@
@@ -3040,7 +3040,7 @@ index 58e36a4..c1cff4c 100644
  #include <rex/system/xevent.h>
  #include <rex/system/xsocket.h>
  #include <rex/system/xthread.h>
-@@ -37,19 +45,101 @@
+@@ -37,19 +45,113 @@
  // NOTE: must be included last as it expects windows.h to already be included.
  #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
  #include <winsock2.h>                    // NOLINT(build/include_order)
@@ -3083,6 +3083,18 @@ index 58e36a4..c1cff4c 100644
 +  }
 +  return std::memcmp(bytes, "mtrx", 4) == 0 || std::memcmp(bytes, "rank", 4) == 0 ||
 +         std::memcmp(bytes, "pnow", 4) == 0;
++}
++
++// Up to `limit` bytes as hex: whole UDP datagrams, which can be decoded afterwards with the game's key.
++static std::string HexBytes(const uint8_t* bytes, size_t length, size_t limit) {
++  static const char kDigits[] = "0123456789abcdef";
++  std::string text;
++  for (size_t i = 0; i < length && i < limit; ++i) {
++    text += kDigits[bytes[i] >> 4];
++    text += kDigits[bytes[i] & 15];
++    text += ' ';
++  }
++  return text;
 +}
 +
 +static std::string HexPrefix(const uint8_t* bytes, size_t length) {
@@ -3142,7 +3154,7 @@ index 58e36a4..c1cff4c 100644
  // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
  enum {
    XNCALLER_INVALID = 0x0,
-@@ -295,25 +385,156 @@ u32 NetDll_WSAGetLastError_entry() {
+@@ -295,25 +397,161 @@ u32 NetDll_WSAGetLastError_entry() {
    return XThread::GetLastError();
  }
  
@@ -3181,6 +3193,10 @@ index 58e36a4..c1cff4c 100644
 +    const int received = socket->RecvFrom(REX_KERNEL_MEMORY()->TranslateVirtual(pending.buffer),
 +                                          pending.length, 0, &from, &from_length);
 +    if (received < 0) {
++      if (errno != EAGAIN && errno != EWOULDBLOCK) {
++        FAKE_LIVE_TRACE_UP_TO(10, "fake Live: UDP receive on socket {} failed (errno {})", pending.socket,
++                              errno);
++      }
 +      continue;  // nothing yet
 +    }
 +    StoreSender(pending.from, pending.from_length, from, from_length);
@@ -3192,9 +3208,10 @@ index 58e36a4..c1cff4c 100644
 +    if (pending.event) {
 +      xboxkrnl::xeNtSetEvent(pending.event, nullptr);
 +    }
-+    FAKE_LIVE_TRACE_UP_TO(60, "fake Live: UDP datagram of {} bytes from {}:{} given to the game",
-+                          received, Ipv4ToString(from.sin_addr),
-+                          static_cast<uint16_t>(from.sin_port));
++    FAKE_LIVE_TRACE_UP_TO(120, "fake Live: UDP datagram of {} bytes from {}:{} given to the game: {}",
++                          received, Ipv4ToString(from.sin_addr), static_cast<uint16_t>(from.sin_port),
++                          HexBytes(REX_KERNEL_MEMORY()->TranslateVirtual(pending.buffer),
++                                   static_cast<size_t>(received), 128));
 +  }
 +}
 +
@@ -3310,7 +3327,7 @@ index 58e36a4..c1cff4c 100644
  // If the socket is a VDP socket, buffer 0 is the game data length, and buffer 1
  // is the unencrypted game data.
  u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buffers,
-@@ -363,10 +584,35 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
+@@ -363,10 +601,35 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
    uint64_t timeout_wait = (uint64_t)timeout;
  
    X_STATUS result = 0;
@@ -3350,7 +3367,7 @@ index 58e36a4..c1cff4c 100644
  
    if (XFAILED(result)) {
      uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
-@@ -436,6 +682,19 @@ struct XnAddrStatus {
+@@ -436,6 +699,19 @@ struct XnAddrStatus {
  };
  
  u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
@@ -3370,7 +3387,7 @@ index 58e36a4..c1cff4c 100644
    // Just return a loopback address atm.
    addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
    addr_ptr->inaOnline.s_addr = 0;
-@@ -505,16 +764,100 @@ struct XEthernetStatus {
+@@ -505,16 +781,100 @@ struct XEthernetStatus {
    static const uint32_t XNET_ETHERNET_LINK_HALF_DUPLEX = 0x10;
  };
  
@@ -3412,9 +3429,9 @@ index 58e36a4..c1cff4c 100644
 +    return caller;
 +  }
 +  FAKE_LIVE_TRACE("fake Live: XNetConnect({:#x}) -> 0", ina);
-+  return 0;
-+}
-+
+   return 0;
+ }
+ 
 +u32 NetDll_XNetGetConnectStatus_entry(u32 caller, u32 ina) {
 +  if (!REX_KERNEL_STATE()->user_profile()->fake_live()) {
 +    return caller;
@@ -3427,9 +3444,9 @@ index 58e36a4..c1cff4c 100644
 +  if (!REX_KERNEL_STATE()->user_profile()->fake_live()) {
 +    return caller;
 +  }
-   return 0;
- }
- 
++  return 0;
++}
++
 +bool xeOnlineServerAddress(uint32_t* ipv4_host_order) {
 +  const std::string configured = REXCVAR_GET(online_server_host);
 +  in_addr address{};
@@ -3473,7 +3490,7 @@ index 58e36a4..c1cff4c 100644
      *pdns = dns_guest;
    }
    if (event_handle) {
-@@ -579,11 +922,24 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
+@@ -579,11 +939,24 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
  }
  
  u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
@@ -3498,7 +3515,7 @@ index 58e36a4..c1cff4c 100644
    if (XFAILED(result)) {
      socket->Release();
  
-@@ -643,6 +999,35 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
+@@ -643,6 +1016,35 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
    return XSUCCEEDED(status) ? 0 : -1;
  }
  
@@ -3534,7 +3551,7 @@ index 58e36a4..c1cff4c 100644
  u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void arg_ptr) {
    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
    if (!socket) {
-@@ -687,10 +1072,43 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -687,10 +1089,43 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
      return -1;
    }
  
@@ -3580,7 +3597,7 @@ index 58e36a4..c1cff4c 100644
      return -1;
    }
  
-@@ -783,6 +1201,18 @@ struct host_set {
+@@ -783,6 +1218,18 @@ struct host_set {
      }
    }
  
@@ -3599,7 +3616,7 @@ index 58e36a4..c1cff4c 100644
    void UpdateFrom(fd_set* native_set) {
      uint32_t new_count = 0;
      for (uint32_t i = 0; i < this->count; ++i) {
-@@ -825,8 +1255,18 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -825,8 +1272,18 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
                                               reinterpret_cast<int32_t*>(&timeout.tv_usec));
      timeout_in = &timeout;
    }
@@ -3620,7 +3637,7 @@ index 58e36a4..c1cff4c 100644
    if (readfds) {
      host_readfds.UpdateFrom(&native_readfds);
      host_readfds.Store(readfds);
-@@ -844,6 +1284,17 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -844,6 +1301,17 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
    return ret;
  }
  
@@ -3638,7 +3655,7 @@ index 58e36a4..c1cff4c 100644
  u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
    if (!socket) {
-@@ -852,7 +1303,15 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -852,7 +1320,15 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -3655,7 +3672,7 @@ index 58e36a4..c1cff4c 100644
  }
  
  u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
-@@ -883,13 +1342,12 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+@@ -883,13 +1359,12 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
    }
  
    if (ret == -1) {
@@ -3675,7 +3692,7 @@ index 58e36a4..c1cff4c 100644
    }
  
    return ret;
-@@ -903,7 +1361,17 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -903,7 +1378,17 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -3694,21 +3711,21 @@ index 58e36a4..c1cff4c 100644
  }
  
  u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
-@@ -915,6 +1383,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+@@ -915,6 +1400,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
      return -1;
    }
  
 +  if (REX_KERNEL_STATE()->user_profile()->fake_live()) {
 +    const XSOCKADDR_IN* sin = to_ptr;
-+    FAKE_LIVE_TRACE_UP_TO(6, "fake Live: sendto socket {} {} bytes to {}:{}: {}", socket_handle,
++    FAKE_LIVE_TRACE_UP_TO(120, "fake Live: sendto socket {} {} bytes to {}:{}: {}", socket_handle,
 +                          buf_len, sin ? Ipv4ToString(sin->sin_addr) : std::string("?"),
 +                          sin ? static_cast<uint32_t>(sin->sin_port) : 0,
-+                          HexPrefix(buf_ptr.as<const uint8_t*>(), buf_len));
++                          HexBytes(buf_ptr.as<const uint8_t*>(), buf_len, 128));
 +  }
    N_XSOCKADDR_IN native_to(to_ptr);
    return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
  }
-@@ -946,6 +1421,9 @@ REX_EXPORT(__imp__NetDll_WSACleanup, rex::kernel::xam::NetDll_WSACleanup_entry)
+@@ -946,6 +1438,9 @@ REX_EXPORT(__imp__NetDll_WSACleanup, rex::kernel::xam::NetDll_WSACleanup_entry)
  REX_EXPORT(__imp__NetDll_WSAGetLastError, rex::kernel::xam::NetDll_WSAGetLastError_entry)
  REX_EXPORT(__imp__NetDll_WSARecvFrom, rex::kernel::xam::NetDll_WSARecvFrom_entry)
  REX_EXPORT(__imp__NetDll_WSASendTo, rex::kernel::xam::NetDll_WSASendTo_entry)
@@ -3718,7 +3735,7 @@ index 58e36a4..c1cff4c 100644
  REX_EXPORT(__imp__NetDll_WSAWaitForMultipleEvents,
             rex::kernel::xam::NetDll_WSAWaitForMultipleEvents_entry)
  REX_EXPORT(__imp__NetDll_WSACreateEvent, rex::kernel::xam::NetDll_WSACreateEvent_entry)
-@@ -963,6 +1441,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+@@ -963,6 +1458,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
             rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
@@ -3727,7 +3744,7 @@ index 58e36a4..c1cff4c 100644
  REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
-@@ -1000,9 +1480,7 @@ REX_EXPORT_STUB(__imp__NetDll_UpnpEventUnsubscribe);
+@@ -1000,9 +1497,7 @@ REX_EXPORT_STUB(__imp__NetDll_UpnpEventUnsubscribe);
  REX_EXPORT_STUB(__imp__NetDll_UpnpSearchCreate);
  REX_EXPORT_STUB(__imp__NetDll_UpnpSearchGetDevices);
  REX_EXPORT_STUB(__imp__NetDll_UpnpStartup);
@@ -3737,7 +3754,7 @@ index 58e36a4..c1cff4c 100644
  REX_EXPORT_STUB(__imp__NetDll_WSARecv);
  REX_EXPORT_STUB(__imp__NetDll_WSASend);
  REX_EXPORT_STUB(__imp__NetDll_WSAStartupEx);
-@@ -1030,12 +1508,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,12 +1525,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -3752,7 +3769,7 @@ index 58e36a4..c1cff4c 100644
  REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
  REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
  REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
-@@ -1048,7 +1526,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
+@@ -1048,7 +1543,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
  REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
  REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
  REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
@@ -3761,7 +3778,7 @@ index 58e36a4..c1cff4c 100644
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
-@@ -1099,4 +1577,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
+@@ -1099,4 +1594,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
  REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
  REX_EXPORT_STUB(__imp__NetDll_getpeername);
  REX_EXPORT_STUB(__imp__NetDll_getsockname);
