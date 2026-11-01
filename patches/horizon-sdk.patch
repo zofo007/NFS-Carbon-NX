@@ -2057,7 +2057,7 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..dbaccc3 100644
+index 58e36a4..e025960 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
 @@ -12,7 +12,10 @@
@@ -2322,7 +2322,7 @@ index 58e36a4..dbaccc3 100644
 +    XThread::SetLastError(0x2735);
 +    return -1;
 +  }
-+  optval_ptr.as_array<rex::be<uint32_t>>()[0] = value;
++  optval_ptr.as_array<uint32_t>()[0] = value;
 +  *optlen_ptr = 4;
 +  if (REX_KERNEL_STATE()->user_profile()->fake_live()) {
 +    FAKE_LIVE_TRACE("fake Live: getsockopt socket {} level {:#x} opt {:#x} -> {}", socket_handle,
