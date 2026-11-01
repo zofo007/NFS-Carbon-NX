@@ -210,7 +210,10 @@ void LookupIsAnsweredLocally() {
   CHECK(static_cast<uint8_t>(reply[4]) == 0x80 && static_cast<uint8_t>(reply[7]) == 0x02);
   CHECK(reply.find("TXN=GetUserIdsByXuids\n") != std::string::npos);
   const std::string user_id = std::to_string(fesl::LocalUserId(2802565664681494ULL));
-  CHECK(reply.find("xuids.{2802565664681494}.userId=" + user_id + "\n") != std::string::npos);
+  // The game reads only userIds.{<own xuid>}.userId (an int64 above zero) from the lookup reply.
+  CHECK(reply.find("userIds.[]=1\n") != std::string::npos);
+  CHECK(reply.find("userIds.{2802565664681494}.userId=" + user_id + "\n") != std::string::npos);
+  CHECK(reply.find("xuids.{") == std::string::npos);
   CHECK(reply.find("userInfo.0.userName=Racer1234\n") != std::string::npos);
   CHECK(fesl::LocalUserId(2802565664681494ULL) == fesl::LocalUserId(2802565664681494ULL));
   CHECK(fesl::LocalUserId(2802565664681494ULL) != 0);

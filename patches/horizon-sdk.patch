@@ -746,10 +746,10 @@ index 0000000..ea078bf
 +}  // namespace rex::system::xam::fake_live
 diff --git a/sdk/include/rex/system/xam/fesl_shim.h b/sdk/include/rex/system/xam/fesl_shim.h
 new file mode 100644
-index 0000000..351704e
+index 0000000..a4e896f
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/fesl_shim.h
-@@ -0,0 +1,331 @@
+@@ -0,0 +1,336 @@
 +#pragma once
 +/**
 + * Translation between the Xbox 360 build's online account protocol and the PC one.
@@ -1054,13 +1054,18 @@ index 0000000..351704e
 +        xuids.emplace_back(value);
 +      }
 +    }
++    // The game's account manager reads userIds.{<own xuid>}.userId (any int64 above zero) and goes
++    // on to XBL360Login on a hit; without it, it shows the terms and creates an account. Always
++    // answering with a hit lets the PC Login decide: an unknown account fails there and the game
++    // falls back to creating one itself.
 +    std::string lines = "TXN=GetUserIdsByXuids\n";
++    lines += "userIds.[]=" + std::to_string(xuids.size()) + "\n";
 +    lines += "userInfo.[]=" + std::to_string(xuids.size()) + "\n";
 +    for (size_t i = 0; i < xuids.size(); ++i) {
 +      const uint64_t xuid = std::stoull(xuids[i]);
 +      const std::string user_id = std::to_string(LocalUserId(xuid));
 +      const std::string index = std::to_string(i);
-+      lines += "xuids.{" + xuids[i] + "}.userId=" + user_id + "\n";
++      lines += "userIds.{" + xuids[i] + "}.userId=" + user_id + "\n";
 +      lines += "userInfo." + index + ".xuid=" + xuids[i] + "\n";
 +      lines += "userInfo." + index + ".userId=" + user_id + "\n";
 +      lines += "userInfo." + index + ".userName=" +
