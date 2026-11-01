@@ -256,6 +256,185 @@ void GarbageIsForwardedUntouched() {
   CHECK(Text(later.to_server) == request);
 }
 
+constexpr uint64_t kSecret = 0x1122334455667788ULL;
+
+uint32_t WordOf(const std::string& frame) {
+  return (uint32_t{static_cast<uint8_t>(frame[4])} << 24) | (uint32_t{static_cast<uint8_t>(frame[5])} << 16) |
+         (uint32_t{static_cast<uint8_t>(frame[6])} << 8) | uint32_t{static_cast<uint8_t>(frame[7])};
+}
+
+// The value of `key` in the frame's "key=value" lines, or "<missing>".
+std::string Value(const std::string& frame, const std::string& key) {
+  const std::string body = "\n" + frame.substr(12);
+  const size_t at = body.find("\n" + key + "=");
+  if (at == std::string::npos) {
+    return "<missing>";
+  }
+  const size_t start = at + key.size() + 2;
+  return body.substr(start, body.find('\n', start) - start);
+}
+
+std::string AddAccountRequest(uint32_t word) {
+  return fesl::EncodeFrame("acct", word,
+                           "TXN=XBL360AddAccount\neaMailFlag=0\nthirdPartyMailFlag=0\nlang=0\n"
+                           "country=0\nage=0\ngamertag=Racer8236\nxuid=2802565664681494\n");
+}
+
+std::string LoginRequest(uint32_t word) {
+  return fesl::EncodeFrame("acct", word,
+                           "TXN=XBL360Login\ngamertag=Racer8236\nxuid=2802565664681494\n");
+}
+
+std::string PcSession(uint32_t word) {
+  return fesl::EncodeFrame("acct", word,
+                           "lkey=KEY.1\nname=Racer8236\nprofileId=7\nTXN=Login\nuserId=164681494\n"
+                           "displayName=Racer8236\n");
+}
+
+std::string PcError(const std::string& txn, uint32_t word, const std::string& code) {
+  return fesl::EncodeFrame("acct", word,
+                           "TXN=" + txn + "\nlocalizedMessage=\"no\"\nerrorCode=" + code +
+                               "\nerrorContainer.[]=0\n");
+}
+
+fesl::Translation FromServer(fesl::Shim& shim, const std::string& frame) {
+  return shim.FromServer(Bytes(frame).data(), frame.size());
+}
+
+void PasswordIsStableAndFits() {
+  const std::string password = fesl::AccountPassword(kSecret);
+  CHECK(password.size() == 12);  // the PC server accepts 1 to 16 characters
+  for (const char c : password) {
+    CHECK((c >= 'A' && c <= 'Z') || (c >= '2' && c <= '7'));
+  }
+  CHECK(password == fesl::AccountPassword(kSecret));
+  CHECK(password != fesl::AccountPassword(kSecret + 1));
+}
+
+void AddAccountBecomesPcAddAccountThenLogin() {
+  fesl::Shim shim(2802565664681494ULL, "Racer8236", kSecret);
+  const std::string request = AddAccountRequest(0x80000004);
+  fesl::Translation step = shim.FromGame(Bytes(request).data(), request.size());
+  CHECK(step.to_game.empty());
+  const std::string add = Text(step.to_server);
+  CHECK(add.substr(0, 4) == "acct");
+  CHECK(Value(add, "TXN") == "AddAccount");
+  CHECK(Value(add, "name") == "Racer8236");
+  CHECK(Value(add, "password") == fesl::AccountPassword(kSecret));
+  step = FromServer(shim, fesl::EncodeFrame("acct", WordOf(add), "TXN=NuAddAccount\n"));
+  CHECK(step.to_game.empty());  // the game never sees the PC-only step
+  const std::string login = Text(step.to_server);
+  CHECK(Value(login, "TXN") == "Login");
+  CHECK(Value(login, "name") == "Racer8236");
+  CHECK(Value(login, "password") == fesl::AccountPassword(kSecret));
+  step = FromServer(shim, PcSession(WordOf(login)));
+  CHECK(step.to_server.empty());
+  const std::string done = Text(step.to_game);
+  CHECK(done.substr(0, 4) == "acct" && WordOf(done) == 0x80000004);
+  CHECK(Value(done, "TXN") == "XBL360AddAccount");
+  CHECK(Value(done, "lkey") == "KEY.1");
+  CHECK(Value(done, "userId") == "164681494");
+  CHECK(Value(done, "profileId") == "7");
+  CHECK(Value(done, "displayName") == "Racer8236");
+}
+
+void ExistingPcAccountStillLogsIn() {
+  fesl::Shim shim(2802565664681494ULL, "Racer8236", kSecret);
+  const std::string request = AddAccountRequest(0x80000004);
+  fesl::Translation step = shim.FromGame(Bytes(request).data(), request.size());
+  const uint32_t add_word = WordOf(Text(step.to_server));
+  step = FromServer(shim, PcError("NuAddAccount", add_word, "160"));  // name already taken
+  CHECK(Value(Text(step.to_server), "TXN") == "Login");  // the login decides whether it is ours
+}
+
+void RejectedAddAccountIsReportedToTheGame() {
+  fesl::Shim shim(2802565664681494ULL, "Racer8236", kSecret);
+  const std::string request = AddAccountRequest(0x80000004);
+  fesl::Translation step = shim.FromGame(Bytes(request).data(), request.size());
+  const uint32_t add_word = WordOf(Text(step.to_server));
+  step = FromServer(shim, PcError("NuAddAccount", add_word, "21"));
+  CHECK(step.to_server.empty());
+  const std::string reply = Text(step.to_game);
+  CHECK(WordOf(reply) == 0x80000004);
+  CHECK(Value(reply, "TXN") == "XBL360AddAccount");
+  CHECK(Value(reply, "errorCode") == "21");
+}
+
+void FailedLoginAfterAddIsReportedToTheGame() {
+  fesl::Shim shim(2802565664681494ULL, "Racer8236", kSecret);
+  const std::string request = AddAccountRequest(0x80000004);
+  fesl::Translation step = shim.FromGame(Bytes(request).data(), request.size());
+  step = FromServer(shim, fesl::EncodeFrame("acct", WordOf(Text(step.to_server)), "TXN=NuAddAccount\n"));
+  const uint32_t login_word = WordOf(Text(step.to_server));
+  step = FromServer(shim, PcError("Login", login_word, "101"));
+  const std::string reply = Text(step.to_game);
+  CHECK(Value(reply, "TXN") == "XBL360AddAccount");
+  CHECK(Value(reply, "errorCode") == "101");
+}
+
+void LoginIsTranslatedToPcLogin() {
+  fesl::Shim shim(2802565664681494ULL, "Racer8236", kSecret);
+  const std::string request = LoginRequest(0x80000005);
+  fesl::Translation step = shim.FromGame(Bytes(request).data(), request.size());
+  CHECK(step.to_game.empty());
+  const std::string login = Text(step.to_server);
+  CHECK(Value(login, "TXN") == "Login");
+  CHECK(Value(login, "name") == "Racer8236");
+  step = FromServer(shim, PcSession(WordOf(login)));
+  const std::string done = Text(step.to_game);
+  CHECK(WordOf(done) == 0x80000005);
+  CHECK(Value(done, "TXN") == "XBL360Login");
+  CHECK(Value(done, "lkey") == "KEY.1");
+}
+
+void LoginCreatesTheAccountWhenItIsMissing() {
+  fesl::Shim shim(2802565664681494ULL, "Racer8236", kSecret);
+  const std::string request = LoginRequest(0x80000005);
+  fesl::Translation step = shim.FromGame(Bytes(request).data(), request.size());
+  step = FromServer(shim, PcError("Login", WordOf(Text(step.to_server)), "101"));
+  CHECK(step.to_game.empty());
+  const std::string add = Text(step.to_server);
+  CHECK(Value(add, "TXN") == "AddAccount");
+  step = FromServer(shim, fesl::EncodeFrame("acct", WordOf(add), "TXN=NuAddAccount\n"));
+  const std::string login = Text(step.to_server);
+  CHECK(Value(login, "TXN") == "Login");
+  step = FromServer(shim, PcSession(WordOf(login)));
+  CHECK(Value(Text(step.to_game), "TXN") == "XBL360Login");
+  CHECK(Value(Text(step.to_game), "lkey") == "KEY.1");
+}
+
+void LoginWithTakenNameReportsTheLoginError() {
+  fesl::Shim shim(2802565664681494ULL, "Racer8236", kSecret);
+  const std::string request = LoginRequest(0x80000005);
+  fesl::Translation step = shim.FromGame(Bytes(request).data(), request.size());
+  step = FromServer(shim, PcError("Login", WordOf(Text(step.to_server)), "101"));
+  step = FromServer(shim, PcError("NuAddAccount", WordOf(Text(step.to_server)), "160"));
+  CHECK(step.to_server.empty());  // someone else owns the name: do not loop
+  const std::string reply = Text(step.to_game);
+  CHECK(Value(reply, "TXN") == "XBL360Login");
+  CHECK(Value(reply, "errorCode") == "101");
+}
+
+void ServerFramesPassThroughToTheGame() {
+  fesl::Shim shim(1, "Racer0001", kSecret);
+  const std::string memcheck = fesl::EncodeFrame("fsys", 0x80000000, "TXN=MemCheck\nsalt=1\n");
+  const fesl::Translation whole = FromServer(shim, memcheck);
+  CHECK(Text(whole.to_game) == memcheck);
+  CHECK(whole.to_server.empty());
+  const fesl::Translation first = shim.FromServer(Bytes(memcheck).data(), 7);
+  CHECK(first.to_game.empty());
+  const fesl::Translation rest = shim.FromServer(Bytes(memcheck).data() + 7, memcheck.size() - 7);
+  CHECK(Text(rest.to_game) == memcheck);
+}
+
+void ServerGarbageIsForwardedUntouched() {
+  fesl::Shim shim(1, "Racer0001", kSecret);
+  const std::string junk = "not a frame at all, just text";
+  CHECK(Text(FromServer(shim, junk).to_game) == junk);
+  const std::string memcheck = fesl::EncodeFrame("fsys", 0x80000000, "TXN=MemCheck\n");
+  CHECK(Text(FromServer(shim, memcheck).to_game) == memcheck);  // still raw once it stopped parsing
+}
+
 void SeedPersists(const fs::path& folder) {
   const fs::path file = folder / "online_identity.bin";
   const uint64_t first = fl::LoadOrCreateSeed(file);
@@ -416,6 +595,16 @@ int main(int argc, char** argv) {
   CodeThatIsNotAPureTailCallIsRefused();
   AsyncMessagesAreTheFiveThousandRange();
   AsyncTaskFieldsAreReadBigEndian();
+  PasswordIsStableAndFits();
+  AddAccountBecomesPcAddAccountThenLogin();
+  ExistingPcAccountStillLogsIn();
+  RejectedAddAccountIsReportedToTheGame();
+  FailedLoginAfterAddIsReportedToTheGame();
+  LoginIsTranslatedToPcLogin();
+  LoginCreatesTheAccountWhenItIsMissing();
+  LoginWithTakenNameReportsTheLoginError();
+  ServerFramesPassThroughToTheGame();
+  ServerGarbageIsForwardedUntouched();
   SeedPersists(folder);
   SeedRepairs(folder);
   std::cout << "fake_live: all checks passed\n";

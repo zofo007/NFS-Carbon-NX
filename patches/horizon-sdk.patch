@@ -746,10 +746,10 @@ index 0000000..ea078bf
 +}  // namespace rex::system::xam::fake_live
 diff --git a/sdk/include/rex/system/xam/fesl_shim.h b/sdk/include/rex/system/xam/fesl_shim.h
 new file mode 100644
-index 0000000..bca9819
+index 0000000..351704e
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/fesl_shim.h
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,331 @@
 +#pragma once
 +/**
 + * Translation between the Xbox 360 build's online account protocol and the PC one.
@@ -760,6 +760,11 @@ index 0000000..bca9819
 + * game's connection to the server: frames it understands are answered locally, everything else
 + * goes through untouched.
 + *
++ * The 360 also creates and logs into its account with its own requests (XBL360AddAccount,
++ * XBL360Login). The PC server only knows AddAccount and Login, so the shim plays the PC client: it
++ * sends those, with a password only this console can derive, and hands the game the PC server's
++ * session key (lkey) and user id in the reply the game expects.
++ *
 + * Frame: 4-character command, 4-byte big-endian transaction word, 4-byte big-endian total length
 + * (header included), then "key=value\n" lines and a terminating NUL.
 + *
@@ -768,6 +773,7 @@ index 0000000..bca9819
 +
 +#include <cstddef>
 +#include <cstdint>
++#include <map>
 +#include <string>
 +#include <string_view>
 +#include <utility>
@@ -802,6 +808,22 @@ index 0000000..bca9819
 +  return 100000000u + static_cast<uint32_t>(xuid % 800000000u);
 +}
 +
++// The password of the PC account this console creates: 12 characters (the PC server takes 1 to 16)
++// derived from a secret that never leaves the console. Not the Xbox ID or gamertag, which the
++// server sees and other players know.
++inline std::string AccountPassword(uint64_t secret) {
++  uint64_t z = secret + 0x9E3779B97F4A7C15ULL;
++  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
++  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
++  z ^= z >> 31;
++  static constexpr char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
++  std::string password;
++  for (int i = 0; i < 12; ++i) {
++    password.push_back(kAlphabet[(z >> (59 - 5 * i)) & 31]);
++  }
++  return password;
++}
++
 +struct Translation {
 +  std::vector<uint8_t> to_server;  // bytes to send to the real server
 +  std::vector<uint8_t> to_game;    // bytes to hand to the game as if the server had sent them
@@ -809,42 +831,72 @@ index 0000000..bca9819
 +
 +class Shim {
 + public:
-+  Shim(uint64_t own_xuid, std::string own_gamertag)
-+      : own_xuid_(own_xuid), own_gamertag_(std::move(own_gamertag)) {}
++  Shim(uint64_t own_xuid, std::string own_gamertag, uint64_t account_secret = 0)
++      : own_xuid_(own_xuid),
++        own_gamertag_(std::move(own_gamertag)),
++        password_(AccountPassword(account_secret)) {}
 +
 +  // Bytes the game sent. Whole frames are handled one by one; a partial frame waits for the rest.
 +  Translation FromGame(const uint8_t* data, size_t size) {
 +    Translation out;
-+    if (passthrough_) {
-+      out.to_server.assign(data, data + size);
-+      return out;
-+    }
-+    pending_.insert(pending_.end(), data, data + size);
-+    size_t offset = 0;
-+    while (pending_.size() - offset >= kHeaderSize) {
-+      const uint8_t* head = pending_.data() + offset;
-+      const size_t length = ReadBigEndian32(head + 8);
-+      if (length < kHeaderSize || length > kMaxFrameSize) {
-+        // Not a frame stream: stop interpreting and send everything on as it is.
-+        passthrough_ = true;
-+        out.to_server.insert(out.to_server.end(), pending_.begin() + offset, pending_.end());
-+        pending_.clear();
-+        return out;
-+      }
-+      if (pending_.size() - offset < length) {
-+        break;
-+      }
-+      HandleFrame(head, length, &out);
-+      offset += length;
-+    }
-+    pending_.erase(pending_.begin(), pending_.begin() + offset);
++    Pump(data, size, &game_pending_, &game_passthrough_, &out.to_server,
++         [&](const uint8_t* frame, size_t length) { HandleGameFrame(frame, length, &out); });
++    return out;
++  }
++
++  // Bytes the server sent. Replies to requests the shim made itself are consumed and answered to the
++  // game in its own terms; everything else reaches the game untouched.
++  Translation FromServer(const uint8_t* data, size_t size) {
++    Translation out;
++    Pump(data, size, &server_pending_, &server_passthrough_, &out.to_game,
++         [&](const uint8_t* frame, size_t length) { HandleServerFrame(frame, length, &out); });
 +    return out;
 +  }
 +
 + private:
++  // Which of the game's requests a job serves, and where it is.
++  enum class Stage { kAdd, kLogin };
++  struct Job {
++    uint32_t game_word = 0;
++    std::string game_txn;  // XBL360AddAccount or XBL360Login
++    std::string name;      // the PC account name
++    Stage stage = Stage::kLogin;
++    std::string login_error_code;  // set when Login failed first and AddAccount is being tried
++    std::string login_error_message;
++  };
++
 +  static uint32_t ReadBigEndian32(const uint8_t* bytes) {
 +    return (uint32_t{bytes[0]} << 24) | (uint32_t{bytes[1]} << 16) | (uint32_t{bytes[2]} << 8) |
 +           uint32_t{bytes[3]};
++  }
++
++  // Splits a byte stream into whole frames. A stream that stops looking like frames is handed on
++  // as it is (`raw`) from then on.
++  template <typename Handler>
++  static void Pump(const uint8_t* data, size_t size, std::vector<uint8_t>* pending,
++                   bool* passthrough, std::vector<uint8_t>* raw, Handler&& handle) {
++    if (*passthrough) {
++      raw->insert(raw->end(), data, data + size);
++      return;
++    }
++    pending->insert(pending->end(), data, data + size);
++    size_t offset = 0;
++    while (pending->size() - offset >= kHeaderSize) {
++      const uint8_t* head = pending->data() + offset;
++      const size_t length = ReadBigEndian32(head + 8);
++      if (length < kHeaderSize || length > kMaxFrameSize) {
++        *passthrough = true;
++        raw->insert(raw->end(), pending->begin() + offset, pending->end());
++        pending->clear();
++        return;
++      }
++      if (pending->size() - offset < length) {
++        break;
++      }
++      handle(head, length);
++      offset += length;
++    }
++    pending->erase(pending->begin(), pending->begin() + offset);
 +  }
 +
 +  // The value of `key` in a "key=value\n" body, empty when absent.
@@ -869,15 +921,125 @@ index 0000000..bca9819
 +    return {};
 +  }
 +
-+  void HandleFrame(const uint8_t* frame, size_t length, Translation* out) {
++  static void Append(std::vector<uint8_t>* bytes, const std::string& frame) {
++    bytes->insert(bytes->end(), frame.begin(), frame.end());
++  }
++
++  void HandleGameFrame(const uint8_t* frame, size_t length, Translation* out) {
 +    const std::string_view command(reinterpret_cast<const char*>(frame), 4);
 +    const std::string_view body(reinterpret_cast<const char*>(frame) + kHeaderSize,
 +                                length - kHeaderSize);
-+    if (command == "acct" && Field(body, "TXN") == "GetUserIdsByXuids") {
-+      AnswerUserIdLookup(ReadBigEndian32(frame + 4), body, out);
-+      return;
++    if (command == "acct") {
++      const std::string_view txn = Field(body, "TXN");
++      if (txn == "GetUserIdsByXuids") {
++        AnswerUserIdLookup(ReadBigEndian32(frame + 4), body, out);
++        return;
++      }
++      if (txn == "XBL360AddAccount" || txn == "XBL360Login") {
++        StartJob(ReadBigEndian32(frame + 4), std::string(txn), body, out);
++        return;
++      }
 +    }
 +    out->to_server.insert(out->to_server.end(), frame, frame + length);
++  }
++
++  void HandleServerFrame(const uint8_t* frame, size_t length, Translation* out) {
++    const std::string_view command(reinterpret_cast<const char*>(frame), 4);
++    const auto found = pending_.find(ReadBigEndian32(frame + 4));
++    if (command != "acct" || found == pending_.end()) {
++      out->to_game.insert(out->to_game.end(), frame, frame + length);
++      return;
++    }
++    const std::string_view body(reinterpret_cast<const char*>(frame) + kHeaderSize,
++                                length - kHeaderSize);
++    Job job = std::move(found->second);
++    pending_.erase(found);
++    Continue(std::move(job), body, out);
++  }
++
++  void StartJob(uint32_t game_word, std::string game_txn, std::string_view body, Translation* out) {
++    Job job;
++    job.game_word = game_word;
++    job.game_txn = std::move(game_txn);
++    std::string name(Field(body, "gamertag"));
++    if (name.empty()) {
++      name = own_gamertag_;
++    }
++    if (name.size() > 32) {
++      name.resize(32);
++    }
++    job.name = std::move(name);
++    if (job.game_txn == "XBL360AddAccount") {
++      SendAdd(std::move(job), out);
++    } else {
++      SendLogin(std::move(job), out);
++    }
++  }
++
++  void SendAdd(Job job, Translation* out) {
++    job.stage = Stage::kAdd;
++    const uint32_t word = next_word_++;
++    Append(&out->to_server,
++           EncodeFrame("acct", word,
++                       "TXN=AddAccount\nname=" + job.name + "\npassword=" + password_ + "\n"));
++    pending_.emplace(word, std::move(job));
++  }
++
++  void SendLogin(Job job, Translation* out) {
++    job.stage = Stage::kLogin;
++    const uint32_t word = next_word_++;
++    Append(&out->to_server,
++           EncodeFrame("acct", word,
++                       "TXN=Login\nname=" + job.name + "\npassword=" + password_ + "\n"));
++    pending_.emplace(word, std::move(job));
++  }
++
++  // The PC server answered one of the shim's own requests.
++  void Continue(Job job, std::string_view body, Translation* out) {
++    const std::string error(Field(body, "errorCode"));
++    const std::string message(Field(body, "localizedMessage"));
++    if (job.stage == Stage::kAdd) {
++      if (error.empty() || error == "160") {
++        if (!job.login_error_code.empty() && error == "160") {
++          // Login refused us and the name is taken: it belongs to someone else.
++          ReplyError(job, job.login_error_code, job.login_error_message, out);
++          return;
++        }
++        SendLogin(std::move(job), out);  // created, or already ours: the login decides
++        return;
++      }
++      ReplyError(job, error, message, out);
++      return;
++    }
++    if (error.empty() && !Field(body, "lkey").empty()) {
++      std::string lines = "TXN=" + job.game_txn + "\n";
++      for (const char* key : {"lkey", "name", "profileId", "userId", "displayName"}) {
++        const std::string_view value = Field(body, key);
++        if (!value.empty()) {
++          lines += std::string(key) + "=" + std::string(value) + "\n";
++        }
++      }
++      Append(&out->to_game, EncodeFrame("acct", job.game_word, lines));
++      return;
++    }
++    if (job.game_txn == "XBL360Login" && job.login_error_code.empty()) {
++      // Probably no account yet: create it once, then log in again.
++      job.login_error_code = error.empty() ? "101" : error;
++      job.login_error_message = message;
++      SendAdd(std::move(job), out);
++      return;
++    }
++    ReplyError(job, error.empty() ? "101" : error, message, out);
++  }
++
++  void ReplyError(const Job& job, const std::string& code, const std::string& message,
++                  Translation* out) {
++    std::string lines = "TXN=" + job.game_txn + "\n";
++    if (!message.empty()) {
++      lines += "localizedMessage=" + message + "\n";
++    }
++    lines += "errorCode=" + code + "\nerrorContainer.[]=0\n";
++    Append(&out->to_game, EncodeFrame("acct", job.game_word, lines));
 +  }
 +
 +  // The 360 asks which user id belongs to each Xbox ID. The reply lists every requested ID under the
@@ -904,19 +1066,23 @@ index 0000000..bca9819
 +      lines += "userInfo." + index + ".userName=" +
 +               (xuid == own_xuid_ ? own_gamertag_ : std::string("Player")) + "\n";
 +    }
-+    const std::string reply = EncodeFrame("acct", word, lines);
-+    out->to_game.insert(out->to_game.end(), reply.begin(), reply.end());
++    Append(&out->to_game, EncodeFrame("acct", word, lines));
 +  }
 +
 +  uint64_t own_xuid_;
 +  std::string own_gamertag_;
-+  std::vector<uint8_t> pending_;
-+  bool passthrough_ = false;
++  std::string password_;
++  std::vector<uint8_t> game_pending_;
++  std::vector<uint8_t> server_pending_;
++  bool game_passthrough_ = false;
++  bool server_passthrough_ = false;
++  std::map<uint32_t, Job> pending_;  // requests the shim made, by the word it used
++  uint32_t next_word_ = 0x80000100;
 +};
 +
 +}  // namespace rex::system::xam::fesl
 diff --git a/sdk/include/rex/system/xam/user_profile.h b/sdk/include/rex/system/xam/user_profile.h
-index ec37017..68d9484 100644
+index ec37017..fe12c46 100644
 --- a/sdk/include/rex/system/xam/user_profile.h
 +++ b/sdk/include/rex/system/xam/user_profile.h
 @@ -20,6 +20,7 @@
@@ -927,7 +1093,7 @@ index ec37017..68d9484 100644
  #include <rex/system/xtypes.h>
  
  namespace rex::system {
-@@ -216,11 +217,22 @@ class UserProfile {
+@@ -216,11 +217,25 @@ class UserProfile {
  
    UserProfile();
  
@@ -947,16 +1113,20 @@ index ec37017..68d9484 100644
 +  void MaybeEnableFakeLive(const std::filesystem::path& user_data_root);
 +  bool fake_live() const { return fake_live_; }
 +  const fake_live::Identity& fake_identity() const { return fake_identity_; }
++  // A random secret kept on this console only (online_account.bin), unrelated to the identity above
++  // so nothing the server or other players see reveals it. The PC account password comes from it.
++  uint64_t fake_account_secret() const { return fake_account_secret_; }
 +
    void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
  
    void AddSetting(std::unique_ptr<Setting> setting);
-@@ -229,6 +241,8 @@ class UserProfile {
+@@ -229,6 +244,9 @@ class UserProfile {
   private:
    uint64_t xuid_;
    std::string name_;
 +  bool fake_live_ = false;
 +  fake_live::Identity fake_identity_{};
++  uint64_t fake_account_secret_ = 0;
    std::vector<std::unique_ptr<Setting>> setting_list_;
    std::unordered_map<uint32_t, Setting*> settings_;
    KernelState* kernel_state_ = nullptr;
@@ -1018,7 +1188,7 @@ index 0000000..da81337
 +
 +}  // namespace rex::system::xam::xlive_async
 diff --git a/sdk/include/rex/system/xsocket.h b/sdk/include/rex/system/xsocket.h
-index a1b4443..edb0b33 100644
+index a1b4443..67f0174 100644
 --- a/sdk/include/rex/system/xsocket.h
 +++ b/sdk/include/rex/system/xsocket.h
 @@ -11,9 +11,13 @@
@@ -1056,8 +1226,8 @@ index a1b4443..edb0b33 100644
  
 +  // Puts the 360-to-PC account translation on this connection (see xam/fesl_shim.h). Frames the PC
 +  // server cannot answer are answered locally and handed to the game by Recv.
-+  void EnableFeslShim(uint64_t own_xuid, std::string own_gamertag) {
-+    shim_ = std::make_unique<xam::fesl::Shim>(own_xuid, std::move(own_gamertag));
++  void EnableFeslShim(uint64_t own_xuid, std::string own_gamertag, uint64_t account_secret) {
++    shim_ = std::make_unique<xam::fesl::Shim>(own_xuid, std::move(own_gamertag), account_secret);
 +  }
 +  bool has_fesl_shim() const { return shim_ != nullptr; }
 +
@@ -2463,7 +2633,7 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..97ef03b 100644
+index 58e36a4..9343983 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
 @@ -12,7 +12,11 @@
@@ -2752,7 +2922,7 @@ index 58e36a4..97ef03b 100644
  u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void arg_ptr) {
    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
    if (!socket) {
-@@ -687,10 +898,42 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -687,10 +898,43 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
      return -1;
    }
  
@@ -2778,7 +2948,8 @@ index 58e36a4..97ef03b 100644
 +    const auto& identity = REX_KERNEL_STATE()->user_profile()->fake_identity();
 +    socket->EnableFeslShim(
 +        identity.xuid,
-+        std::string(identity.gamertag, strnlen(identity.gamertag, sizeof(identity.gamertag))));
++        std::string(identity.gamertag, strnlen(identity.gamertag, sizeof(identity.gamertag))),
++        REX_KERNEL_STATE()->user_profile()->fake_account_secret());
 +  }
 +  if (fake_live) {
 +    FAKE_LIVE_TRACE_UP_TO(20, "fake Live: connect socket {} to {}:{} (asked {}) -> {} (winsock {}, errno {})",
@@ -2797,7 +2968,7 @@ index 58e36a4..97ef03b 100644
      return -1;
    }
  
-@@ -783,6 +1026,18 @@ struct host_set {
+@@ -783,6 +1027,18 @@ struct host_set {
      }
    }
  
@@ -2816,7 +2987,7 @@ index 58e36a4..97ef03b 100644
    void UpdateFrom(fd_set* native_set) {
      uint32_t new_count = 0;
      for (uint32_t i = 0; i < this->count; ++i) {
-@@ -825,8 +1080,18 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -825,8 +1081,18 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
                                               reinterpret_cast<int32_t*>(&timeout.tv_usec));
      timeout_in = &timeout;
    }
@@ -2837,7 +3008,7 @@ index 58e36a4..97ef03b 100644
    if (readfds) {
      host_readfds.UpdateFrom(&native_readfds);
      host_readfds.Store(readfds);
-@@ -844,6 +1109,17 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -844,6 +1110,17 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
    return ret;
  }
  
@@ -2855,7 +3026,7 @@ index 58e36a4..97ef03b 100644
  u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
    if (!socket) {
-@@ -852,7 +1128,15 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -852,7 +1129,15 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -2872,7 +3043,7 @@ index 58e36a4..97ef03b 100644
  }
  
  u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
-@@ -883,13 +1167,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+@@ -883,13 +1168,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
    }
  
    if (ret == -1) {
@@ -2887,7 +3058,7 @@ index 58e36a4..97ef03b 100644
    }
  
    return ret;
-@@ -903,7 +1181,16 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -903,7 +1182,16 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -2905,7 +3076,7 @@ index 58e36a4..97ef03b 100644
  }
  
  u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
-@@ -915,6 +1202,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+@@ -915,6 +1203,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
      return -1;
    }
  
@@ -2919,7 +3090,7 @@ index 58e36a4..97ef03b 100644
    N_XSOCKADDR_IN native_to(to_ptr);
    return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
  }
-@@ -963,6 +1257,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+@@ -963,6 +1258,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
             rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
@@ -2928,7 +3099,7 @@ index 58e36a4..97ef03b 100644
  REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
-@@ -1030,12 +1326,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,12 +1327,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -2943,7 +3114,7 @@ index 58e36a4..97ef03b 100644
  REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
  REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
  REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
-@@ -1048,7 +1344,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
+@@ -1048,7 +1345,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
  REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
  REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
  REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
@@ -2952,7 +3123,7 @@ index 58e36a4..97ef03b 100644
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
-@@ -1099,4 +1395,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
+@@ -1099,4 +1396,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
  REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
  REX_EXPORT_STUB(__imp__NetDll_getpeername);
  REX_EXPORT_STUB(__imp__NetDll_getsockname);
@@ -4075,10 +4246,10 @@ index 78826a6..e715bb3 100644
  
  }  // namespace xam
 diff --git a/sdk/src/system/xam/user_profile.cpp b/sdk/src/system/xam/user_profile.cpp
-index a77f5e6..908c8b8 100644
+index a77f5e6..e2cb8ea 100644
 --- a/sdk/src/system/xam/user_profile.cpp
 +++ b/sdk/src/system/xam/user_profile.cpp
-@@ -9,18 +9,73 @@
+@@ -9,18 +9,74 @@
   * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
@@ -4143,6 +4314,7 @@ index a77f5e6..908c8b8 100644
 +  REXSYS_WARN("fake Live: setting is on, loading identity from {}", user_data_root.string());
 +  const auto seed = fake_live::LoadOrCreateSeed(user_data_root / "online_identity.bin");
 +  fake_identity_ = fake_live::MakeIdentity(seed);
++  fake_account_secret_ = fake_live::LoadOrCreateSeed(user_data_root / "online_account.bin");
 +  fake_live_ = true;
 +  g_trace_online_calls = true;
 +  // Warn level on purpose: it is flushed at once, so it survives a crash.
@@ -4257,19 +4429,24 @@ index d358f39..e3bee26 100644
      switch (result) {
        case rex::thread::WaitResult::kSuccess:
 diff --git a/sdk/src/system/xsocket.cpp b/sdk/src/system/xsocket.cpp
-index 2d13ac8..62a8dda 100644
+index 2d13ac8..7812271 100644
 --- a/sdk/src/system/xsocket.cpp
 +++ b/sdk/src/system/xsocket.cpp
-@@ -9,6 +9,8 @@
+@@ -9,9 +9,13 @@
   * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
 +#include <algorithm>
 +#include <cerrno>
  #include <cstring>
++#include <string>
  
  #include <rex/kernel/xam/module.h>
-@@ -90,6 +92,27 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
++#include <rex/logging.h>
+ #include <rex/platform.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xsocket.h>
+@@ -90,6 +94,27 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
    return X_STATUS_SUCCESS;
  }
  
@@ -4297,7 +4474,7 @@ index 2d13ac8..62a8dda 100644
  X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
    int ret = rex::net::socket_ioctl(native_handle_, cmd, arg_ptr);
    if (ret < 0) {
-@@ -100,17 +123,57 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
+@@ -100,17 +125,57 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
    return X_STATUS_SUCCESS;
  }
  
@@ -4355,10 +4532,45 @@ index 2d13ac8..62a8dda 100644
    if (ret < 0) {
      return X_STATUS_UNSUCCESSFUL;
    }
-@@ -158,6 +221,15 @@ int XSocket::Shutdown(int how) {
+@@ -158,6 +223,50 @@ int XSocket::Shutdown(int how) {
  }
  
  int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
++  if (shim_ && shim_inbox_.empty()) {
++    // Everything the server sends goes through the shim: replies to its own account requests are
++    // answered to the game in the game's terms, the rest is queued as it came.
++    uint8_t chunk[4096];
++    const int got = recv(native_handle_, reinterpret_cast<char*>(chunk), sizeof(chunk), 0);
++    if (got <= 0) {
++      return got;  // closed (0) or failed (-1): the caller reports why
++    }
++    const xam::fesl::Translation translated = shim_->FromServer(chunk, static_cast<size_t>(got));
++    static int traced = 0;
++    if (traced < 40) {
++      ++traced;
++      std::string text;
++      for (int i = 0; i < got && i < 400; ++i) {
++        const uint8_t c = chunk[i];
++        text.push_back(c == 0x0A ? '|' : (c >= 0x20 && c < 0x7F ? static_cast<char>(c) : '.'));
++      }
++      REXKRNL_WARN("fake Live: server sent {} bytes, to game {} bytes, to server {} bytes: {}", got,
++                   translated.to_game.size(), translated.to_server.size(), text);
++    }
++    shim_inbox_.insert(shim_inbox_.end(), translated.to_game.begin(), translated.to_game.end());
++    if (!translated.to_server.empty()) {
++      send(native_handle_, reinterpret_cast<const char*>(translated.to_server.data()),
++           static_cast<int>(translated.to_server.size()), 0);
++    }
++    if (shim_inbox_.empty()) {
++      // Only part of a frame so far, or a reply the shim consumed: nothing for the game yet.
++#if REX_PLATFORM_WIN32
++      WSASetLastError(WSAEWOULDBLOCK);
++#else
++      errno = EAGAIN;
++#endif
++      return -1;
++    }
++  }
 +  if (!shim_inbox_.empty()) {
 +    // A locally answered frame comes first, as far as the game's buffer allows.
 +    const size_t count = std::min<size_t>(buf_len, shim_inbox_.size());
@@ -4371,7 +4583,7 @@ index 2d13ac8..62a8dda 100644
    return recv(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags);
  }
  
-@@ -205,7 +277,19 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
+@@ -205,7 +314,19 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
  }
  
  int XSocket::Send(const uint8_t* buf, uint32_t buf_len, uint32_t flags) {
@@ -4392,7 +4604,7 @@ index 2d13ac8..62a8dda 100644
  }
  
  int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_IN* to,
-@@ -221,12 +305,20 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
+@@ -221,12 +342,20 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
    }
    */
  
