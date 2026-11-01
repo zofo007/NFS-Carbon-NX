@@ -1327,6 +1327,127 @@ index 0000000..3abc908
 +};
 +
 +}  // namespace rex::system::xam::fesl
+diff --git a/sdk/include/rex/system/xam/overlapped_recv.h b/sdk/include/rex/system/xam/overlapped_recv.h
+new file mode 100644
+index 0000000..3de7758
+--- /dev/null
++++ b/sdk/include/rex/system/xam/overlapped_recv.h
+@@ -0,0 +1,115 @@
++#pragma once
++/**
++ * Overlapped UDP receives for the 360 game's socket layer (DirtySDK).
++ *
++ * The game does not call recvfrom on its UDP sockets. It posts WSARecvFrom with an OVERLAPPED
++ * structure, expects "pending" (WSA_IO_PENDING, 997) when nothing has arrived, then waits on the
++ * overlapped's event and collects the result with WSAGetOverlappedResult. Its socket thread posts a
++ * new receive only while its "bytes received" field is zero, so a plain "would block" error would
++ * leave that field set and the socket would never be read again.
++ *
++ * This table remembers the receives the game posted until they complete and are collected. All
++ * addresses are guest addresses. Header-only and free of kernel dependencies so it can be unit-tested
++ * on the host.
++ */
++
++#include <algorithm>
++#include <cstdint>
++#include <mutex>
++#include <vector>
++
++namespace rex::system::xam::overlapped {
++
++struct PendingReceive {
++  uint32_t socket = 0;      // the guest's socket handle
++  uint32_t buffer = 0;      // where the datagram goes
++  uint32_t length = 0;      // size of that buffer
++  uint32_t from = 0;        // sockaddr_in the sender is written to (0 = none)
++  uint32_t from_length = 0; // pointer to its size (0 = none)
++  uint32_t overlapped = 0;  // the game's OVERLAPPED, the key
++  uint32_t event = 0;       // event handle to signal when the datagram arrives (0 = none)
++  bool done = false;
++  uint32_t bytes = 0;
++};
++
++class PendingReceiveTable {
++ public:
++  // The same OVERLAPPED posted again replaces the earlier receive.
++  void Add(const PendingReceive& receive) {
++    std::lock_guard<std::mutex> guard(lock_);
++    for (PendingReceive& existing : receives_) {
++      if (existing.overlapped == receive.overlapped) {
++        existing = receive;
++        return;
++      }
++    }
++    receives_.push_back(receive);
++  }
++
++  // Receives still waiting for a datagram (completed ones are not polled again).
++  std::vector<PendingReceive> Active() const {
++    std::lock_guard<std::mutex> guard(lock_);
++    std::vector<PendingReceive> active;
++    for (const PendingReceive& receive : receives_) {
++      if (!receive.done) {
++        active.push_back(receive);
++      }
++    }
++    return active;
++  }
++
++  bool HasActive() const {
++    std::lock_guard<std::mutex> guard(lock_);
++    return std::any_of(receives_.begin(), receives_.end(),
++                       [](const PendingReceive& receive) { return !receive.done; });
++  }
++
++  // True from the post until the game collects the result (or the socket is cancelled).
++  bool IsPending(uint32_t overlapped) const {
++    std::lock_guard<std::mutex> guard(lock_);
++    return std::any_of(receives_.begin(), receives_.end(), [&](const PendingReceive& receive) {
++      return receive.overlapped == overlapped;
++    });
++  }
++
++  // A datagram of `bytes` arrived for this receive.
++  void Complete(uint32_t overlapped, uint32_t bytes) {
++    std::lock_guard<std::mutex> guard(lock_);
++    for (PendingReceive& receive : receives_) {
++      if (receive.overlapped == overlapped && !receive.done) {
++        receive.done = true;
++        receive.bytes = bytes;
++        return;
++      }
++    }
++  }
++
++  // The game asks for the result: only a completed receive is handed over, once.
++  bool Collect(uint32_t overlapped, uint32_t* bytes) {
++    std::lock_guard<std::mutex> guard(lock_);
++    for (auto it = receives_.begin(); it != receives_.end(); ++it) {
++      if (it->overlapped == overlapped && it->done) {
++        *bytes = it->bytes;
++        receives_.erase(it);
++        return true;
++      }
++    }
++    return false;
++  }
++
++  // WSACancelOverlappedIO: forget everything posted on this socket.
++  void CancelSocket(uint32_t socket) {
++    std::lock_guard<std::mutex> guard(lock_);
++    receives_.erase(std::remove_if(receives_.begin(), receives_.end(),
++                                   [&](const PendingReceive& receive) {
++                                     return receive.socket == socket;
++                                   }),
++                    receives_.end());
++  }
++
++ private:
++  mutable std::mutex lock_;
++  std::vector<PendingReceive> receives_;
++};
++
++}  // namespace rex::system::xam::overlapped
 diff --git a/sdk/include/rex/system/xam/user_profile.h b/sdk/include/rex/system/xam/user_profile.h
 index ec37017..fe12c46 100644
 --- a/sdk/include/rex/system/xam/user_profile.h
@@ -2886,22 +3007,24 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..aa0ee80 100644
+index 58e36a4..c1cff4c 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
-@@ -12,7 +12,11 @@
+@@ -12,7 +12,13 @@
  // Disable warnings about unused parameters for kernel functions
  #pragma GCC diagnostic ignored "-Wunused-parameter"
  
 +#include <algorithm>
 +#include <atomic>
 +#include <cerrno>
++#include <chrono>
  #include <cstring>
 +#include <string>
++#include <thread>
  
  #if REX_PLATFORM_MAC
  #include <sys/select.h>
-@@ -20,6 +24,7 @@
+@@ -20,6 +26,7 @@
  
  #include <rex/chrono/clock.h>
  #include <rex/kernel/xam/module.h>
@@ -2909,7 +3032,15 @@ index 58e36a4..aa0ee80 100644
  #include <rex/kernel/xam/private.h>
  #include <rex/kernel/xboxkrnl/error.h>
  #include <rex/kernel/xboxkrnl/threading.h>
-@@ -37,19 +42,101 @@
+@@ -28,6 +35,7 @@
+ #include <rex/types.h>
+ #include <rex/string.h>
+ #include <rex/system/kernel_state.h>
++#include <rex/system/xam/overlapped_recv.h>
+ #include <rex/system/xevent.h>
+ #include <rex/system/xsocket.h>
+ #include <rex/system/xthread.h>
+@@ -37,19 +45,101 @@
  // NOTE: must be included last as it expects windows.h to already be included.
  #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
  #include <winsock2.h>                    // NOLINT(build/include_order)
@@ -3011,7 +3142,215 @@ index 58e36a4..aa0ee80 100644
  // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
  enum {
    XNCALLER_INVALID = 0x0,
-@@ -436,6 +523,19 @@ struct XnAddrStatus {
+@@ -295,25 +385,156 @@ u32 NetDll_WSAGetLastError_entry() {
+   return XThread::GetLastError();
+ }
+ 
+-u32 NetDll_WSARecvFrom_entry(u32 caller, u32 socket, ppc_ptr_t<XWSABUF> buffers_ptr,
++// The UDP receives the game posted and has not collected yet (see xam/overlapped_recv.h).
++static rex::system::xam::overlapped::PendingReceiveTable g_pending_receives;
++
++// Writes one received datagram's sender (address, port and length) into the guest's sockaddr_in.
++static void StoreSender(uint32_t from_guest, uint32_t from_length_guest, const N_XSOCKADDR_IN& from,
++                        uint32_t from_length) {
++  if (from_guest) {
++    auto* out = reinterpret_cast<XSOCKADDR_IN*>(REX_KERNEL_MEMORY()->TranslateVirtual(from_guest));
++    out->sin_family = from.sin_family;
++    out->sin_port = from.sin_port;
++    out->sin_addr = from.sin_addr;
++    std::memset(out->x_sin_zero, 0, sizeof(out->x_sin_zero));
++  }
++  if (from_length_guest) {
++    memory::store_and_swap<uint32_t>(REX_KERNEL_MEMORY()->TranslateVirtual(from_length_guest),
++                                     from_length);
++  }
++}
++
++// Reads every socket the game has a receive posted on; a datagram that arrived is copied into the
++// game's buffer, the receive is marked done and the overlapped's event is signalled, which is what the
++// game's socket thread waits for.
++static void CompletePendingReceives() {
++  for (const rex::system::xam::overlapped::PendingReceive& pending : g_pending_receives.Active()) {
++    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(pending.socket);
++    if (!socket) {
++      g_pending_receives.CancelSocket(pending.socket);  // closed under it
++      continue;
++    }
++    N_XSOCKADDR_IN from;
++    uint32_t from_length = sizeof(XSOCKADDR_IN);
++    const int received = socket->RecvFrom(REX_KERNEL_MEMORY()->TranslateVirtual(pending.buffer),
++                                          pending.length, 0, &from, &from_length);
++    if (received < 0) {
++      continue;  // nothing yet
++    }
++    StoreSender(pending.from, pending.from_length, from, from_length);
++    auto* overlapped_out =
++        reinterpret_cast<XWSAOVERLAPPED*>(REX_KERNEL_MEMORY()->TranslateVirtual(pending.overlapped));
++    overlapped_out->internal = 0;  // STATUS_SUCCESS
++    overlapped_out->internal_high = static_cast<uint32_t>(received);
++    g_pending_receives.Complete(pending.overlapped, static_cast<uint32_t>(received));
++    if (pending.event) {
++      xboxkrnl::xeNtSetEvent(pending.event, nullptr);
++    }
++    FAKE_LIVE_TRACE_UP_TO(60, "fake Live: UDP datagram of {} bytes from {}:{} given to the game",
++                          received, Ipv4ToString(from.sin_addr),
++                          static_cast<uint16_t>(from.sin_port));
++  }
++}
++
++// The game never reads its UDP sockets with recvfrom: it posts this call with an OVERLAPPED. A datagram
++// that is already there is returned at once; otherwise the receive stays pending (WSA_IO_PENDING) and
++// is completed later by CompletePendingReceives. A plain "would block" error is not enough: the game
++// posts again only while its byte count is zero, which an error leaves set.
++u32 NetDll_WSARecvFrom_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buffers_ptr,
+                              u32 buffer_count, mapped_u32 num_bytes_recv, mapped_u32 flags_ptr,
+-                             ppc_ptr_t<XSOCKADDR_IN> from_addr,
++                             ppc_ptr_t<XSOCKADDR_IN> from_addr, mapped_u32 from_length_ptr,
+                              ppc_ptr_t<XWSAOVERLAPPED> overlapped_ptr,
+                              mapped_void completion_routine_ptr) {
+-  if (overlapped_ptr) {
+-    // auto evt = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(
+-    //    overlapped_ptr->event_handle);
+-
+-    // if (evt) {
+-    //  //evt->Set(0, false);
+-    //}
++  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
++  if (!socket) {
++    XThread::SetLastError(0x2736);  // WSAENOTSOCK
++    return -1;
++  }
++  if (!buffers_ptr || buffer_count == 0) {
++    XThread::SetLastError(10014);  // WSAEFAULT
++    return -1;
+   }
++  // The game posts one buffer; any further ones are not filled.
++  const uint32_t buffer_guest = buffers_ptr[0].buf_ptr;
++  const uint32_t buffer_length = buffers_ptr[0].len;
+ 
+-  // we're not going to be receiving packets any time soon
+-  // return error so we don't wait on that - Cancerous
++  N_XSOCKADDR_IN native_from;
++  uint32_t native_from_length = sizeof(XSOCKADDR_IN);
++  const int received = socket->RecvFrom(REX_KERNEL_MEMORY()->TranslateVirtual(buffer_guest),
++                                        buffer_length, 0, &native_from, &native_from_length);
++  if (received >= 0) {
++    StoreSender(from_addr ? from_addr.guest_address() : 0,
++                from_length_ptr ? from_length_ptr.guest_address() : 0, native_from,
++                native_from_length);
++    if (num_bytes_recv) {
++      *num_bytes_recv = static_cast<uint32_t>(received);
++    }
++    if (flags_ptr) {
++      *flags_ptr = 0;
++    }
++    return 0;
++  }
++  if (!overlapped_ptr) {
++    XThread::SetLastError(10035);  // WSAEWOULDBLOCK
++    return -1;
++  }
++  rex::system::xam::overlapped::PendingReceive pending;
++  pending.socket = socket_handle;
++  pending.buffer = buffer_guest;
++  pending.length = buffer_length;
++  pending.from = from_addr ? from_addr.guest_address() : 0;
++  pending.from_length = from_length_ptr ? from_length_ptr.guest_address() : 0;
++  pending.overlapped = overlapped_ptr.guest_address();
++  pending.event = overlapped_ptr->event_handle;
++  overlapped_ptr->internal = 0x103;  // STATUS_PENDING
++  overlapped_ptr->internal_high = 0;
++  g_pending_receives.Add(pending);
++  FAKE_LIVE_TRACE_UP_TO(12, "fake Live: WSARecvFrom posted on socket {} (buffer {} bytes, overlapped {:#x})",
++                        socket_handle, buffer_length, pending.overlapped);
++  XThread::SetLastError(997);  // WSA_IO_PENDING
+   return -1;
+ }
+ 
++// Collects the result of a receive posted with WSARecvFrom: TRUE with the byte count once a datagram
++// arrived, otherwise FALSE with WSA_IO_INCOMPLETE (996); an OVERLAPPED the table does not know fails
++// with WSA_INVALID_HANDLE (6), which lets the game clear its pending flag and post again.
++u32 NetDll_WSAGetOverlappedResult_entry(u32 caller, u32 socket_handle,
++                                        ppc_ptr_t<XWSAOVERLAPPED> overlapped_ptr,
++                                        mapped_u32 num_bytes_ptr, u32 wait, mapped_u32 flags_ptr) {
++  if (!overlapped_ptr) {
++    XThread::SetLastError(6);
++    return 0;
++  }
++  const uint32_t key = overlapped_ptr.guest_address();
++  for (;;) {
++    CompletePendingReceives();
++    uint32_t bytes = 0;
++    if (g_pending_receives.Collect(key, &bytes)) {
++      if (num_bytes_ptr) {
++        *num_bytes_ptr = bytes;
++      }
++      if (flags_ptr) {
++        *flags_ptr = 0;
++      }
++      return 1;
++    }
++    if (!g_pending_receives.IsPending(key)) {
++      XThread::SetLastError(6);  // WSA_INVALID_HANDLE
++      return 0;
++    }
++    if (!wait) {
++      XThread::SetLastError(996);  // WSA_IO_INCOMPLETE
++      return 0;
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds(1));
++  }
++}
++
++u32 NetDll_WSACancelOverlappedIO_entry(u32 caller, u32 socket_handle) {
++  g_pending_receives.CancelSocket(socket_handle);
++  return 0;
++}
++
+ // If the socket is a VDP socket, buffer 0 is the game data length, and buffer 1
+ // is the unencrypted game data.
+ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buffers,
+@@ -363,10 +584,35 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
+   uint64_t timeout_wait = (uint64_t)timeout;
+ 
+   X_STATUS result = 0;
+-  do {
+-    result = xboxkrnl::xeNtWaitForMultipleObjectsEx(num_events, events, wait_all, 1, alertable,
+-                                                    timeout != -1 ? &timeout_wait : nullptr);
+-  } while (result == X_STATUS_ALERTED);
++  if (REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    // The game's socket thread waits here (usually with no timeout) for its UDP receives to complete.
++    // Nothing in the host signals the events by itself, so wait in 10 ms slices and look for arrived
++    // datagrams in between; a datagram completes its receive and signals the event.
++    const auto started = std::chrono::steady_clock::now();
++    for (;;) {
++      CompletePendingReceives();
++      uint64_t slice = static_cast<uint64_t>(-100000LL);  // 10 ms, relative, in 100 ns units
++      result = xboxkrnl::xeNtWaitForMultipleObjectsEx(num_events, events, wait_all, 1, alertable,
++                                                      &slice);
++      if (result == X_STATUS_ALERTED) {
++        continue;
++      }
++      if (result != 0x00000102 /* STATUS_TIMEOUT */) {
++        break;
++      }
++      const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
++                              std::chrono::steady_clock::now() - started)
++                              .count();
++      if (timeout != static_cast<u32>(-1) && waited >= static_cast<int64_t>(timeout)) {
++        break;
++      }
++    }
++  } else {
++    do {
++      result = xboxkrnl::xeNtWaitForMultipleObjectsEx(num_events, events, wait_all, 1, alertable,
++                                                      timeout != -1 ? &timeout_wait : nullptr);
++    } while (result == X_STATUS_ALERTED);
++  }
+ 
+   if (XFAILED(result)) {
+     uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
+@@ -436,6 +682,19 @@ struct XnAddrStatus {
  };
  
  u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
@@ -3031,7 +3370,7 @@ index 58e36a4..aa0ee80 100644
    // Just return a loopback address atm.
    addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
    addr_ptr->inaOnline.s_addr = 0;
-@@ -505,16 +605,100 @@ struct XEthernetStatus {
+@@ -505,16 +764,100 @@ struct XEthernetStatus {
    static const uint32_t XNET_ETHERNET_LINK_HALF_DUPLEX = 0x10;
  };
  
@@ -3073,9 +3412,9 @@ index 58e36a4..aa0ee80 100644
 +    return caller;
 +  }
 +  FAKE_LIVE_TRACE("fake Live: XNetConnect({:#x}) -> 0", ina);
-   return 0;
- }
- 
++  return 0;
++}
++
 +u32 NetDll_XNetGetConnectStatus_entry(u32 caller, u32 ina) {
 +  if (!REX_KERNEL_STATE()->user_profile()->fake_live()) {
 +    return caller;
@@ -3088,9 +3427,9 @@ index 58e36a4..aa0ee80 100644
 +  if (!REX_KERNEL_STATE()->user_profile()->fake_live()) {
 +    return caller;
 +  }
-+  return 0;
-+}
-+
+   return 0;
+ }
+ 
 +bool xeOnlineServerAddress(uint32_t* ipv4_host_order) {
 +  const std::string configured = REXCVAR_GET(online_server_host);
 +  in_addr address{};
@@ -3134,7 +3473,7 @@ index 58e36a4..aa0ee80 100644
      *pdns = dns_guest;
    }
    if (event_handle) {
-@@ -579,11 +763,24 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
+@@ -579,11 +922,24 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
  }
  
  u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
@@ -3159,7 +3498,7 @@ index 58e36a4..aa0ee80 100644
    if (XFAILED(result)) {
      socket->Release();
  
-@@ -643,6 +840,35 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
+@@ -643,6 +999,35 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
    return XSUCCEEDED(status) ? 0 : -1;
  }
  
@@ -3195,7 +3534,7 @@ index 58e36a4..aa0ee80 100644
  u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void arg_ptr) {
    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
    if (!socket) {
-@@ -687,10 +913,43 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -687,10 +1072,43 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
      return -1;
    }
  
@@ -3241,7 +3580,7 @@ index 58e36a4..aa0ee80 100644
      return -1;
    }
  
-@@ -783,6 +1042,18 @@ struct host_set {
+@@ -783,6 +1201,18 @@ struct host_set {
      }
    }
  
@@ -3260,7 +3599,7 @@ index 58e36a4..aa0ee80 100644
    void UpdateFrom(fd_set* native_set) {
      uint32_t new_count = 0;
      for (uint32_t i = 0; i < this->count; ++i) {
-@@ -825,8 +1096,18 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -825,8 +1255,18 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
                                               reinterpret_cast<int32_t*>(&timeout.tv_usec));
      timeout_in = &timeout;
    }
@@ -3281,7 +3620,7 @@ index 58e36a4..aa0ee80 100644
    if (readfds) {
      host_readfds.UpdateFrom(&native_readfds);
      host_readfds.Store(readfds);
-@@ -844,6 +1125,17 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -844,6 +1284,17 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
    return ret;
  }
  
@@ -3299,7 +3638,7 @@ index 58e36a4..aa0ee80 100644
  u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
    if (!socket) {
-@@ -852,7 +1144,15 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -852,7 +1303,15 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -3316,7 +3655,7 @@ index 58e36a4..aa0ee80 100644
  }
  
  u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
-@@ -883,13 +1183,12 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+@@ -883,13 +1342,12 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
    }
  
    if (ret == -1) {
@@ -3336,7 +3675,7 @@ index 58e36a4..aa0ee80 100644
    }
  
    return ret;
-@@ -903,7 +1202,17 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -903,7 +1361,17 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -3355,7 +3694,7 @@ index 58e36a4..aa0ee80 100644
  }
  
  u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
-@@ -915,6 +1224,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+@@ -915,6 +1383,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
      return -1;
    }
  
@@ -3369,7 +3708,17 @@ index 58e36a4..aa0ee80 100644
    N_XSOCKADDR_IN native_to(to_ptr);
    return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
  }
-@@ -963,6 +1279,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+@@ -946,6 +1421,9 @@ REX_EXPORT(__imp__NetDll_WSACleanup, rex::kernel::xam::NetDll_WSACleanup_entry)
+ REX_EXPORT(__imp__NetDll_WSAGetLastError, rex::kernel::xam::NetDll_WSAGetLastError_entry)
+ REX_EXPORT(__imp__NetDll_WSARecvFrom, rex::kernel::xam::NetDll_WSARecvFrom_entry)
+ REX_EXPORT(__imp__NetDll_WSASendTo, rex::kernel::xam::NetDll_WSASendTo_entry)
++REX_EXPORT(__imp__NetDll_WSAGetOverlappedResult,
++           rex::kernel::xam::NetDll_WSAGetOverlappedResult_entry)
++REX_EXPORT(__imp__NetDll_WSACancelOverlappedIO, rex::kernel::xam::NetDll_WSACancelOverlappedIO_entry)
+ REX_EXPORT(__imp__NetDll_WSAWaitForMultipleEvents,
+            rex::kernel::xam::NetDll_WSAWaitForMultipleEvents_entry)
+ REX_EXPORT(__imp__NetDll_WSACreateEvent, rex::kernel::xam::NetDll_WSACreateEvent_entry)
+@@ -963,6 +1441,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
             rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
@@ -3378,7 +3727,17 @@ index 58e36a4..aa0ee80 100644
  REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
-@@ -1030,12 +1348,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1000,9 +1480,7 @@ REX_EXPORT_STUB(__imp__NetDll_UpnpEventUnsubscribe);
+ REX_EXPORT_STUB(__imp__NetDll_UpnpSearchCreate);
+ REX_EXPORT_STUB(__imp__NetDll_UpnpSearchGetDevices);
+ REX_EXPORT_STUB(__imp__NetDll_UpnpStartup);
+-REX_EXPORT_STUB(__imp__NetDll_WSACancelOverlappedIO);
+ REX_EXPORT_STUB(__imp__NetDll_WSAEventSelect);
+-REX_EXPORT_STUB(__imp__NetDll_WSAGetOverlappedResult);
+ REX_EXPORT_STUB(__imp__NetDll_WSARecv);
+ REX_EXPORT_STUB(__imp__NetDll_WSASend);
+ REX_EXPORT_STUB(__imp__NetDll_WSAStartupEx);
+@@ -1030,12 +1508,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -3393,7 +3752,7 @@ index 58e36a4..aa0ee80 100644
  REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
  REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
  REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
-@@ -1048,7 +1366,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
+@@ -1048,7 +1526,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
  REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
  REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
  REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
@@ -3402,7 +3761,7 @@ index 58e36a4..aa0ee80 100644
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
-@@ -1099,4 +1417,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
+@@ -1099,4 +1577,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
  REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
  REX_EXPORT_STUB(__imp__NetDll_getpeername);
  REX_EXPORT_STUB(__imp__NetDll_getsockname);

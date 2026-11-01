@@ -1,6 +1,7 @@
 #include <rex/system/tail_call_thunk.h>
 #include <rex/system/xam/fake_live.h>
 #include <rex/system/xam/fesl_shim.h>
+#include <rex/system/xam/overlapped_recv.h>
 #include <rex/system/xam/xlive_async.h>
 
 #include <cerrno>
@@ -19,6 +20,7 @@ namespace fs = std::filesystem;
 namespace fl = rex::system::xam::fake_live;
 namespace fesl = rex::system::xam::fesl;
 namespace xa = rex::system::xam::xlive_async;
+namespace overlapped = rex::system::xam::overlapped;
 
 void Check(bool success, const char* expression, int line) {
   if (!success) {
@@ -488,6 +490,45 @@ void CallRingKeepsTheLastCallsOldestFirst() {
   CHECK(ring.LastCallMs() == 60);
 }
 
+overlapped::PendingReceive Receive(uint32_t socket, uint32_t overlapped_ptr, uint32_t buffer) {
+  return {socket, buffer, 1000, 0x2000, 0x2010, overlapped_ptr, 9};
+}
+
+void PendingReceiveIsKeptPerOverlapped() {
+  overlapped::PendingReceiveTable table;
+  CHECK(!table.HasActive());
+  table.Add(Receive(7, 0x3000, 0x1000));
+  CHECK(table.HasActive() && table.IsPending(0x3000));
+  table.Add(Receive(7, 0x3000, 0x1100));  // the same overlapped replaces, never duplicates
+  CHECK(table.Active().size() == 1 && table.Active()[0].buffer == 0x1100);
+  table.Add(Receive(8, 0x4000, 0x1200));
+  CHECK(table.Active().size() == 2);
+}
+
+void CompletedReceiveIsCollectedOnce() {
+  overlapped::PendingReceiveTable table;
+  table.Add(Receive(7, 0x3000, 0x1000));
+  uint32_t bytes = 0;
+  CHECK(!table.Collect(0x3000, &bytes));  // nothing arrived yet
+  table.Complete(0x3000, 28);
+  CHECK(!table.HasActive());              // a completed receive is not polled again
+  CHECK(table.IsPending(0x3000));         // but it stays until the game collects it
+  CHECK(table.Collect(0x3000, &bytes) && bytes == 28);
+  CHECK(!table.Collect(0x3000, &bytes));  // collected exactly once
+  CHECK(!table.IsPending(0x3000));
+}
+
+void CancelDropsASocketsReceives() {
+  overlapped::PendingReceiveTable table;
+  table.Add(Receive(7, 0x3000, 0x1000));
+  table.Add(Receive(8, 0x4000, 0x1200));
+  table.CancelSocket(7);
+  CHECK(!table.IsPending(0x3000) && table.IsPending(0x4000));
+  uint32_t bytes = 0;
+  table.Complete(0x3000, 5);  // completing something already cancelled changes nothing
+  CHECK(!table.Collect(0x3000, &bytes));
+}
+
 void ServerPortReplacesOnlyTheLoginPort() {
   CHECK(fl::RedirectedPort(18220, 18210) == 18210);  // the 360's account port becomes the server's
   CHECK(fl::RedirectedPort(18215, 18210) == 18215);  // Theater keeps the port the server announced
@@ -742,6 +783,9 @@ int main(int argc, char** argv) {
   Base64Decodes();
   FragmentedMatchRequestIsDecodedForTheTrace();
   OtherFragmentedCommandsAreNotTraced();
+  PendingReceiveIsKeptPerOverlapped();
+  CompletedReceiveIsCollectedOnce();
+  CancelDropsASocketsReceives();
   CallRingKeepsTheLastCallsOldestFirst();
   TheaterAddressesAreRewrittenToTheReachableHost();
   TheaterFramesWithoutTheAnnouncedAddressAreUntouched();
