@@ -159,6 +159,9 @@ void WinsockErrors() {
   CHECK(fl::WinsockErrorFromErrno(ENETUNREACH) == 10051);
   CHECK(fl::WinsockErrorFromErrno(EHOSTUNREACH) == 10065);
   CHECK(fl::WinsockErrorFromErrno(EISCONN) == 10056);
+  CHECK(fl::WinsockErrorFromErrno(ECONNRESET) == 10054);  // the server closed the connection
+  CHECK(fl::WinsockErrorFromErrno(ENOTCONN) == 10057);
+  CHECK(fl::WinsockErrorFromErrno(ECONNABORTED) == 10053);
   CHECK(fl::WinsockErrorFromErrno(ENOENT) == 10050);  // WSAENETDOWN for anything unlisted
 }
 

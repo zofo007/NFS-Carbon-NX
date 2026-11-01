@@ -381,10 +381,10 @@ index 9b9cf9e..d853a94 100644
  
 diff --git a/sdk/include/rex/system/xam/fake_live.h b/sdk/include/rex/system/xam/fake_live.h
 new file mode 100644
-index 0000000..cfc4e70
+index 0000000..ea078bf
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/fake_live.h
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,257 @@
 +#pragma once
 +
 +// Values the kernel reports when the profile is made to look signed in to Xbox Live.
@@ -541,6 +541,12 @@ index 0000000..cfc4e70
 +      return 10065;  // WSAEHOSTUNREACH
 +    case EISCONN:
 +      return 10056;  // WSAEISCONN
++    case ENOTCONN:
++      return 10057;  // WSAENOTCONN
++    case ECONNRESET:
++      return 10054;  // WSAECONNRESET
++    case ECONNABORTED:
++      return 10053;  // WSAECONNABORTED
 +    default:
 +      break;
 +  }
@@ -2057,21 +2063,22 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..e025960 100644
+index 58e36a4..d6a0c18 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
-@@ -12,7 +12,10 @@
+@@ -12,7 +12,11 @@
  // Disable warnings about unused parameters for kernel functions
  #pragma GCC diagnostic ignored "-Wunused-parameter"
  
 +#include <algorithm>
 +#include <atomic>
++#include <cerrno>
  #include <cstring>
 +#include <string>
  
  #if REX_PLATFORM_MAC
  #include <sys/select.h>
-@@ -20,6 +23,7 @@
+@@ -20,6 +24,7 @@
  
  #include <rex/chrono/clock.h>
  #include <rex/kernel/xam/module.h>
@@ -2079,7 +2086,7 @@ index 58e36a4..e025960 100644
  #include <rex/kernel/xam/private.h>
  #include <rex/kernel/xboxkrnl/error.h>
  #include <rex/kernel/xboxkrnl/threading.h>
-@@ -37,19 +41,80 @@
+@@ -37,19 +42,80 @@
  // NOTE: must be included last as it expects windows.h to already be included.
  #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
  #include <winsock2.h>                    // NOLINT(build/include_order)
@@ -2160,7 +2167,7 @@ index 58e36a4..e025960 100644
  // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
  enum {
    XNCALLER_INVALID = 0x0,
-@@ -436,6 +501,19 @@ struct XnAddrStatus {
+@@ -436,6 +502,19 @@ struct XnAddrStatus {
  };
  
  u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
@@ -2180,7 +2187,7 @@ index 58e36a4..e025960 100644
    // Just return a loopback address atm.
    addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
    addr_ptr->inaOnline.s_addr = 0;
-@@ -505,16 +583,100 @@ struct XEthernetStatus {
+@@ -505,16 +584,100 @@ struct XEthernetStatus {
    static const uint32_t XNET_ETHERNET_LINK_HALF_DUPLEX = 0x10;
  };
  
@@ -2283,7 +2290,7 @@ index 58e36a4..e025960 100644
      *pdns = dns_guest;
    }
    if (event_handle) {
-@@ -579,6 +741,14 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
+@@ -579,6 +742,14 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
  }
  
  u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
@@ -2298,7 +2305,7 @@ index 58e36a4..e025960 100644
    XSocket* socket = new XSocket(REX_KERNEL_STATE());
    X_STATUS result =
        socket->Initialize(XSocket::AddressFamily((uint32_t)af), XSocket::Type((uint32_t)type),
-@@ -643,6 +813,35 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
+@@ -643,6 +814,35 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
    return XSUCCEEDED(status) ? 0 : -1;
  }
  
@@ -2334,7 +2341,7 @@ index 58e36a4..e025960 100644
  u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void arg_ptr) {
    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
    if (!socket) {
-@@ -687,10 +886,34 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -687,10 +887,34 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
      return -1;
    }
  
@@ -2371,7 +2378,7 @@ index 58e36a4..e025960 100644
      return -1;
    }
  
-@@ -783,6 +1006,18 @@ struct host_set {
+@@ -783,6 +1007,18 @@ struct host_set {
      }
    }
  
@@ -2390,7 +2397,7 @@ index 58e36a4..e025960 100644
    void UpdateFrom(fd_set* native_set) {
      uint32_t new_count = 0;
      for (uint32_t i = 0; i < this->count; ++i) {
-@@ -825,8 +1060,18 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -825,8 +1061,18 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
                                               reinterpret_cast<int32_t*>(&timeout.tv_usec));
      timeout_in = &timeout;
    }
@@ -2411,18 +2418,70 @@ index 58e36a4..e025960 100644
    if (readfds) {
      host_readfds.UpdateFrom(&native_readfds);
      host_readfds.Store(readfds);
-@@ -903,6 +1148,10 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -844,6 +1090,17 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+   return ret;
+ }
+ 
++// After a failed host socket call: the game's WSAGetLastError() must say why (would-block on a
++// non-blocking socket is normal and the game polls again, anything else ends the connection).
++static void SetLastErrorFromHost(int host_errno) {
++#if REX_PLATFORM_WIN32
++  XThread::SetLastError(static_cast<uint32_t>(WSAGetLastError()));
++  (void)host_errno;
++#else
++  XThread::SetLastError(fake_live::WinsockErrorFromErrno(host_errno));
++#endif
++}
++
+ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
+   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+   if (!socket) {
+@@ -852,7 +1109,11 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
+-  return socket->Recv(buf_ptr, buf_len, flags);
++  const int ret = socket->Recv(buf_ptr, buf_len, flags);
++  if (ret < 0) {
++    SetLastErrorFromHost(errno);
++  }
++  return ret;
+ }
+ 
+ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
+@@ -883,13 +1144,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+   }
+ 
+   if (ret == -1) {
+-// TODO: Better way of getting the error code
+-#if REX_PLATFORM_WIN32
+-    uint32_t error_code = WSAGetLastError();
+-    XThread::SetLastError(error_code);
+-#else
+-    XThread::SetLastError(0x0);
+-#endif
++    SetLastErrorFromHost(errno);
+   }
+ 
+   return ret;
+@@ -903,7 +1158,15 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+     return -1;
+   }
+ 
+-  return socket->Send(buf_ptr, buf_len, flags);
 +  if (REX_KERNEL_STATE()->user_profile()->fake_live()) {
 +    FAKE_LIVE_TRACE_UP_TO(6, "fake Live: send socket {} {} bytes: {}", socket_handle, buf_len,
 +                          HexPrefix(buf_ptr.as<const uint8_t*>(), buf_len));
 +  }
-   return socket->Send(buf_ptr, buf_len, flags);
++  const int ret = socket->Send(buf_ptr, buf_len, flags);
++  if (ret < 0) {
++    SetLastErrorFromHost(errno);
++  }
++  return ret;
  }
  
-@@ -915,6 +1164,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
+@@ -915,6 +1178,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
      return -1;
    }
  
@@ -2436,7 +2495,7 @@ index 58e36a4..e025960 100644
    N_XSOCKADDR_IN native_to(to_ptr);
    return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
  }
-@@ -963,6 +1219,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+@@ -963,6 +1233,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
             rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
@@ -2445,7 +2504,7 @@ index 58e36a4..e025960 100644
  REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
-@@ -1030,12 +1288,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,12 +1302,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -2460,7 +2519,7 @@ index 58e36a4..e025960 100644
  REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
  REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
  REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
-@@ -1048,7 +1306,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
+@@ -1048,7 +1320,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
  REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
  REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
  REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
@@ -2469,7 +2528,7 @@ index 58e36a4..e025960 100644
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
-@@ -1099,4 +1357,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
+@@ -1099,4 +1371,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
  REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
  REX_EXPORT_STUB(__imp__NetDll_getpeername);
  REX_EXPORT_STUB(__imp__NetDll_getsockname);
