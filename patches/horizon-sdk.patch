@@ -803,10 +803,10 @@ index 0000000..9238c65
 +}  // namespace rex::system::xam::fake_live
 diff --git a/sdk/include/rex/system/xam/fesl_shim.h b/sdk/include/rex/system/xam/fesl_shim.h
 new file mode 100644
-index 0000000..3abc908
+index 0000000..7e71e76
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/fesl_shim.h
-@@ -0,0 +1,520 @@
+@@ -0,0 +1,532 @@
 +#pragma once
 +/**
 + * Translation between the Xbox 360 build's online account protocol and the PC one.
@@ -836,6 +836,8 @@ index 0000000..3abc908
 +#include <string_view>
 +#include <utility>
 +#include <vector>
++
++#include <rex/system/xam/udp_tunnel.h>
 +
 +namespace rex::system::xam::fesl {
 +
@@ -1098,6 +1100,16 @@ index 0000000..3abc908
 +
 +  void HandleServerFrame(const uint8_t* frame, size_t length, Translation* out) {
 +    const std::string_view command(reinterpret_cast<const char*>(frame), 4);
++    if (command == "EGEG") {
++      // The entry reply carries the key of the game's UDP tunnel: the socket layer needs it to split
++      // the 360's bundled packets (udp_tunnel.h). Each entry starts a fresh tunnel.
++      const std::string_view entry_body(reinterpret_cast<const char*>(frame) + kHeaderSize,
++                                        length - kHeaderSize);
++      const std::string_view key = Field(entry_body, "EKEY");
++      if (!key.empty()) {
++        tunnel::GlobalTunnel().Begin(std::string(key));
++      }
++    }
 +    if (command == "fsys" && !service_host_.empty()) {
 +      const std::string_view hello_body(reinterpret_cast<const char*>(frame) + kHeaderSize,
 +                                        length - kHeaderSize);
@@ -1448,6 +1460,286 @@ index 0000000..3de7758
 +};
 +
 +}  // namespace rex::system::xam::overlapped
+diff --git a/sdk/include/rex/system/xam/udp_tunnel.h b/sdk/include/rex/system/xam/udp_tunnel.h
+new file mode 100644
+index 0000000..77cbf90
+--- /dev/null
++++ b/sdk/include/rex/system/xam/udp_tunnel.h
+@@ -0,0 +1,274 @@
++#pragma once
++/**
++ * The game's UDP tunnel datagrams (DirtySDK ProtoTunnel) in the encrypted mode the PC server uses, and the
++ * one translation the 360 needs on the way out.
++ *
++ * Datagram: be16 prefix, then a table of 2 bytes per virtual packet (length 12 bits, channel 4 bits) and
++ * the packets' bodies. Everything on the channels 1, 2 and 7 (table included) is RC4-encrypted with the
++ * game's key (EGEG's EKEY); the prefix is the position in that RC4 stream in 4-byte words (the table starts
++ * at prefix * 4, each encrypted body follows the previous one). Other channels travel in clear and do not
++ * use the stream.
++ *
++ * Channel 1 carries CommUDP "active" packets: be32 [n:4 | sequence:28], be32 ack, then the newest record,
++ * then n older records each followed by its length byte (newest first). The PC server only accepts a
++ * packet that holds a single record, but the 360 bundles history into each one, so its ticket arrives as
++ * the second record of a packet and is dropped silently. ClientNormalizer splits the bundle back into one
++ * packet per record, oldest first, keeping every record's own sequence number.
++ *
++ * Header-only and free of kernel dependencies so it can be unit-tested on the host.
++ */
++
++#include <cstddef>
++#include <cstdint>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace rex::system::xam::tunnel {
++
++constexpr size_t kMaxDatagram = 1000;  // the server refuses anything longer
++constexpr size_t kMaxPackets = 9;      // and a table with more entries
++
++// `count` bytes of the RC4 keystream of `key`, after skipping `skip` bytes.
++inline std::vector<uint8_t> Rc4Keystream(std::string_view key, size_t skip, size_t count) {
++  uint8_t state[256];
++  for (int i = 0; i < 256; ++i) {
++    state[i] = static_cast<uint8_t>(i);
++  }
++  uint8_t j = 0;
++  for (int i = 0; i < 256; ++i) {
++    j = static_cast<uint8_t>(j + state[i] + static_cast<uint8_t>(key[static_cast<size_t>(i) % key.size()]));
++    const uint8_t swap = state[i];
++    state[i] = state[j];
++    state[j] = swap;
++  }
++  std::vector<uint8_t> out;
++  out.reserve(count);
++  uint8_t a = 0;
++  uint8_t b = 0;
++  for (size_t produced = 0; produced < skip + count; ++produced) {
++    a = static_cast<uint8_t>(a + 1);
++    b = static_cast<uint8_t>(b + state[a]);
++    const uint8_t swap = state[a];
++    state[a] = state[b];
++    state[b] = swap;
++    if (produced >= skip) {
++      out.push_back(state[static_cast<uint8_t>(state[a] + state[b])]);
++    }
++  }
++  return out;
++}
++
++struct Packet {
++  uint8_t channel = 0;
++  std::vector<uint8_t> body;
++};
++
++struct Datagram {
++  uint16_t prefix = 0;
++  std::vector<Packet> packets;
++};
++
++inline bool IsEncryptedChannel(uint8_t channel) {
++  return channel == 1 || channel == 2 || channel == 7;
++}
++
++// Decodes a datagram as the server does: tries table sizes 1 to 9 until the lengths add up exactly.
++inline bool Decode(const uint8_t* data, size_t size, std::string_view key, Datagram* out) {
++  if (size < 4 || size > kMaxDatagram) {
++    return false;
++  }
++  const uint16_t prefix = static_cast<uint16_t>((data[0] << 8) | data[1]);
++  const std::vector<uint8_t> stream = Rc4Keystream(key, static_cast<size_t>(prefix) * 4, size - 2);
++  for (size_t count = 1; count <= kMaxPackets && 2 + 2 * count <= size; ++count) {
++    std::vector<size_t> lengths;
++    std::vector<uint8_t> channels;
++    size_t total = 0;
++    bool valid = true;
++    for (size_t i = 0; i < count; ++i) {
++      const uint8_t high = data[2 + 2 * i] ^ stream[2 * i];
++      const uint8_t low = data[3 + 2 * i] ^ stream[2 * i + 1];
++      const size_t length = (static_cast<size_t>(high) << 4) | (low >> 4);
++      if (length == 0) {
++        valid = false;
++        break;
++      }
++      lengths.push_back(length);
++      channels.push_back(low & 0x0F);
++      total += length;
++    }
++    if (!valid || 2 + 2 * count + total != size) {
++      continue;
++    }
++    Datagram datagram;
++    datagram.prefix = prefix;
++    size_t position = 2 + 2 * count;
++    size_t used = 2 * count;  // keystream bytes consumed so far
++    for (size_t i = 0; i < count; ++i) {
++      Packet packet;
++      packet.channel = channels[i];
++      packet.body.assign(data + position, data + position + lengths[i]);
++      if (IsEncryptedChannel(packet.channel)) {
++        for (size_t k = 0; k < lengths[i]; ++k) {
++          packet.body[k] ^= stream[used + k];
++        }
++        used += lengths[i];
++      }
++      position += lengths[i];
++      datagram.packets.push_back(std::move(packet));
++    }
++    *out = std::move(datagram);
++    return true;
++  }
++  return false;
++}
++
++inline std::vector<uint8_t> Encode(const Datagram& datagram, std::string_view key) {
++  const size_t count = datagram.packets.size();
++  size_t encrypted = 2 * count;
++  for (const Packet& packet : datagram.packets) {
++    if (IsEncryptedChannel(packet.channel)) {
++      encrypted += packet.body.size();
++    }
++  }
++  const std::vector<uint8_t> stream = Rc4Keystream(key, static_cast<size_t>(datagram.prefix) * 4, encrypted);
++  std::vector<uint8_t> wire;
++  wire.push_back(static_cast<uint8_t>(datagram.prefix >> 8));
++  wire.push_back(static_cast<uint8_t>(datagram.prefix));
++  size_t used = 0;
++  for (const Packet& packet : datagram.packets) {
++    const size_t length = packet.body.size();
++    wire.push_back(static_cast<uint8_t>((length >> 4) ^ stream[used]));
++    wire.push_back(static_cast<uint8_t>((((length & 0x0F) << 4) | packet.channel) ^ stream[used + 1]));
++    used += 2;
++  }
++  for (const Packet& packet : datagram.packets) {
++    for (const uint8_t byte : packet.body) {
++      wire.push_back(IsEncryptedChannel(packet.channel) ? static_cast<uint8_t>(byte ^ stream[used++]) : byte);
++    }
++  }
++  return wire;
++}
++
++class ClientNormalizer {
++ public:
++  explicit ClientNormalizer(std::string key) : key_(std::move(key)) {}
++
++  // The datagram rewritten with every bundled CommUDP packet split into single records, or nothing when
++  // there is nothing to split (or it is not a datagram), in which case it is sent as it is.
++  std::optional<std::vector<uint8_t>> Normalize(const uint8_t* data, size_t size) {
++    Datagram in;
++    if (!Decode(data, size, key_, &in)) {
++      return std::nullopt;
++    }
++    Datagram out;
++    out.prefix = in.prefix;
++    bool changed = false;
++    for (Packet& packet : in.packets) {
++      std::vector<Packet> records;
++      if (packet.channel == 1 && packet.body.size() > 8 && (packet.body[0] >> 4) != 0 &&
++          Split(packet.body, &records)) {
++        changed = true;
++        for (Packet& record : records) {
++          out.packets.push_back(std::move(record));
++        }
++      } else {
++        out.packets.push_back(std::move(packet));
++      }
++    }
++    if (!changed || out.packets.size() > kMaxPackets) {
++      return std::nullopt;
++    }
++    std::vector<uint8_t> wire = Encode(out, key_);
++    if (wire.size() > kMaxDatagram) {
++      return std::nullopt;
++    }
++    return wire;
++  }
++
++ private:
++  static uint32_t ReadBigEndian32(const uint8_t* bytes) {
++    return (uint32_t{bytes[0]} << 24) | (uint32_t{bytes[1]} << 16) | (uint32_t{bytes[2]} << 8) |
++           uint32_t{bytes[3]};
++  }
++
++  // One packet per record, oldest first: records the server has already been given are skipped, but
++  // the newest is always sent (the game retransmits it until it is acknowledged).
++  bool Split(const std::vector<uint8_t>& body, std::vector<Packet>* out) {
++    const uint32_t header = ReadBigEndian32(body.data());
++    const size_t older = header >> 28;
++    const int64_t latest = header & 0x0FFFFFFF;
++    size_t position = body.size();
++    std::vector<std::vector<uint8_t>> popped;  // the oldest record comes off the end first
++    for (size_t i = 0; i < older; ++i) {
++      if (position < 8 + 2) {
++        return false;
++      }
++      const size_t length = body[position - 1];
++      if (length == 0 || position < 8 + 1 + length + 1) {
++        return false;
++      }
++      popped.emplace_back(body.begin() + (position - 1 - length), body.begin() + (position - 1));
++      position -= length + 1;
++    }
++    if (position <= 8) {
++      return false;
++    }
++    const auto make = [&](int64_t sequence, const uint8_t* begin, const uint8_t* end) {
++      Packet packet;
++      packet.channel = 1;
++      const uint32_t value = static_cast<uint32_t>(sequence) & 0x0FFFFFFF;
++      for (int shift = 24; shift >= 0; shift -= 8) {
++        packet.body.push_back(static_cast<uint8_t>(value >> shift));
++      }
++      packet.body.insert(packet.body.end(), body.begin() + 4, body.begin() + 8);  // the ack
++      packet.body.insert(packet.body.end(), begin, end);
++      return packet;
++    };
++    for (size_t i = 0; i < popped.size(); ++i) {
++      const int64_t sequence = latest - static_cast<int64_t>(older - i);
++      if (sequence >= 0 && sequence > last_forwarded_) {
++        out->push_back(make(sequence, popped[i].data(), popped[i].data() + popped[i].size()));
++      }
++    }
++    out->push_back(make(latest, body.data() + 8, body.data() + position));
++    if (latest > last_forwarded_) {
++      last_forwarded_ = latest;
++    }
++    return true;
++  }
++
++  std::string key_;
++  int64_t last_forwarded_ = -1;
++};
++
++// The tunnel of the game the process is in: the key arrives with the Theater entry reply (EGEG), the
++// datagrams leave from the socket layer, which are different parts of the program.
++class TunnelState {
++ public:
++  void Begin(std::string key) {
++    std::lock_guard<std::mutex> guard(lock_);
++    normalizer_.emplace(std::move(key));
++  }
++
++  std::optional<std::vector<uint8_t>> Normalize(const uint8_t* data, size_t size) {
++    std::lock_guard<std::mutex> guard(lock_);
++    if (!normalizer_) {
++      return std::nullopt;
++    }
++    return normalizer_->Normalize(data, size);
++  }
++
++ private:
++  std::mutex lock_;
++  std::optional<ClientNormalizer> normalizer_;
++};
++
++inline TunnelState& GlobalTunnel() {
++  static TunnelState state;
++  return state;
++}
++
++}  // namespace rex::system::xam::tunnel
 diff --git a/sdk/include/rex/system/xam/user_profile.h b/sdk/include/rex/system/xam/user_profile.h
 index ec37017..fe12c46 100644
 --- a/sdk/include/rex/system/xam/user_profile.h
@@ -3007,7 +3299,7 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..137a4c3 100644
+index 58e36a4..5d37248 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
 @@ -12,7 +12,13 @@
@@ -3032,15 +3324,16 @@ index 58e36a4..137a4c3 100644
  #include <rex/kernel/xam/private.h>
  #include <rex/kernel/xboxkrnl/error.h>
  #include <rex/kernel/xboxkrnl/threading.h>
-@@ -28,6 +35,7 @@
+@@ -28,6 +35,8 @@
  #include <rex/types.h>
  #include <rex/string.h>
  #include <rex/system/kernel_state.h>
 +#include <rex/system/xam/overlapped_recv.h>
++#include <rex/system/xam/udp_tunnel.h>
  #include <rex/system/xevent.h>
  #include <rex/system/xsocket.h>
  #include <rex/system/xthread.h>
-@@ -37,19 +45,113 @@
+@@ -37,19 +46,113 @@
  // NOTE: must be included last as it expects windows.h to already be included.
  #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
  #include <winsock2.h>                    // NOLINT(build/include_order)
@@ -3154,7 +3447,7 @@ index 58e36a4..137a4c3 100644
  // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
  enum {
    XNCALLER_INVALID = 0x0,
-@@ -295,25 +397,161 @@ u32 NetDll_WSAGetLastError_entry() {
+@@ -295,25 +398,161 @@ u32 NetDll_WSAGetLastError_entry() {
    return XThread::GetLastError();
  }
  
@@ -3327,7 +3620,7 @@ index 58e36a4..137a4c3 100644
  // If the socket is a VDP socket, buffer 0 is the game data length, and buffer 1
  // is the unencrypted game data.
  u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buffers,
-@@ -363,10 +601,35 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
+@@ -363,10 +602,35 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
    uint64_t timeout_wait = (uint64_t)timeout;
  
    X_STATUS result = 0;
@@ -3367,7 +3660,7 @@ index 58e36a4..137a4c3 100644
  
    if (XFAILED(result)) {
      uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
-@@ -436,6 +699,19 @@ struct XnAddrStatus {
+@@ -436,6 +700,19 @@ struct XnAddrStatus {
  };
  
  u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
@@ -3387,7 +3680,7 @@ index 58e36a4..137a4c3 100644
    // Just return a loopback address atm.
    addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
    addr_ptr->inaOnline.s_addr = 0;
-@@ -505,16 +781,100 @@ struct XEthernetStatus {
+@@ -505,16 +782,100 @@ struct XEthernetStatus {
    static const uint32_t XNET_ETHERNET_LINK_HALF_DUPLEX = 0x10;
  };
  
@@ -3429,9 +3722,9 @@ index 58e36a4..137a4c3 100644
 +    return caller;
 +  }
 +  FAKE_LIVE_TRACE("fake Live: XNetConnect({:#x}) -> 0", ina);
-   return 0;
- }
- 
++  return 0;
++}
++
 +u32 NetDll_XNetGetConnectStatus_entry(u32 caller, u32 ina) {
 +  if (!REX_KERNEL_STATE()->user_profile()->fake_live()) {
 +    return caller;
@@ -3444,9 +3737,9 @@ index 58e36a4..137a4c3 100644
 +  if (!REX_KERNEL_STATE()->user_profile()->fake_live()) {
 +    return caller;
 +  }
-+  return 0;
-+}
-+
+   return 0;
+ }
+ 
 +bool xeOnlineServerAddress(uint32_t* ipv4_host_order) {
 +  const std::string configured = REXCVAR_GET(online_server_host);
 +  in_addr address{};
@@ -3490,7 +3783,7 @@ index 58e36a4..137a4c3 100644
      *pdns = dns_guest;
    }
    if (event_handle) {
-@@ -579,11 +939,24 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
+@@ -579,11 +940,24 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
  }
  
  u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
@@ -3515,7 +3808,7 @@ index 58e36a4..137a4c3 100644
    if (XFAILED(result)) {
      socket->Release();
  
-@@ -643,6 +1016,35 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
+@@ -643,6 +1017,35 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
    return XSUCCEEDED(status) ? 0 : -1;
  }
  
@@ -3551,7 +3844,7 @@ index 58e36a4..137a4c3 100644
  u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void arg_ptr) {
    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
    if (!socket) {
-@@ -687,10 +1089,43 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -687,10 +1090,43 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
      return -1;
    }
  
@@ -3597,7 +3890,7 @@ index 58e36a4..137a4c3 100644
      return -1;
    }
  
-@@ -783,6 +1218,18 @@ struct host_set {
+@@ -783,6 +1219,18 @@ struct host_set {
      }
    }
  
@@ -3616,7 +3909,7 @@ index 58e36a4..137a4c3 100644
    void UpdateFrom(fd_set* native_set) {
      uint32_t new_count = 0;
      for (uint32_t i = 0; i < this->count; ++i) {
-@@ -825,8 +1272,18 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -825,8 +1273,18 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
                                               reinterpret_cast<int32_t*>(&timeout.tv_usec));
      timeout_in = &timeout;
    }
@@ -3637,7 +3930,7 @@ index 58e36a4..137a4c3 100644
    if (readfds) {
      host_readfds.UpdateFrom(&native_readfds);
      host_readfds.Store(readfds);
-@@ -844,6 +1301,17 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -844,6 +1302,17 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
    return ret;
  }
  
@@ -3655,7 +3948,7 @@ index 58e36a4..137a4c3 100644
  u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
    if (!socket) {
-@@ -852,7 +1320,15 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -852,7 +1321,15 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -3672,7 +3965,7 @@ index 58e36a4..137a4c3 100644
  }
  
  u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
-@@ -883,13 +1359,12 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+@@ -883,13 +1360,12 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
    }
  
    if (ret == -1) {
@@ -3692,7 +3985,7 @@ index 58e36a4..137a4c3 100644
    }
  
    return ret;
-@@ -903,7 +1378,17 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -903,7 +1379,17 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -3711,7 +4004,7 @@ index 58e36a4..137a4c3 100644
  }
  
  u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
-@@ -915,6 +1400,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+@@ -915,7 +1401,29 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
      return -1;
    }
  
@@ -3723,9 +4016,25 @@ index 58e36a4..137a4c3 100644
 +                          HexBytes(buf_ptr.as<const uint8_t*>(), buf_len, 128));
 +  }
    N_XSOCKADDR_IN native_to(to_ptr);
++  uint32_t server_address = 0;
++  if (REX_KERNEL_STATE()->user_profile()->fake_live() && to_ptr &&
++      xeOnlineServerAddress(&server_address) &&
++      static_cast<uint32_t>(to_ptr->sin_addr) == server_address) {
++    // The PC server's race transport wants one record per packet, but the 360 bundles its recent
++    // history into each (udp_tunnel.h): split the bundle and send that instead.
++    if (auto rewritten = rex::system::xam::tunnel::GlobalTunnel().Normalize(
++            buf_ptr.as<const uint8_t*>(), buf_len)) {
++      FAKE_LIVE_TRACE_UP_TO(60, "fake Live: UDP datagram split: {} bytes became {} bytes: {}", buf_len,
++                            rewritten->size(), HexBytes(rewritten->data(), rewritten->size(), 128));
++      const int sent = socket->SendTo(rewritten->data(), static_cast<uint32_t>(rewritten->size()),
++                                      flags, &native_to, to_len);
++      return sent < 0 ? static_cast<u32>(-1) : buf_len;
++    }
++  }
    return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
  }
-@@ -946,6 +1438,9 @@ REX_EXPORT(__imp__NetDll_WSACleanup, rex::kernel::xam::NetDll_WSACleanup_entry)
+ 
+@@ -946,6 +1454,9 @@ REX_EXPORT(__imp__NetDll_WSACleanup, rex::kernel::xam::NetDll_WSACleanup_entry)
  REX_EXPORT(__imp__NetDll_WSAGetLastError, rex::kernel::xam::NetDll_WSAGetLastError_entry)
  REX_EXPORT(__imp__NetDll_WSARecvFrom, rex::kernel::xam::NetDll_WSARecvFrom_entry)
  REX_EXPORT(__imp__NetDll_WSASendTo, rex::kernel::xam::NetDll_WSASendTo_entry)
@@ -3735,7 +4044,7 @@ index 58e36a4..137a4c3 100644
  REX_EXPORT(__imp__NetDll_WSAWaitForMultipleEvents,
             rex::kernel::xam::NetDll_WSAWaitForMultipleEvents_entry)
  REX_EXPORT(__imp__NetDll_WSACreateEvent, rex::kernel::xam::NetDll_WSACreateEvent_entry)
-@@ -963,6 +1458,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+@@ -963,6 +1474,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
             rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
@@ -3744,7 +4053,7 @@ index 58e36a4..137a4c3 100644
  REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
-@@ -1000,9 +1497,7 @@ REX_EXPORT_STUB(__imp__NetDll_UpnpEventUnsubscribe);
+@@ -1000,9 +1513,7 @@ REX_EXPORT_STUB(__imp__NetDll_UpnpEventUnsubscribe);
  REX_EXPORT_STUB(__imp__NetDll_UpnpSearchCreate);
  REX_EXPORT_STUB(__imp__NetDll_UpnpSearchGetDevices);
  REX_EXPORT_STUB(__imp__NetDll_UpnpStartup);
@@ -3754,7 +4063,7 @@ index 58e36a4..137a4c3 100644
  REX_EXPORT_STUB(__imp__NetDll_WSARecv);
  REX_EXPORT_STUB(__imp__NetDll_WSASend);
  REX_EXPORT_STUB(__imp__NetDll_WSAStartupEx);
-@@ -1030,12 +1525,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,12 +1541,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -3769,7 +4078,7 @@ index 58e36a4..137a4c3 100644
  REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
  REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
  REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
-@@ -1048,7 +1543,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
+@@ -1048,7 +1559,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
  REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
  REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
  REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
@@ -3778,7 +4087,7 @@ index 58e36a4..137a4c3 100644
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
-@@ -1099,4 +1594,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
+@@ -1099,4 +1610,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
  REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
  REX_EXPORT_STUB(__imp__NetDll_getpeername);
  REX_EXPORT_STUB(__imp__NetDll_getsockname);

@@ -2,6 +2,7 @@
 #include <rex/system/xam/fake_live.h>
 #include <rex/system/xam/fesl_shim.h>
 #include <rex/system/xam/overlapped_recv.h>
+#include <rex/system/xam/udp_tunnel.h>
 #include <rex/system/xam/xlive_async.h>
 
 #include <cerrno>
@@ -21,6 +22,7 @@ namespace fl = rex::system::xam::fake_live;
 namespace fesl = rex::system::xam::fesl;
 namespace xa = rex::system::xam::xlive_async;
 namespace overlapped = rex::system::xam::overlapped;
+namespace tn = rex::system::xam::tunnel;
 
 void Check(bool success, const char* expression, int line) {
   if (!success) {
@@ -490,6 +492,154 @@ void CallRingKeepsTheLastCallsOldestFirst() {
   CHECK(ring.LastCallMs() == 60);
 }
 
+// --- The game's UDP tunnel (encrypted datagrams) -------------------------------------------------
+
+std::vector<uint8_t> Hex(const char* text) {
+  std::vector<uint8_t> bytes;
+  for (const char* p = text; *p;) {
+    if (*p == ' ') {
+      ++p;
+      continue;
+    }
+    bytes.push_back(static_cast<uint8_t>(std::stoi(std::string(p, 2), nullptr, 16)));
+    p += 2;
+  }
+  return bytes;
+}
+
+std::vector<uint8_t> Concat(std::initializer_list<std::vector<uint8_t>> parts) {
+  std::vector<uint8_t> all;
+  for (const auto& part : parts) {
+    all.insert(all.end(), part.begin(), part.end());
+  }
+  return all;
+}
+
+const char kTunnelKey[] = "9181081919";
+// The first datagram the game sent on hardware (23:54:39.545): CONNECT with channel-7 identity.
+const char kFirstDatagram[] = "00 00 5c c5 de 2e b7 4a 8b d7 ac a5 14 6d c0 38 0b b5 7b 62";
+
+void Rc4MatchesTheStandardVector() {
+  const std::vector<uint8_t> stream = tn::Rc4Keystream("Key", 0, 9);
+  const std::vector<uint8_t> expected = Hex("eb 9f 77 81 b7 34 ca 72 a7");  // RC4("Key") keystream
+  CHECK(stream == expected);
+  // Skipping bytes gives the same stream from further on.
+  CHECK(tn::Rc4Keystream("Key", 4, 5) == std::vector<uint8_t>(expected.begin() + 4, expected.end()));
+}
+
+void CapturedDatagramDecodes() {
+  const std::vector<uint8_t> wire = Hex(kFirstDatagram);
+  tn::Datagram datagram;
+  CHECK(tn::Decode(wire.data(), wire.size(), kTunnelKey, &datagram));
+  CHECK(datagram.prefix == 0);
+  CHECK(datagram.packets.size() == 2);
+  CHECK(datagram.packets[0].channel == 7 && datagram.packets[0].body == Hex("00 e1 49 76 72 00"));
+  CHECK(datagram.packets[1].channel == 1 && datagram.packets[1].body == Hex("00 00 00 01 b6 ce 59 2c"));
+}
+
+void EncodeReproducesTheCapturedDatagram() {
+  tn::Datagram datagram;
+  datagram.prefix = 0;
+  datagram.packets = {{7, Hex("00 e1 49 76 72 00")}, {1, Hex("00 00 00 01 b6 ce 59 2c")}};
+  CHECK(tn::Encode(datagram, kTunnelKey) == Hex(kFirstDatagram));
+}
+
+void GarbageIsNotADatagram() {
+  const std::vector<uint8_t> junk = Hex("00 00 11 22 33 44 55");
+  tn::Datagram datagram;
+  CHECK(!tn::Decode(junk.data(), junk.size(), kTunnelKey, &datagram));
+  CHECK(!tn::Decode(junk.data(), 3, kTunnelKey, &datagram));
+}
+
+// A CommUDP "active" packet as the 360 builds it: header (n older records | sequence, ack), the newest
+// record, then each older record followed by its length.
+std::vector<uint8_t> ActivePacket(uint32_t older, uint32_t sequence, uint32_t ack,
+                                  const std::vector<std::vector<uint8_t>>& records) {
+  std::vector<uint8_t> packet;
+  const uint32_t first = (older << 28) | sequence;
+  for (int shift = 24; shift >= 0; shift -= 8) packet.push_back(static_cast<uint8_t>(first >> shift));
+  for (int shift = 24; shift >= 0; shift -= 8) packet.push_back(static_cast<uint8_t>(ack >> shift));
+  for (size_t i = 0; i < records.size(); ++i) {
+    packet.insert(packet.end(), records[i].begin(), records[i].end());
+    if (i > 0) packet.push_back(static_cast<uint8_t>(records[i].size()));
+  }
+  return packet;
+}
+
+const std::vector<uint8_t> kTicketRecord = Hex("01 80 80 04 80 00 00 0a 31 39 35 32 34 30 35 34 37 31 04");
+const std::vector<uint8_t> kFooterRecord = Hex("11 22 33 44 55 66 77 88 99 aa bb cc 40");
+
+tn::Datagram AggregateDatagram(uint16_t prefix, uint32_t older, uint32_t sequence,
+                               const std::vector<std::vector<uint8_t>>& records) {
+  tn::Datagram datagram;
+  datagram.prefix = prefix;
+  datagram.packets = {{1, ActivePacket(older, sequence, 0xFF, records)}};
+  return datagram;
+}
+
+std::vector<uint8_t> WithRecordBody(uint32_t sequence, const std::vector<uint8_t>& record) {
+  std::vector<uint8_t> body = Hex("00 00 00 00 00 00 00 ff");
+  body[0] = static_cast<uint8_t>(sequence >> 24);
+  body[1] = static_cast<uint8_t>(sequence >> 16);
+  body[2] = static_cast<uint8_t>(sequence >> 8);
+  body[3] = static_cast<uint8_t>(sequence);
+  body.insert(body.end(), record.begin(), record.end());
+  return body;
+}
+
+void TicketBundleIsSplitIntoSingleRecords() {
+  tn::ClientNormalizer normalizer(kTunnelKey);
+  // seq 0x101 = ticket, one older record (seq 0x100, footer only): "10 00 01 01 ..." on the wire.
+  const tn::Datagram bundle = AggregateDatagram(16, 1, 0x101, {kTicketRecord, kFooterRecord});
+  const std::vector<uint8_t> wire = tn::Encode(bundle, kTunnelKey);
+  const auto rewritten = normalizer.Normalize(wire.data(), wire.size());
+  CHECK(rewritten.has_value());
+  tn::Datagram out;
+  CHECK(tn::Decode(rewritten->data(), rewritten->size(), kTunnelKey, &out));
+  CHECK(out.prefix == 16);  // the stream position the game chose is kept
+  CHECK(out.packets.size() == 2);
+  CHECK(out.packets[0].channel == 1 && out.packets[0].body == WithRecordBody(0x100, kFooterRecord));
+  CHECK(out.packets[1].channel == 1 && out.packets[1].body == WithRecordBody(0x101, kTicketRecord));
+}
+
+void OlderRecordsAreNotForwardedTwice() {
+  tn::ClientNormalizer normalizer(kTunnelKey);
+  const std::vector<uint8_t> first =
+      tn::Encode(AggregateDatagram(16, 1, 0x101, {kTicketRecord, kFooterRecord}), kTunnelKey);
+  CHECK(normalizer.Normalize(first.data(), first.size()).has_value());
+  // The next tick: new footer-only record 0x102 on top of the history 0x101 (ticket), 0x100.
+  const std::vector<uint8_t> second = tn::Encode(
+      AggregateDatagram(27, 2, 0x102, {kFooterRecord, kTicketRecord, kFooterRecord}), kTunnelKey);
+  const auto rewritten = normalizer.Normalize(second.data(), second.size());
+  CHECK(rewritten.has_value());
+  tn::Datagram out;
+  CHECK(tn::Decode(rewritten->data(), rewritten->size(), kTunnelKey, &out));
+  CHECK(out.packets.size() == 1);  // only the new record: 0x100 and 0x101 already went out
+  CHECK(out.packets[0].body == WithRecordBody(0x102, kFooterRecord));
+}
+
+void NewestRecordIsSentAgainWhenRetransmitted() {
+  tn::ClientNormalizer normalizer(kTunnelKey);
+  const std::vector<uint8_t> wire =
+      tn::Encode(AggregateDatagram(16, 1, 0x101, {kTicketRecord, kFooterRecord}), kTunnelKey);
+  CHECK(normalizer.Normalize(wire.data(), wire.size()).has_value());
+  // The same packet again (the game retransmits): the newest record goes out again in case the first
+  // copy was lost; the older one does not.
+  const auto again = normalizer.Normalize(wire.data(), wire.size());
+  CHECK(again.has_value());
+  tn::Datagram out;
+  CHECK(tn::Decode(again->data(), again->size(), kTunnelKey, &out));
+  CHECK(out.packets.size() == 1 && out.packets[0].body == WithRecordBody(0x101, kTicketRecord));
+}
+
+void PlainDatagramsAreLeftAlone() {
+  tn::ClientNormalizer normalizer(kTunnelKey);
+  const std::vector<uint8_t> connect = Hex(kFirstDatagram);
+  CHECK(!normalizer.Normalize(connect.data(), connect.size()).has_value());  // no bundle in it
+  const std::vector<uint8_t> junk = Hex("de ad be ef 00 11 22 33");
+  CHECK(!normalizer.Normalize(junk.data(), junk.size()).has_value());        // not a datagram at all
+}
+
 overlapped::PendingReceive Receive(uint32_t socket, uint32_t overlapped_ptr, uint32_t buffer) {
   return {socket, buffer, 1000, 0x2000, 0x2010, overlapped_ptr, 9};
 }
@@ -569,6 +719,25 @@ void TheaterFramesWithoutTheAnnouncedAddressAreUntouched() {
   fesl::Shim theater(1, "Racer0001", kSecret, "188.27.34.215");
   const std::string other = fesl::EncodeFrame("LDAT", 0, "NAME=Internet\nLID=257\nI=10.1.2.3\n");
   CHECK(Text(FromServer(theater, other).to_game) == other);
+}
+
+void EntryReplyStartsTheTunnelWithItsKey() {
+  fesl::Shim theater(1, "Racer0001", kSecret);
+  const std::vector<uint8_t> bundle = tn::Encode(
+      AggregateDatagram(16, 1, 0x101, {kTicketRecord, kFooterRecord}), "4455667788");
+  // Before any entry reply nothing is rewritten.
+  CHECK(!tn::GlobalTunnel().Normalize(bundle.data(), bundle.size()).has_value());
+  const std::string entered = fesl::EncodeFrame("EGEG", 0, "TICKET=1\nEKEY=4455667788\nGID=7\n");
+  CHECK(Text(FromServer(theater, entered).to_game) == entered);  // the game still gets it as it was
+  CHECK(tn::GlobalTunnel().Normalize(bundle.data(), bundle.size()).has_value());
+  // A new entry starts the flow over: the same bundle is split in full again.
+  const std::string again = fesl::EncodeFrame("EGEG", 0, "TICKET=2\nEKEY=4455667788\nGID=8\n");
+  FromServer(theater, again);
+  const auto rewritten = tn::GlobalTunnel().Normalize(bundle.data(), bundle.size());
+  CHECK(rewritten.has_value());
+  tn::Datagram out;
+  CHECK(tn::Decode(rewritten->data(), rewritten->size(), "4455667788", &out));
+  CHECK(out.packets.size() == 2);
 }
 
 void TheaterIsUntouchedWithoutAHost() {
@@ -783,6 +952,14 @@ int main(int argc, char** argv) {
   Base64Decodes();
   FragmentedMatchRequestIsDecodedForTheTrace();
   OtherFragmentedCommandsAreNotTraced();
+  Rc4MatchesTheStandardVector();
+  CapturedDatagramDecodes();
+  EncodeReproducesTheCapturedDatagram();
+  GarbageIsNotADatagram();
+  TicketBundleIsSplitIntoSingleRecords();
+  OlderRecordsAreNotForwardedTwice();
+  NewestRecordIsSentAgainWhenRetransmitted();
+  PlainDatagramsAreLeftAlone();
   PendingReceiveIsKeptPerOverlapped();
   CompletedReceiveIsCollectedOnce();
   CancelDropsASocketsReceives();
@@ -790,6 +967,7 @@ int main(int argc, char** argv) {
   TheaterAddressesAreRewrittenToTheReachableHost();
   TheaterFramesWithoutTheAnnouncedAddressAreUntouched();
   TheaterIsUntouchedWithoutAHost();
+  EntryReplyStartsTheTunnelWithItsKey();
   ServerPortReplacesOnlyTheLoginPort();
   HelloPointsTheaterAndMessengerAtTheReachableHost();
   HelloIsUntouchedWithoutAHost();
