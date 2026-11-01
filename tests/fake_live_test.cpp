@@ -727,9 +727,12 @@ void EntryReplyStartsTheTunnelWithItsKey() {
       AggregateDatagram(16, 1, 0x101, {kTicketRecord, kFooterRecord}), "4455667788");
   // Before any entry reply nothing is rewritten.
   CHECK(!tn::GlobalTunnel().Normalize(bundle.data(), bundle.size()).has_value());
-  const std::string entered = fesl::EncodeFrame("EGEG", 0, "TICKET=1\nEKEY=4455667788\nGID=7\n");
+  CHECK(tn::GlobalTunnel().ServerPort() == 0);
+  const std::string entered =
+      fesl::EncodeFrame("EGEG", 0, "TICKET=1\nEKEY=4455667788\nINT-PORT=19119\nGID=7\n");
   CHECK(Text(FromServer(theater, entered).to_game) == entered);  // the game still gets it as it was
   CHECK(tn::GlobalTunnel().Normalize(bundle.data(), bundle.size()).has_value());
+  CHECK(tn::GlobalTunnel().ServerPort() == 19119);  // where the server's UDP socket really listens
   // A new entry starts the flow over: the same bundle is split in full again.
   const std::string again = fesl::EncodeFrame("EGEG", 0, "TICKET=2\nEKEY=4455667788\nGID=8\n");
   FromServer(theater, again);

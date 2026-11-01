@@ -803,10 +803,10 @@ index 0000000..9238c65
 +}  // namespace rex::system::xam::fake_live
 diff --git a/sdk/include/rex/system/xam/fesl_shim.h b/sdk/include/rex/system/xam/fesl_shim.h
 new file mode 100644
-index 0000000..7e71e76
+index 0000000..508823d
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/fesl_shim.h
-@@ -0,0 +1,532 @@
+@@ -0,0 +1,541 @@
 +#pragma once
 +/**
 + * Translation between the Xbox 360 build's online account protocol and the PC one.
@@ -1107,7 +1107,16 @@ index 0000000..7e71e76
 +                                        length - kHeaderSize);
 +      const std::string_view key = Field(entry_body, "EKEY");
 +      if (!key.empty()) {
-+        tunnel::GlobalTunnel().Begin(std::string(key));
++        std::string_view port_text = Field(entry_body, "INT-PORT");
++        if (port_text.empty()) {
++          port_text = Field(entry_body, "P");
++        }
++        uint16_t port = 0;
++        if (!port_text.empty() && port_text.size() <= 5) {
++          const unsigned long value = std::stoul(std::string(port_text));
++          port = value > 0 && value <= 65535 ? static_cast<uint16_t>(value) : 0;
++        }
++        tunnel::GlobalTunnel().Begin(std::string(key), port);
 +      }
 +    }
 +    if (command == "fsys" && !service_host_.empty()) {
@@ -1462,10 +1471,10 @@ index 0000000..3de7758
 +}  // namespace rex::system::xam::overlapped
 diff --git a/sdk/include/rex/system/xam/udp_tunnel.h b/sdk/include/rex/system/xam/udp_tunnel.h
 new file mode 100644
-index 0000000..77cbf90
+index 0000000..787ad74
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/udp_tunnel.h
-@@ -0,0 +1,274 @@
+@@ -0,0 +1,285 @@
 +#pragma once
 +/**
 + * The game's UDP tunnel datagrams (DirtySDK ProtoTunnel) in the encrypted mode the PC server uses, and the
@@ -1716,9 +1725,19 @@ index 0000000..77cbf90
 +// datagrams leave from the socket layer, which are different parts of the program.
 +class TunnelState {
 + public:
-+  void Begin(std::string key) {
++  // `server_port` is the UDP port the server's reply names for the game (0 = not stated).
++  void Begin(std::string key, uint16_t server_port = 0) {
 +    std::lock_guard<std::mutex> guard(lock_);
 +    normalizer_.emplace(std::move(key));
++    server_port_ = server_port;
++  }
++
++  // Where the server's UDP socket listens, or 0 when no game has been entered. The first reply to the
++  // game can come from another port (a router or relay in front of the server rewrote it); the game
++  // then sends everything there, which may never reach the server, so the sender uses this port.
++  uint16_t ServerPort() {
++    std::lock_guard<std::mutex> guard(lock_);
++    return server_port_;
 +  }
 +
 +  std::optional<std::vector<uint8_t>> Normalize(const uint8_t* data, size_t size) {
@@ -1732,6 +1751,7 @@ index 0000000..77cbf90
 + private:
 +  std::mutex lock_;
 +  std::optional<ClientNormalizer> normalizer_;
++  uint16_t server_port_ = 0;
 +};
 +
 +inline TunnelState& GlobalTunnel() {
@@ -3299,7 +3319,7 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..5d37248 100644
+index 58e36a4..c8724b9 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
 @@ -12,7 +12,13 @@
@@ -4004,7 +4024,7 @@ index 58e36a4..5d37248 100644
  }
  
  u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
-@@ -915,7 +1401,29 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+@@ -915,7 +1401,38 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
      return -1;
    }
  
@@ -4020,6 +4040,15 @@ index 58e36a4..5d37248 100644
 +  if (REX_KERNEL_STATE()->user_profile()->fake_live() && to_ptr &&
 +      xeOnlineServerAddress(&server_address) &&
 +      static_cast<uint32_t>(to_ptr->sin_addr) == server_address) {
++    // The server answered the game's first datagram from another port (a router or relay in front of
++    // it rewrote it) and the game now sends everything there. Whether that port leads back to the
++    // server is unknown, while the port the first datagram used is known to: send to that one.
++    const uint16_t server_port = rex::system::xam::tunnel::GlobalTunnel().ServerPort();
++    if (server_port != 0 && static_cast<uint16_t>(to_ptr->sin_port) != server_port) {
++      FAKE_LIVE_TRACE_UP_TO(10, "fake Live: UDP the game addressed to port {} goes to port {}",
++                            static_cast<uint16_t>(to_ptr->sin_port), server_port);
++      native_to.sin_port = server_port;
++    }
 +    // The PC server's race transport wants one record per packet, but the 360 bundles its recent
 +    // history into each (udp_tunnel.h): split the bundle and send that instead.
 +    if (auto rewritten = rex::system::xam::tunnel::GlobalTunnel().Normalize(
@@ -4034,7 +4063,7 @@ index 58e36a4..5d37248 100644
    return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
  }
  
-@@ -946,6 +1454,9 @@ REX_EXPORT(__imp__NetDll_WSACleanup, rex::kernel::xam::NetDll_WSACleanup_entry)
+@@ -946,6 +1463,9 @@ REX_EXPORT(__imp__NetDll_WSACleanup, rex::kernel::xam::NetDll_WSACleanup_entry)
  REX_EXPORT(__imp__NetDll_WSAGetLastError, rex::kernel::xam::NetDll_WSAGetLastError_entry)
  REX_EXPORT(__imp__NetDll_WSARecvFrom, rex::kernel::xam::NetDll_WSARecvFrom_entry)
  REX_EXPORT(__imp__NetDll_WSASendTo, rex::kernel::xam::NetDll_WSASendTo_entry)
@@ -4044,7 +4073,7 @@ index 58e36a4..5d37248 100644
  REX_EXPORT(__imp__NetDll_WSAWaitForMultipleEvents,
             rex::kernel::xam::NetDll_WSAWaitForMultipleEvents_entry)
  REX_EXPORT(__imp__NetDll_WSACreateEvent, rex::kernel::xam::NetDll_WSACreateEvent_entry)
-@@ -963,6 +1474,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+@@ -963,6 +1483,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
             rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
@@ -4053,7 +4082,7 @@ index 58e36a4..5d37248 100644
  REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
-@@ -1000,9 +1513,7 @@ REX_EXPORT_STUB(__imp__NetDll_UpnpEventUnsubscribe);
+@@ -1000,9 +1522,7 @@ REX_EXPORT_STUB(__imp__NetDll_UpnpEventUnsubscribe);
  REX_EXPORT_STUB(__imp__NetDll_UpnpSearchCreate);
  REX_EXPORT_STUB(__imp__NetDll_UpnpSearchGetDevices);
  REX_EXPORT_STUB(__imp__NetDll_UpnpStartup);
@@ -4063,7 +4092,7 @@ index 58e36a4..5d37248 100644
  REX_EXPORT_STUB(__imp__NetDll_WSARecv);
  REX_EXPORT_STUB(__imp__NetDll_WSASend);
  REX_EXPORT_STUB(__imp__NetDll_WSAStartupEx);
-@@ -1030,12 +1541,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,12 +1550,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -4078,7 +4107,7 @@ index 58e36a4..5d37248 100644
  REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
  REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
  REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
-@@ -1048,7 +1559,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
+@@ -1048,7 +1568,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
  REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
  REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
  REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
@@ -4087,7 +4116,7 @@ index 58e36a4..5d37248 100644
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
-@@ -1099,4 +1610,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
+@@ -1099,4 +1619,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
  REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
  REX_EXPORT_STUB(__imp__NetDll_getpeername);
  REX_EXPORT_STUB(__imp__NetDll_getsockname);
