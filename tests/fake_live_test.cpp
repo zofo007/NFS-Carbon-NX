@@ -1,3 +1,4 @@
+#include <rex/system/adjustor_thunk.h>
 #include <rex/system/xam/fake_live.h>
 #include <rex/system/xam/fesl_shim.h>
 
@@ -274,6 +275,37 @@ void SeedRepairs(const fs::path& folder) {
   CHECK(fl::LoadOrCreateSeed(folder / "missing-folder" / "x.bin") != 0);
 }
 
+// The six instructions at 0x82A30D40 in the Standard image (big-endian bytes).
+const uint8_t kRealThunk[24] = {0x81, 0x43, 0x00, 0x04, 0x81, 0x63, 0x00, 0x0C, 0x81, 0x23, 0x00, 0x08,
+                                0x7C, 0x6B, 0x52, 0x14, 0x7D, 0x29, 0x03, 0xA6, 0x4E, 0x80, 0x04, 0x20};
+
+void AdjustorThunkIsRecognised() {
+  CHECK(rex::system::IsAdjustorThunk(kRealThunk));
+}
+
+void OtherCodeIsNotAnAdjustorThunk() {
+  uint8_t returns[24];
+  std::memcpy(returns, kRealThunk, sizeof(returns));
+  returns[20] = 0x4E;  // the last word becomes blr (4e800020): a normal return, not a tail call
+  returns[21] = 0x80;
+  returns[22] = 0x00;
+  returns[23] = 0x20;
+  CHECK(!rex::system::IsAdjustorThunk(returns));
+  uint8_t other_field[24];
+  std::memcpy(other_field, kRealThunk, sizeof(other_field));
+  other_field[3] = 0x10;  // lwz r10,16(r3): a different adjustment slot
+  CHECK(!rex::system::IsAdjustorThunk(other_field));
+}
+
+void AdjustorThunkMovesThisAndPicksTarget() {
+  // lwz r10,4(r3); lwz r11,12(r3); lwz r9,8(r3); add r3,r11,r10; mtctr r9; bctr
+  const rex::system::AdjustorStep step = rex::system::ApplyAdjustor(0x10, 0x82A30D58, 0x7000);
+  CHECK(step.r3 == 0x7010);
+  CHECK(step.target == 0x82A30D58);
+  const rex::system::AdjustorStep wrapped = rex::system::ApplyAdjustor(0xFFFFFFFF, 0x1, 0x2);
+  CHECK(wrapped.r3 == 0x100000001ull);  // the recompiled add is 64-bit
+}
+
 int main(int argc, char** argv) {
   CHECK(argc == 2);
   const fs::path folder = argv[1];
@@ -295,6 +327,9 @@ int main(int argc, char** argv) {
   SplitFramesAreHeldUntilComplete();
   TwoFramesInOneBuffer();
   GarbageIsForwardedUntouched();
+  AdjustorThunkIsRecognised();
+  OtherCodeIsNotAnAdjustorThunk();
+  AdjustorThunkMovesThisAndPicksTarget();
   SeedPersists(folder);
   SeedRepairs(folder);
   std::cout << "fake_live: all checks passed\n";

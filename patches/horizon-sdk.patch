@@ -326,6 +326,55 @@ index 3df4776..1d5e30b 100644
  rex::runtime::Export* RegisterExport_xam(rex::runtime::Export* export_entry);
  
  // Registration functions, one per file.
+diff --git a/sdk/include/rex/system/adjustor_thunk.h b/sdk/include/rex/system/adjustor_thunk.h
+new file mode 100644
+index 0000000..784c166
+--- /dev/null
++++ b/sdk/include/rex/system/adjustor_thunk.h
+@@ -0,0 +1,43 @@
++#pragma once
++/**
++ * C++ adjustor thunks: the six instructions the compiler emits to call a method through a
++ * member-function delegate. They load an offset, a target and a base from the delegate object
++ * (r3 + 4, + 8, + 12), move `this` by offset + base and jump to the target:
++ *
++ *   lwz r10,4(r3); lwz r11,12(r3); lwz r9,8(r3); add r3,r11,r10; mtctr r9; bctr
++ *
++ * The recompiler only registers a function it finds a direct call to. These thunks are reached
++ * through function pointers stored in tables, so many were never registered and the first
++ * indirect call into one stopped the game. The dispatcher uses this header to recognise such a
++ * call and run the thunk instead.
++ *
++ * Header-only and free of kernel dependencies so it can be unit-tested on the host.
++ */
++
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++
++namespace rex::system {
++
++constexpr size_t kAdjustorThunkSize = 24;
++
++// True when the 24 bytes of guest code (big-endian) are exactly the thunk above.
++inline bool IsAdjustorThunk(const uint8_t* code) {
++  static constexpr uint8_t kThunk[kAdjustorThunkSize] = {
++      0x81, 0x43, 0x00, 0x04, 0x81, 0x63, 0x00, 0x0C, 0x81, 0x23, 0x00, 0x08,
++      0x7C, 0x6B, 0x52, 0x14, 0x7D, 0x29, 0x03, 0xA6, 0x4E, 0x80, 0x04, 0x20};
++  return std::memcmp(code, kThunk, kAdjustorThunkSize) == 0;
++}
++
++struct AdjustorStep {
++  uint64_t r3;      // the adjusted `this` (the recompiled add is 64-bit)
++  uint32_t target;  // where the thunk jumps
++};
++
++// What the thunk computes from the delegate's words at +4 (offset), +8 (target) and +12 (base).
++inline AdjustorStep ApplyAdjustor(uint32_t offset, uint32_t target, uint32_t base) {
++  return {static_cast<uint64_t>(base) + offset, target};
++}
++
++}  // namespace rex::system
 diff --git a/sdk/include/rex/system/kernel_state.h b/sdk/include/rex/system/kernel_state.h
 index 9b9cf9e..d853a94 100644
 --- a/sdk/include/rex/system/kernel_state.h
@@ -3076,6 +3125,47 @@ index f4e0efd..3fe81be 100644
    }
  }
  
+diff --git a/sdk/src/system/function_dispatcher.cpp b/sdk/src/system/function_dispatcher.cpp
+index bd43109..a040a17 100644
+--- a/sdk/src/system/function_dispatcher.cpp
++++ b/sdk/src/system/function_dispatcher.cpp
+@@ -20,6 +20,7 @@
+ #include <rex/memory.h>
+ #include <rex/ppc/context.h>
+ #include <rex/runtime.h>
++#include <rex/system/adjustor_thunk.h>
+ #include <rex/system/function_dispatcher.h>
+ #include <rex/system/thread_state.h>
+ 
+@@ -34,9 +35,25 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
+ 
+ }  // namespace
+ 
+-static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
+-  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
+-            ctx.last_indirect_target);
++static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* base) {
++  const uint32_t address = ctx.last_indirect_target;
++  // An adjustor thunk nobody called directly was never registered: run it here.
++  if (rex::system::IsAdjustorThunk(base + address)) {
++    const uint32_t delegate = ctx.r3.u32;
++    ctx.r10.u64 = memory::load_and_swap<uint32_t>(base + delegate + 4);
++    ctx.r11.u64 = memory::load_and_swap<uint32_t>(base + delegate + 12);
++    ctx.r9.u64 = memory::load_and_swap<uint32_t>(base + delegate + 8);
++    const rex::system::AdjustorStep step =
++        rex::system::ApplyAdjustor(ctx.r10.u32, ctx.r9.u32, ctx.r11.u32);
++    ctx.r3.u64 = step.r3;
++    const auto saved_ctr = ctx.ctr;
++    ctx.ctr.u64 = step.target;
++    ctx.last_indirect_target = step.target;
++    ResolveIndirectFunction(step.target)(ctx, base);
++    ctx.ctr = saved_ctr;
++    return;
++  }
++  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}", address);
+ }
+ 
+ PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
 diff --git a/sdk/src/system/kernel_state.cpp b/sdk/src/system/kernel_state.cpp
 index 697399c..f8c6a3a 100644
 --- a/sdk/src/system/kernel_state.cpp
