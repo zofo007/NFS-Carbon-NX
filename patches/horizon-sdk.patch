@@ -2063,7 +2063,7 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..d6a0c18 100644
+index 58e36a4..b441193 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
 @@ -12,7 +12,11 @@
@@ -2436,7 +2436,7 @@ index 58e36a4..d6a0c18 100644
  u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
    if (!socket) {
-@@ -852,7 +1109,11 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -852,7 +1109,14 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -2444,12 +2444,15 @@ index 58e36a4..d6a0c18 100644
 +  const int ret = socket->Recv(buf_ptr, buf_len, flags);
 +  if (ret < 0) {
 +    SetLastErrorFromHost(errno);
++  } else if (REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    FAKE_LIVE_TRACE_UP_TO(12, "fake Live: recv socket {} {} bytes: {}", socket_handle, ret,
++                          HexPrefix(buf_ptr.as<const uint8_t*>(), static_cast<uint32_t>(ret)));
 +  }
 +  return ret;
  }
  
  u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
-@@ -883,13 +1144,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+@@ -883,13 +1147,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
    }
  
    if (ret == -1) {
@@ -2464,7 +2467,7 @@ index 58e36a4..d6a0c18 100644
    }
  
    return ret;
-@@ -903,7 +1158,15 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -903,7 +1161,15 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -2481,7 +2484,7 @@ index 58e36a4..d6a0c18 100644
  }
  
  u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
-@@ -915,6 +1178,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+@@ -915,6 +1181,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
      return -1;
    }
  
@@ -2495,7 +2498,7 @@ index 58e36a4..d6a0c18 100644
    N_XSOCKADDR_IN native_to(to_ptr);
    return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
  }
-@@ -963,6 +1233,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+@@ -963,6 +1236,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
             rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
@@ -2504,7 +2507,7 @@ index 58e36a4..d6a0c18 100644
  REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
-@@ -1030,12 +1302,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,12 +1305,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -2519,7 +2522,7 @@ index 58e36a4..d6a0c18 100644
  REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
  REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
  REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
-@@ -1048,7 +1320,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
+@@ -1048,7 +1323,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
  REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
  REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
  REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
@@ -2528,7 +2531,7 @@ index 58e36a4..d6a0c18 100644
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
-@@ -1099,4 +1371,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
+@@ -1099,4 +1374,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
  REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
  REX_EXPORT_STUB(__imp__NetDll_getpeername);
  REX_EXPORT_STUB(__imp__NetDll_getsockname);
