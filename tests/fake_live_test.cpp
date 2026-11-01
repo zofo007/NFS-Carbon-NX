@@ -488,6 +488,41 @@ std::string HelloReply(uint32_t word) {
                            "theaterIp=188.27.48.18\ntheaterPort=18215\n");
 }
 
+void TheaterAddressesAreRewrittenToTheReachableHost() {
+  // The Hello on the account connection tells the process which address the server announces...
+  fesl::Shim account(1, "Racer0001", kSecret, "188.27.34.215");
+  FromServer(account, HelloReply(0x80000001));
+  // ...and the Theater connection (a different socket, so a different shim) uses it.
+  fesl::Shim theater(1, "Racer0001", kSecret, "188.27.34.215");
+  const std::string entered = fesl::EncodeFrame(
+      "EGEG", 0, "PL=PC\nTICKET=3175867091\nINT-PORT=19119\nINT-IP=188.27.48.18\nI=188.27.48.18\n"
+                 "PEER-IP=10.0.0.5\nGID=235282\n");
+  const std::string reply = Text(FromServer(theater, entered).to_game);
+  CHECK(reply.substr(0, 4) == "EGEG" && WordOf(reply) == 0);
+  CHECK(Value(reply, "INT-IP") == "188.27.34.215");
+  CHECK(Value(reply, "I") == "188.27.34.215");
+  CHECK(Value(reply, "PEER-IP") == "10.0.0.5");  // other players' addresses stay as they are
+  CHECK(Value(reply, "INT-PORT") == "19119");
+  CHECK(Value(reply, "GID") == "235282");
+  CHECK(reply.back() == '\0');
+}
+
+void TheaterFramesWithoutTheAnnouncedAddressAreUntouched() {
+  fesl::Shim account(1, "Racer0001", kSecret, "188.27.34.215");
+  FromServer(account, HelloReply(0x80000001));
+  fesl::Shim theater(1, "Racer0001", kSecret, "188.27.34.215");
+  const std::string other = fesl::EncodeFrame("LDAT", 0, "NAME=Internet\nLID=257\nI=10.1.2.3\n");
+  CHECK(Text(FromServer(theater, other).to_game) == other);
+}
+
+void TheaterIsUntouchedWithoutAHost() {
+  fesl::Shim account(1, "Racer0001", kSecret, "188.27.34.215");
+  FromServer(account, HelloReply(0x80000001));
+  fesl::Shim theater(1, "Racer0001", kSecret);  // no reachable host known
+  const std::string entered = fesl::EncodeFrame("EGEG", 0, "INT-IP=188.27.48.18\n");
+  CHECK(Text(FromServer(theater, entered).to_game) == entered);
+}
+
 void HelloPointsTheaterAndMessengerAtTheReachableHost() {
   fesl::Shim shim(1, "Racer0001", kSecret, "188.27.34.215");
   const std::string reply = Text(FromServer(shim, HelloReply(0x80000001)).to_game);
@@ -692,6 +727,9 @@ int main(int argc, char** argv) {
   Base64Decodes();
   FragmentedMatchRequestIsDecodedForTheTrace();
   OtherFragmentedCommandsAreNotTraced();
+  TheaterAddressesAreRewrittenToTheReachableHost();
+  TheaterFramesWithoutTheAnnouncedAddressAreUntouched();
+  TheaterIsUntouchedWithoutAHost();
   ServerPortReplacesOnlyTheLoginPort();
   HelloPointsTheaterAndMessengerAtTheReachableHost();
   HelloIsUntouchedWithoutAHost();

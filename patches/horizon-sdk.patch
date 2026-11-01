@@ -757,10 +757,10 @@ index 0000000..c7fd4f5
 +}  // namespace rex::system::xam::fake_live
 diff --git a/sdk/include/rex/system/xam/fesl_shim.h b/sdk/include/rex/system/xam/fesl_shim.h
 new file mode 100644
-index 0000000..62fff03
+index 0000000..3abc908
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/fesl_shim.h
-@@ -0,0 +1,452 @@
+@@ -0,0 +1,520 @@
 +#pragma once
 +/**
 + * Translation between the Xbox 360 build's online account protocol and the PC one.
@@ -785,6 +785,7 @@ index 0000000..62fff03
 +#include <cstddef>
 +#include <cstdint>
 +#include <map>
++#include <mutex>
 +#include <string>
 +#include <string_view>
 +#include <utility>
@@ -866,6 +867,26 @@ index 0000000..62fff03
 +    }
 +  }
 +  return out;
++}
++
++// The address the server announced for its own services in the greeting (before it is replaced by
++// the one that answers). Theater and messenger connections run in other Shim objects, so the
++// account connection's Hello records it here for the whole process.
++inline std::mutex& AnnouncedHostLock() {
++  static std::mutex lock;
++  return lock;
++}
++inline std::string& AnnouncedHostValue() {
++  static std::string host;
++  return host;
++}
++inline void SetAnnouncedHost(std::string host) {
++  std::lock_guard<std::mutex> guard(AnnouncedHostLock());
++  AnnouncedHostValue() = std::move(host);
++}
++inline std::string AnnouncedHost() {
++  std::lock_guard<std::mutex> guard(AnnouncedHostLock());
++  return AnnouncedHostValue();
 +}
 +
 +struct Translation {
@@ -1039,6 +1060,22 @@ index 0000000..62fff03
 +        return;
 +      }
 +    }
++    if (command != "acct" && command != "fsys" && !service_host_.empty()) {
++      // Theater and messenger replies name the server's game address (I=, INT-IP=) the same way
++      // the greeting does. Values equal to the announced address become the reachable one; any
++      // other value (another player's address, say) is left alone.
++      const std::string announced = AnnouncedHost();
++      const std::string_view theater_body(reinterpret_cast<const char*>(frame) + kHeaderSize,
++                                          length - kHeaderSize);
++      if (!announced.empty() && theater_body.find(announced) != std::string_view::npos) {
++        const std::string rewritten =
++            ReplaceValues(command, ReadBigEndian32(frame + 4), theater_body, announced);
++        if (!rewritten.empty()) {
++          Append(&out->to_game, rewritten);
++          return;
++        }
++      }
++    }
 +    const auto found = pending_.find(ReadBigEndian32(frame + 4));
 +    if (command != "acct" || found == pending_.end()) {
 +      out->to_game.insert(out->to_game.end(), frame, frame + length);
@@ -1049,6 +1086,34 @@ index 0000000..62fff03
 +    Job job = std::move(found->second);
 +    pending_.erase(found);
 +    Continue(std::move(job), body, out);
++  }
++
++  // The frame with every "key=<announced>" line changed to "key=<service_host_>", or an empty string
++  // when no line has exactly that value (the caller then forwards the original bytes untouched).
++  std::string ReplaceValues(std::string_view command, uint32_t word, std::string_view body,
++                            const std::string& announced) const {
++    std::string lines;
++    bool changed = false;
++    size_t start = 0;
++    while (start < body.size()) {
++      size_t end = body.find('\n', start);
++      if (end == std::string_view::npos) {
++        end = body.size();
++      }
++      std::string_view line = body.substr(start, end - start);
++      while (!line.empty() && (line.back() == '\0' || line.back() == '\r')) {
++        line.remove_suffix(1);
++      }
++      const size_t equals = line.find('=');
++      if (equals != std::string_view::npos && line.substr(equals + 1) == announced) {
++        lines += std::string(line.substr(0, equals + 1)) + service_host_ + "\n";
++        changed = true;
++      } else if (!line.empty()) {
++        lines += std::string(line) + "\n";
++      }
++      start = end + 1;
++    }
++    return changed ? EncodeFrame(command, word, lines) : std::string();
 +  }
 +
 +  // The greeting with theaterIp and messengerIp replaced by the address that is known to answer;
@@ -1066,6 +1131,9 @@ index 0000000..62fff03
 +        line.remove_suffix(1);
 +      }
 +      if (line.substr(0, 10) == "theaterIp=") {
++        if (line.size() > 10 && line.substr(10) != service_host_) {
++          SetAnnouncedHost(std::string(line.substr(10)));  // Theater's other traffic names it too
++        }
 +        lines += "theaterIp=" + service_host_ + "\n";
 +      } else if (line.substr(0, 12) == "messengerIp=") {
 +        lines += "messengerIp=" + service_host_ + "\n";
@@ -2772,7 +2840,7 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..2a30fd0 100644
+index 58e36a4..aa0ee80 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
 @@ -12,7 +12,11 @@
@@ -3202,7 +3270,7 @@ index 58e36a4..2a30fd0 100644
  }
  
  u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
-@@ -883,13 +1183,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+@@ -883,13 +1183,12 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
    }
  
    if (ret == -1) {
@@ -3214,10 +3282,15 @@ index 58e36a4..2a30fd0 100644
 -    XThread::SetLastError(0x0);
 -#endif
 +    SetLastErrorFromHost(errno);
++  } else if (ret > 0 && REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    FAKE_LIVE_TRACE_UP_TO(60, "fake Live: recvfrom socket {} {} bytes from {}:{}: {}", socket_handle,
++                          ret, Ipv4ToString(native_from.sin_addr),
++                          static_cast<uint16_t>(native_from.sin_port),
++                          HexPrefix(buf_ptr.as<const uint8_t*>(), static_cast<uint32_t>(ret)));
    }
  
    return ret;
-@@ -903,7 +1197,17 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -903,7 +1202,17 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -3236,7 +3309,7 @@ index 58e36a4..2a30fd0 100644
  }
  
  u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
-@@ -915,6 +1219,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+@@ -915,6 +1224,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
      return -1;
    }
  
@@ -3250,7 +3323,7 @@ index 58e36a4..2a30fd0 100644
    N_XSOCKADDR_IN native_to(to_ptr);
    return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
  }
-@@ -963,6 +1274,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+@@ -963,6 +1279,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
             rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
@@ -3259,7 +3332,7 @@ index 58e36a4..2a30fd0 100644
  REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
-@@ -1030,12 +1343,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,12 +1348,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -3274,7 +3347,7 @@ index 58e36a4..2a30fd0 100644
  REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
  REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
  REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
-@@ -1048,7 +1361,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
+@@ -1048,7 +1366,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
  REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
  REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
  REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
@@ -3283,7 +3356,7 @@ index 58e36a4..2a30fd0 100644
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
-@@ -1099,4 +1412,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
+@@ -1099,4 +1417,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
  REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
  REX_EXPORT_STUB(__imp__NetDll_getpeername);
  REX_EXPORT_STUB(__imp__NetDll_getsockname);
