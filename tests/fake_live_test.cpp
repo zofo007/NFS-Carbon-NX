@@ -1,6 +1,7 @@
 #include <rex/system/tail_call_thunk.h>
 #include <rex/system/xam/fake_live.h>
 #include <rex/system/xam/fesl_shim.h>
+#include <rex/system/xam/xlive_async.h>
 
 #include <cerrno>
 #include <cstdint>
@@ -17,6 +18,7 @@
 namespace fs = std::filesystem;
 namespace fl = rex::system::xam::fake_live;
 namespace fesl = rex::system::xam::fesl;
+namespace xa = rex::system::xam::xlive_async;
 
 void Check(bool success, const char* expression, int line) {
   if (!success) {
@@ -360,6 +362,32 @@ void CodeThatIsNotAPureTailCallIsRefused() {
   CHECK(!run.Run(long_code));
 }
 
+void AsyncMessagesAreTheFiveThousandRange() {
+  CHECK(xa::IsAsyncTaskMessage(0x0005000E));
+  CHECK(xa::IsAsyncTaskMessage(0x000500C6));
+  CHECK(!xa::IsAsyncTaskMessage(0x00058004));  // logon and service queries are 0x580xx
+  CHECK(!xa::IsAsyncTaskMessage(0x0007000E));
+  CHECK(!xa::IsAsyncTaskMessage(0x0000000E));
+}
+
+void AsyncTaskFieldsAreReadBigEndian() {
+  uint8_t task[xa::kTaskSize] = {};
+  const auto put = [&](size_t offset, uint32_t value) {
+    for (int i = 0; i < 4; ++i) task[offset + i] = static_cast<uint8_t>(value >> (24 - 8 * i));
+  };
+  put(0x00, 0x0604);      // ordinal
+  put(0x18, 0x40001000);  // marshalled request pointer
+  put(0x1C, 0x58);        // marshalled request size
+  put(0x2C, 0x40002000);  // results pointer
+  put(0x30, 0x200);       // results size
+  const xa::Task decoded = xa::DecodeTask(task);
+  CHECK(decoded.ordinal == 0x0604);
+  CHECK(decoded.request_ptr == 0x40001000);
+  CHECK(decoded.request_size == 0x58);
+  CHECK(decoded.results_ptr == 0x40002000);
+  CHECK(decoded.results_size == 0x200);
+}
+
 int main(int argc, char** argv) {
   CHECK(argc == 2);
   const fs::path folder = argv[1];
@@ -386,6 +414,8 @@ int main(int argc, char** argv) {
   MoveAndAddThunkKeepsArguments();
   AddressArithmeticThunk();
   CodeThatIsNotAPureTailCallIsRefused();
+  AsyncMessagesAreTheFiveThousandRange();
+  AsyncTaskFieldsAreReadBigEndian();
   SeedPersists(folder);
   SeedRepairs(folder);
   std::cout << "fake_live: all checks passed\n";

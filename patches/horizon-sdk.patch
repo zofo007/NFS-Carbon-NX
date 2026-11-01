@@ -960,6 +960,63 @@ index ec37017..68d9484 100644
    std::vector<std::unique_ptr<Setting>> setting_list_;
    std::unordered_map<uint32_t, Setting*> settings_;
    KernelState* kernel_state_ = nullptr;
+diff --git a/sdk/include/rex/system/xam/xlive_async.h b/sdk/include/rex/system/xam/xlive_async.h
+new file mode 100644
+index 0000000..da81337
+--- /dev/null
++++ b/sdk/include/rex/system/xam/xlive_async.h
+@@ -0,0 +1,51 @@
++#pragma once
++/**
++ * Asynchronous Xbox Live tasks the title starts through XMsgStartIORequest on the XLiveBase app
++ * (0xFC). The message id is 0x50000 | a schema index that depends on the SDK the title was built
++ * with, so the id alone does not say which Xbox Live function it is. The buffer the title passes
++ * is a 0x28-byte message whose first word points to a 0x4C-byte task, and the task's `ordinal`
++ * names the function (for example 0x0A03 XUserFindUsers, 0x0604 XAccountGetUserInfo).
++ *
++ *   task +0x00 ordinal            +0x18 marshalled request pointer   +0x2C results pointer
++ *   task +0x1C request size       +0x30 results size                 (all big-endian words)
++ *
++ * Layout from the public xenia-canary netplay fork (xnet.h, XLIVE_ASYNC_TASK) and confirmed
++ * against the game: it stores the request size at task +0x1C before it starts the request.
++ *
++ * Pure functions only, no kernel state, so tests/fake_live_test.cpp can compile it on its own.
++ */
++
++#include <cstddef>
++#include <cstdint>
++
++namespace rex::system::xam::xlive_async {
++
++constexpr size_t kTaskSize = 0x4C;
++constexpr size_t kMessageSize = 0x28;
++
++// 0x5xxxx with bit 0x8000 clear: the 0x580xx messages (logon id, NAT type, service info...) are
++// synchronous queries with their own handlers.
++inline bool IsAsyncTaskMessage(uint32_t message) {
++  return (message & 0xFFFF8000u) == 0x00050000u;
++}
++
++struct Task {
++  uint32_t ordinal;
++  uint32_t request_ptr;
++  uint32_t request_size;
++  uint32_t results_ptr;
++  uint32_t results_size;
++};
++
++inline uint32_t ReadWord(const uint8_t* bytes) {
++  return (uint32_t{bytes[0]} << 24) | (uint32_t{bytes[1]} << 16) | (uint32_t{bytes[2]} << 8) |
++         uint32_t{bytes[3]};
++}
++
++// `task` points at kTaskSize bytes of guest memory.
++inline Task DecodeTask(const uint8_t* task) {
++  return {ReadWord(task + 0x00), ReadWord(task + 0x18), ReadWord(task + 0x1C),
++          ReadWord(task + 0x2C), ReadWord(task + 0x30)};
++}
++
++}  // namespace rex::system::xam::xlive_async
 diff --git a/sdk/include/rex/system/xsocket.h b/sdk/include/rex/system/xsocket.h
 index a1b4443..edb0b33 100644
 --- a/sdk/include/rex/system/xsocket.h
@@ -2252,21 +2309,24 @@ index ccf5e2a..ee36923 100644
      const bool ahora = modificador && (held & kAtajos[i].boton) != 0;
      const bool antes = (slot.menu_shortcuts & bit) != 0;
 diff --git a/sdk/src/kernel/xam/apps/xlivebase_app.cpp b/sdk/src/kernel/xam/apps/xlivebase_app.cpp
-index 3593403..bed934b 100644
+index 3593403..1d9b7d9 100644
 --- a/sdk/src/kernel/xam/apps/xlivebase_app.cpp
 +++ b/sdk/src/kernel/xam/apps/xlivebase_app.cpp
-@@ -9,7 +9,10 @@
+@@ -9,8 +9,13 @@
   * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
 +#include <cstring>
++#include <string>
 +
  #include <rex/kernel/xam/apps/xlivebase_app.h>
 +#include <rex/kernel/xam/private.h>
  #include <rex/logging.h>
++#include <rex/system/xam/xlive_async.h>
  #include <rex/thread.h>
  
-@@ -48,6 +51,21 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
+ namespace rex {
+@@ -48,6 +53,21 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
        // and pServiceInfo. pServiceInfo should contain pointer to
        // XONLINE_SERVICE_INFO structure.
        REXKRNL_DEBUG("CXLiveLogon::GetServiceInfo({:08X}, {:08X})", buffer_ptr, buffer_length);
@@ -2288,6 +2348,38 @@ index 3593403..bed934b 100644
        return 0x80151802;  // ERROR_CONNECTION_INVALID
      }
      case 0x00058020: {
+@@ -78,6 +98,31 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
+       return X_E_SUCCESS;
+     }
+   }
++  if (kernel_state_->user_profile()->fake_live() && xlive_async::IsAsyncTaskMessage(message) &&
++      buffer_ptr && buffer_length >= xlive_async::kMessageSize) {
++    // An Xbox Live task nobody serves. Say which function it is (the ordinal) and what it asked,
++    // then finish it with an empty successful result so the title can go on to its next step.
++    const uint32_t task_ptr = memory::load_and_swap<uint32_t>(buffer);
++    if (task_ptr) {
++      const auto task = xlive_async::DecodeTask(memory_->TranslateVirtual(task_ptr));
++      FAKE_LIVE_TRACE(
++          "fake Live: XLiveBase task msg {:#x} ordinal {:#x} request {:#x}+{} results {:#x}+{}",
++          message, task.ordinal, task.request_ptr, task.request_size, task.results_ptr,
++          task.results_size);
++      if (task.request_ptr && task.request_size) {
++        const auto* request = memory_->TranslateVirtual(task.request_ptr);
++        std::string hex;
++        for (uint32_t i = 0; i < task.request_size && i < 160; ++i) {
++          hex += fmt::format("{:02x} ", request[i]);
++        }
++        FAKE_LIVE_TRACE("fake Live: XLiveBase task request bytes: {}", hex);
++      }
++      if (task.results_ptr && task.results_size) {
++        std::memset(memory_->TranslateVirtual(task.results_ptr), 0, task.results_size);
++      }
++      return X_E_SUCCESS;
++    }
++  }
+   REXKRNL_ERROR(
+       "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, "
+       "arg2={:08X}",
 diff --git a/sdk/src/kernel/xam/xam_content.cpp b/sdk/src/kernel/xam/xam_content.cpp
 index 78734b4..454f1ad 100644
 --- a/sdk/src/kernel/xam/xam_content.cpp
