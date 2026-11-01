@@ -1,4 +1,5 @@
 #include <rex/system/xam/fake_live.h>
+#include <rex/system/xam/fesl_shim.h>
 
 #include <cerrno>
 #include <cstdint>
@@ -8,9 +9,11 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 namespace fl = rex::system::xam::fake_live;
+namespace fesl = rex::system::xam::fesl;
 
 void Check(bool success, const char* expression, int line) {
   if (!success) {
@@ -165,6 +168,89 @@ void WinsockErrors() {
   CHECK(fl::WinsockErrorFromErrno(ENOENT) == 10050);  // WSAENETDOWN for anything unlisted
 }
 
+// The 360 game's request, as captured on a Switch: acct GetUserIdsByXuids for one Xbox ID.
+std::string GameLookupFrame(uint32_t word, const std::string& xuid) {
+  return fesl::EncodeFrame("acct", word,
+                           "TXN=GetUserIdsByXuids\nxuids.[]=1\nxuids.0=" + xuid + "\n");
+}
+
+std::string HelloFrame() {
+  return fesl::EncodeFrame("fsys", 0x80000001, "TXN=Hello\nclientString=nfs-360\n");
+}
+
+std::vector<uint8_t> Bytes(const std::string& text) {
+  return std::vector<uint8_t>(text.begin(), text.end());
+}
+
+std::string Text(const std::vector<uint8_t>& bytes) {
+  return std::string(bytes.begin(), bytes.end());
+}
+
+void FrameEncoding() {
+  const std::string frame = fesl::EncodeFrame("fsys", 0x80000001, "TXN=Hello\n");
+  CHECK(frame.size() == 12 + 10 + 1);
+  CHECK(frame.substr(0, 4) == "fsys");
+  CHECK(static_cast<uint8_t>(frame[4]) == 0x80 && static_cast<uint8_t>(frame[7]) == 0x01);
+  CHECK(static_cast<uint8_t>(frame[11]) == frame.size());  // total length, header included
+  CHECK(frame.back() == '\0');
+}
+
+void LookupIsAnsweredLocally() {
+  fesl::Shim shim(2802565664681494ULL, "Racer1234");
+  const std::string request = GameLookupFrame(0x80000002, "2802565664681494");
+  const fesl::Translation out = shim.FromGame(Bytes(request).data(), request.size());
+  CHECK(out.to_server.empty());  // the PC server cannot answer this, so it never sees it
+  const std::string reply = Text(out.to_game);
+  CHECK(reply.substr(0, 4) == "acct");
+  CHECK(static_cast<uint8_t>(reply[4]) == 0x80 && static_cast<uint8_t>(reply[7]) == 0x02);
+  CHECK(reply.find("TXN=GetUserIdsByXuids\n") != std::string::npos);
+  const std::string user_id = std::to_string(fesl::LocalUserId(2802565664681494ULL));
+  CHECK(reply.find("xuids.{2802565664681494}.userId=" + user_id + "\n") != std::string::npos);
+  CHECK(reply.find("userInfo.0.userName=Racer1234\n") != std::string::npos);
+  CHECK(fesl::LocalUserId(2802565664681494ULL) == fesl::LocalUserId(2802565664681494ULL));
+  CHECK(fesl::LocalUserId(2802565664681494ULL) != 0);
+}
+
+void OtherFramesPassThrough() {
+  fesl::Shim shim(1, "Racer0001");
+  const std::string hello = HelloFrame();
+  const fesl::Translation out = shim.FromGame(Bytes(hello).data(), hello.size());
+  CHECK(Text(out.to_server) == hello);
+  CHECK(out.to_game.empty());
+}
+
+void SplitFramesAreHeldUntilComplete() {
+  fesl::Shim shim(1, "Racer0001");
+  const std::string request = GameLookupFrame(0x80000002, "1");
+  const fesl::Translation first = shim.FromGame(Bytes(request).data(), 20);
+  CHECK(first.to_server.empty() && first.to_game.empty());
+  const fesl::Translation second =
+      shim.FromGame(Bytes(request).data() + 20, request.size() - 20);
+  CHECK(second.to_server.empty());
+  CHECK(!second.to_game.empty());
+}
+
+void TwoFramesInOneBuffer() {
+  fesl::Shim shim(1, "Racer0001");
+  const std::string hello = HelloFrame();
+  const std::string both = hello + GameLookupFrame(0x80000002, "1");
+  const fesl::Translation out = shim.FromGame(Bytes(both).data(), both.size());
+  CHECK(Text(out.to_server) == hello);
+  CHECK(!out.to_game.empty());
+}
+
+void GarbageIsForwardedUntouched() {
+  fesl::Shim shim(1, "Racer0001");
+  const std::string junk = "not a frame at all, just text";
+  const fesl::Translation out = shim.FromGame(Bytes(junk).data(), junk.size());
+  CHECK(Text(out.to_server) == junk);
+  CHECK(out.to_game.empty());
+  // Once the stream stopped looking like frames it stays out of the way.
+  const std::string request = GameLookupFrame(0x80000002, "1");
+  const fesl::Translation later = shim.FromGame(Bytes(request).data(), request.size());
+  CHECK(Text(later.to_server) == request);
+}
+
 void SeedPersists(const fs::path& folder) {
   const fs::path file = folder / "online_identity.bin";
   const uint64_t first = fl::LoadOrCreateSeed(file);
@@ -203,6 +289,12 @@ int main(int argc, char** argv) {
   ServiceInfoBytes();
   ConnectStatusValues();
   WinsockErrors();
+  FrameEncoding();
+  LookupIsAnsweredLocally();
+  OtherFramesPassThrough();
+  SplitFramesAreHeldUntilComplete();
+  TwoFramesInOneBuffer();
+  GarbageIsForwardedUntouched();
   SeedPersists(folder);
   SeedRepairs(folder);
   std::cout << "fake_live: all checks passed\n";

@@ -642,6 +642,177 @@ index 0000000..ea078bf
 +}
 +
 +}  // namespace rex::system::xam::fake_live
+diff --git a/sdk/include/rex/system/xam/fesl_shim.h b/sdk/include/rex/system/xam/fesl_shim.h
+new file mode 100644
+index 0000000..bca9819
+--- /dev/null
++++ b/sdk/include/rex/system/xam/fesl_shim.h
+@@ -0,0 +1,165 @@
++#pragma once
++/**
++ * Translation between the Xbox 360 build's online account protocol and the PC one.
++ *
++ * The 360 game talks the same line-based FESL frames as the PC game, but a few account
++ * transactions only exist on the 360 (for example acct GetUserIdsByXuids). A PC-only community
++ * server ignores them and the game waits for an answer that never comes. The shim sits on the
++ * game's connection to the server: frames it understands are answered locally, everything else
++ * goes through untouched.
++ *
++ * Frame: 4-character command, 4-byte big-endian transaction word, 4-byte big-endian total length
++ * (header included), then "key=value\n" lines and a terminating NUL.
++ *
++ * Header-only and free of kernel dependencies so the logic can be unit-tested on the host.
++ */
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++namespace rex::system::xam::fesl {
++
++constexpr size_t kHeaderSize = 12;
++// A frame longer than this is not a FESL frame (the PC server refuses the same).
++constexpr size_t kMaxFrameSize = 65535;
++
++// One whole frame: header, the given "key=value\n" lines, and the closing NUL.
++inline std::string EncodeFrame(std::string_view command, uint32_t word, std::string_view lines) {
++  const uint32_t length = static_cast<uint32_t>(kHeaderSize + lines.size() + 1);
++  std::string frame;
++  frame.reserve(length);
++  frame.append(command.substr(0, 4));
++  frame.resize(4, ' ');
++  for (int shift = 24; shift >= 0; shift -= 8) {
++    frame.push_back(static_cast<char>((word >> shift) & 0xFF));
++  }
++  for (int shift = 24; shift >= 0; shift -= 8) {
++    frame.push_back(static_cast<char>((length >> shift) & 0xFF));
++  }
++  frame.append(lines);
++  frame.push_back('\0');
++  return frame;
++}
++
++// The user id the shim reports for an Xbox ID: stable, non-zero, and the same on every run.
++inline uint32_t LocalUserId(uint64_t xuid) {
++  return 100000000u + static_cast<uint32_t>(xuid % 800000000u);
++}
++
++struct Translation {
++  std::vector<uint8_t> to_server;  // bytes to send to the real server
++  std::vector<uint8_t> to_game;    // bytes to hand to the game as if the server had sent them
++};
++
++class Shim {
++ public:
++  Shim(uint64_t own_xuid, std::string own_gamertag)
++      : own_xuid_(own_xuid), own_gamertag_(std::move(own_gamertag)) {}
++
++  // Bytes the game sent. Whole frames are handled one by one; a partial frame waits for the rest.
++  Translation FromGame(const uint8_t* data, size_t size) {
++    Translation out;
++    if (passthrough_) {
++      out.to_server.assign(data, data + size);
++      return out;
++    }
++    pending_.insert(pending_.end(), data, data + size);
++    size_t offset = 0;
++    while (pending_.size() - offset >= kHeaderSize) {
++      const uint8_t* head = pending_.data() + offset;
++      const size_t length = ReadBigEndian32(head + 8);
++      if (length < kHeaderSize || length > kMaxFrameSize) {
++        // Not a frame stream: stop interpreting and send everything on as it is.
++        passthrough_ = true;
++        out.to_server.insert(out.to_server.end(), pending_.begin() + offset, pending_.end());
++        pending_.clear();
++        return out;
++      }
++      if (pending_.size() - offset < length) {
++        break;
++      }
++      HandleFrame(head, length, &out);
++      offset += length;
++    }
++    pending_.erase(pending_.begin(), pending_.begin() + offset);
++    return out;
++  }
++
++ private:
++  static uint32_t ReadBigEndian32(const uint8_t* bytes) {
++    return (uint32_t{bytes[0]} << 24) | (uint32_t{bytes[1]} << 16) | (uint32_t{bytes[2]} << 8) |
++           uint32_t{bytes[3]};
++  }
++
++  // The value of `key` in a "key=value\n" body, empty when absent.
++  static std::string_view Field(std::string_view body, std::string_view key) {
++    size_t start = 0;
++    while (start < body.size()) {
++      size_t end = body.find('\n', start);
++      if (end == std::string_view::npos) {
++        end = body.size();
++      }
++      const std::string_view line = body.substr(start, end - start);
++      if (line.size() > key.size() && line.substr(0, key.size()) == key &&
++          line[key.size()] == '=') {
++        std::string_view value = line.substr(key.size() + 1);
++        while (!value.empty() && (value.back() == '\0' || value.back() == '\r')) {
++          value.remove_suffix(1);
++        }
++        return value;
++      }
++      start = end + 1;
++    }
++    return {};
++  }
++
++  void HandleFrame(const uint8_t* frame, size_t length, Translation* out) {
++    const std::string_view command(reinterpret_cast<const char*>(frame), 4);
++    const std::string_view body(reinterpret_cast<const char*>(frame) + kHeaderSize,
++                                length - kHeaderSize);
++    if (command == "acct" && Field(body, "TXN") == "GetUserIdsByXuids") {
++      AnswerUserIdLookup(ReadBigEndian32(frame + 4), body, out);
++      return;
++    }
++    out->to_server.insert(out->to_server.end(), frame, frame + length);
++  }
++
++  // The 360 asks which user id belongs to each Xbox ID. The reply lists every requested ID under the
++  // key shapes the game's account code reads.
++  void AnswerUserIdLookup(uint32_t word, std::string_view body, Translation* out) {
++    std::vector<std::string> xuids;
++    const std::string count_text(Field(body, "xuids.[]"));
++    const size_t count = count_text.empty() ? 0 : static_cast<size_t>(std::stoul(count_text));
++    for (size_t i = 0; i < count && i < 64; ++i) {
++      const std::string_view value = Field(body, "xuids." + std::to_string(i));
++      if (!value.empty()) {
++        xuids.emplace_back(value);
++      }
++    }
++    std::string lines = "TXN=GetUserIdsByXuids\n";
++    lines += "userInfo.[]=" + std::to_string(xuids.size()) + "\n";
++    for (size_t i = 0; i < xuids.size(); ++i) {
++      const uint64_t xuid = std::stoull(xuids[i]);
++      const std::string user_id = std::to_string(LocalUserId(xuid));
++      const std::string index = std::to_string(i);
++      lines += "xuids.{" + xuids[i] + "}.userId=" + user_id + "\n";
++      lines += "userInfo." + index + ".xuid=" + xuids[i] + "\n";
++      lines += "userInfo." + index + ".userId=" + user_id + "\n";
++      lines += "userInfo." + index + ".userName=" +
++               (xuid == own_xuid_ ? own_gamertag_ : std::string("Player")) + "\n";
++    }
++    const std::string reply = EncodeFrame("acct", word, lines);
++    out->to_game.insert(out->to_game.end(), reply.begin(), reply.end());
++  }
++
++  uint64_t own_xuid_;
++  std::string own_gamertag_;
++  std::vector<uint8_t> pending_;
++  bool passthrough_ = false;
++};
++
++}  // namespace rex::system::xam::fesl
 diff --git a/sdk/include/rex/system/xam/user_profile.h b/sdk/include/rex/system/xam/user_profile.h
 index ec37017..68d9484 100644
 --- a/sdk/include/rex/system/xam/user_profile.h
@@ -688,10 +859,24 @@ index ec37017..68d9484 100644
    std::unordered_map<uint32_t, Setting*> settings_;
    KernelState* kernel_state_ = nullptr;
 diff --git a/sdk/include/rex/system/xsocket.h b/sdk/include/rex/system/xsocket.h
-index a1b4443..5aa9685 100644
+index a1b4443..edb0b33 100644
 --- a/sdk/include/rex/system/xsocket.h
 +++ b/sdk/include/rex/system/xsocket.h
-@@ -101,8 +101,16 @@ class XSocket : public XObject {
+@@ -11,9 +11,13 @@
+  */
+ 
+ #include <cstring>
++#include <deque>
++#include <memory>
+ #include <queue>
++#include <string>
+ 
+ #include <rex/math.h>
++#include <rex/system/xam/fesl_shim.h>
+ #include <rex/system/xobject.h>
+ #include <rex/types.h>
+ 
+@@ -101,13 +105,28 @@ class XSocket : public XObject {
  
    X_STATUS SetOption(uint32_t level, uint32_t optname, void* optval_ptr, uint32_t optlen);
    X_STATUS IOControl(uint32_t cmd, uint8_t* arg_ptr);
@@ -708,7 +893,19 @@ index a1b4443..5aa9685 100644
    X_STATUS Bind(N_XSOCKADDR_IN* name, int name_len);
    X_STATUS Listen(int backlog);
    object_ref<XSocket> Accept(N_XSOCKADDR* name, int* name_len);
-@@ -135,6 +143,8 @@ class XSocket : public XObject {
+   int Shutdown(int how);
+ 
++  // Puts the 360-to-PC account translation on this connection (see xam/fesl_shim.h). Frames the PC
++  // server cannot answer are answered locally and handed to the game by Recv.
++  void EnableFeslShim(uint64_t own_xuid, std::string own_gamertag) {
++    shim_ = std::make_unique<xam::fesl::Shim>(own_xuid, std::move(own_gamertag));
++  }
++  bool has_fesl_shim() const { return shim_ != nullptr; }
++
+   int Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags);
+   int Send(const uint8_t* buf, uint32_t buf_len, uint32_t flags);
+ 
+@@ -135,12 +154,17 @@ class XSocket : public XObject {
    Type type_;           // Type (DGRAM/Stream/etc)
    Protocol proto_;      // Protocol (TCP/UDP/etc)
    bool secure_ = true;  // Secure socket (encryption enabled)
@@ -717,6 +914,15 @@ index a1b4443..5aa9685 100644
  
    bool bound_ = false;  // Explicitly bound to an IP address?
    uint16_t bound_port_ = 0;
+ 
+   bool broadcast_socket_ = false;
+ 
++  std::unique_ptr<xam::fesl::Shim> shim_;  // set only on the connection to the online server
++  std::deque<uint8_t> shim_inbox_;         // locally answered bytes waiting for the game's Recv
++
+   std::unique_ptr<rex::thread::Event> event_;
+   std::mutex incoming_packet_mutex_;
+   std::queue<uint8_t*> incoming_packets_;
 diff --git a/sdk/include/rex/system/xthread.h b/sdk/include/rex/system/xthread.h
 index a72911e..e0c27c2 100644
 --- a/sdk/include/rex/system/xthread.h
@@ -2063,7 +2269,7 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..bf20ca1 100644
+index 58e36a4..97ef03b 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
 @@ -12,7 +12,11 @@
@@ -2352,7 +2558,7 @@ index 58e36a4..bf20ca1 100644
  u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void arg_ptr) {
    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
    if (!socket) {
-@@ -687,10 +898,34 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -687,10 +898,42 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
      return -1;
    }
  
@@ -2372,6 +2578,14 @@ index 58e36a4..bf20ca1 100644
 +  }
 +  N_XSOCKADDR native_name(raw);
    X_STATUS status = socket->Connect(&native_name, namelen);
++  if (fake_live && !socket->has_fesl_shim() && xeOnlineServerAddress(&server_address) &&
++      static_cast<uint32_t>(sin->sin_addr) == server_address) {
++    // The 360's account requests the PC server cannot answer are answered here instead.
++    const auto& identity = REX_KERNEL_STATE()->user_profile()->fake_identity();
++    socket->EnableFeslShim(
++        identity.xuid,
++        std::string(identity.gamertag, strnlen(identity.gamertag, sizeof(identity.gamertag))));
++  }
 +  if (fake_live) {
 +    FAKE_LIVE_TRACE_UP_TO(20, "fake Live: connect socket {} to {}:{} (asked {}) -> {} (winsock {}, errno {})",
 +                          socket_handle, Ipv4ToString(sin->sin_addr),
@@ -2389,7 +2603,7 @@ index 58e36a4..bf20ca1 100644
      return -1;
    }
  
-@@ -783,6 +1018,18 @@ struct host_set {
+@@ -783,6 +1026,18 @@ struct host_set {
      }
    }
  
@@ -2408,7 +2622,7 @@ index 58e36a4..bf20ca1 100644
    void UpdateFrom(fd_set* native_set) {
      uint32_t new_count = 0;
      for (uint32_t i = 0; i < this->count; ++i) {
-@@ -825,8 +1072,18 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -825,8 +1080,18 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
                                               reinterpret_cast<int32_t*>(&timeout.tv_usec));
      timeout_in = &timeout;
    }
@@ -2429,7 +2643,7 @@ index 58e36a4..bf20ca1 100644
    if (readfds) {
      host_readfds.UpdateFrom(&native_readfds);
      host_readfds.Store(readfds);
-@@ -844,6 +1101,17 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -844,6 +1109,17 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
    return ret;
  }
  
@@ -2447,7 +2661,7 @@ index 58e36a4..bf20ca1 100644
  u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
    if (!socket) {
-@@ -852,7 +1120,15 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -852,7 +1128,15 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -2464,7 +2678,7 @@ index 58e36a4..bf20ca1 100644
  }
  
  u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
-@@ -883,13 +1159,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+@@ -883,13 +1167,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
    }
  
    if (ret == -1) {
@@ -2479,7 +2693,7 @@ index 58e36a4..bf20ca1 100644
    }
  
    return ret;
-@@ -903,7 +1173,16 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -903,7 +1181,16 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -2497,7 +2711,7 @@ index 58e36a4..bf20ca1 100644
  }
  
  u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
-@@ -915,6 +1194,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+@@ -915,6 +1202,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
      return -1;
    }
  
@@ -2511,7 +2725,7 @@ index 58e36a4..bf20ca1 100644
    N_XSOCKADDR_IN native_to(to_ptr);
    return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
  }
-@@ -963,6 +1249,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+@@ -963,6 +1257,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
             rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
@@ -2520,7 +2734,7 @@ index 58e36a4..bf20ca1 100644
  REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
-@@ -1030,12 +1318,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,12 +1326,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -2535,7 +2749,7 @@ index 58e36a4..bf20ca1 100644
  REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
  REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
  REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
-@@ -1048,7 +1336,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
+@@ -1048,7 +1344,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
  REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
  REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
  REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
@@ -2544,7 +2758,7 @@ index 58e36a4..bf20ca1 100644
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
-@@ -1099,4 +1387,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
+@@ -1099,4 +1395,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
  REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
  REX_EXPORT_STUB(__imp__NetDll_getpeername);
  REX_EXPORT_STUB(__imp__NetDll_getsockname);
@@ -3800,18 +4014,19 @@ index d358f39..e3bee26 100644
      switch (result) {
        case rex::thread::WaitResult::kSuccess:
 diff --git a/sdk/src/system/xsocket.cpp b/sdk/src/system/xsocket.cpp
-index 2d13ac8..1d5c867 100644
+index 2d13ac8..62a8dda 100644
 --- a/sdk/src/system/xsocket.cpp
 +++ b/sdk/src/system/xsocket.cpp
-@@ -9,6 +9,7 @@
+@@ -9,6 +9,8 @@
   * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
++#include <algorithm>
 +#include <cerrno>
  #include <cstring>
  
  #include <rex/kernel/xam/module.h>
-@@ -90,6 +91,27 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
+@@ -90,6 +92,27 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
    return X_STATUS_SUCCESS;
  }
  
@@ -3839,7 +4054,7 @@ index 2d13ac8..1d5c867 100644
  X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
    int ret = rex::net::socket_ioctl(native_handle_, cmd, arg_ptr);
    if (ret < 0) {
-@@ -100,17 +122,57 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
+@@ -100,17 +123,57 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
    return X_STATUS_SUCCESS;
  }
  
@@ -3897,7 +4112,44 @@ index 2d13ac8..1d5c867 100644
    if (ret < 0) {
      return X_STATUS_UNSUCCESSFUL;
    }
-@@ -221,12 +283,20 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
+@@ -158,6 +221,15 @@ int XSocket::Shutdown(int how) {
+ }
+ 
+ int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
++  if (!shim_inbox_.empty()) {
++    // A locally answered frame comes first, as far as the game's buffer allows.
++    const size_t count = std::min<size_t>(buf_len, shim_inbox_.size());
++    std::copy_n(shim_inbox_.begin(), count, buf);
++    if (!(flags & 0x2 /* MSG_PEEK */)) {
++      shim_inbox_.erase(shim_inbox_.begin(), shim_inbox_.begin() + count);
++    }
++    return static_cast<int>(count);
++  }
+   return recv(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags);
+ }
+ 
+@@ -205,7 +277,19 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
+ }
+ 
+ int XSocket::Send(const uint8_t* buf, uint32_t buf_len, uint32_t flags) {
+-  return send(native_handle_, reinterpret_cast<const char*>(buf), buf_len, flags);
++  if (!shim_) {
++    return send(native_handle_, reinterpret_cast<const char*>(buf), buf_len, flags);
++  }
++  const xam::fesl::Translation translated = shim_->FromGame(buf, buf_len);
++  shim_inbox_.insert(shim_inbox_.end(), translated.to_game.begin(), translated.to_game.end());
++  if (!translated.to_server.empty()) {
++    const int sent = send(native_handle_, reinterpret_cast<const char*>(translated.to_server.data()),
++                          static_cast<int>(translated.to_server.size()), flags);
++    if (sent < 0) {
++      return sent;
++    }
++  }
++  return static_cast<int>(buf_len);  // the game handed over its bytes; the shim took them all
+ }
+ 
+ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_IN* to,
+@@ -221,12 +305,20 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
    }
    */
  
