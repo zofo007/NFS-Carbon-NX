@@ -757,7 +757,7 @@ index 0000000..c7fd4f5
 +}  // namespace rex::system::xam::fake_live
 diff --git a/sdk/include/rex/system/xam/fesl_shim.h b/sdk/include/rex/system/xam/fesl_shim.h
 new file mode 100644
-index 0000000..8d89245
+index 0000000..62fff03
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/fesl_shim.h
 @@ -0,0 +1,452 @@
@@ -1015,7 +1015,7 @@ index 0000000..8d89245
 +    Pieces& pieces = fragments_[word];
 +    pieces.size = std::stoul(size_text);
 +    pieces.base64.append(data);
-+    if (pieces.base64.size() < (pieces.size + 2) / 3 * 4) {
++    if (pieces.base64.size() < pieces.size) {  // "size" counts the base64 characters
 +      return;
 +    }
 +    std::string text = Base64Decode(pieces.base64);

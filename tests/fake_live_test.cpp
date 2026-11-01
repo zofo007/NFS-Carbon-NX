@@ -444,9 +444,10 @@ void Base64Decodes() {
   CHECK(fesl::Base64Decode("").empty());
 }
 
-// A request the game splits over frames: each carries "size=<decoded bytes>" and a slice of base64.
+// A request the game splits over frames: each carries "size=<total base64 characters>" (seen on
+// hardware: size=18644 over ten frames) and a slice of base64.
 std::string Fragment(const std::string& command, uint32_t word, const std::string& slice) {
-  return fesl::EncodeFrame(command, word, "size=43\ndata=" + slice + "\n");
+  return fesl::EncodeFrame(command, word, "size=60\ndata=" + slice + "\n");
 }
 
 void FragmentedMatchRequestIsDecodedForTheTrace() {
