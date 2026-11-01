@@ -1976,13 +1976,14 @@ index d604044..2531785 100644
   * newlib has mktime, which interprets struct tm in the local time zone, but not
 diff --git a/sdk/src/core/switch_network.c b/sdk/src/core/switch_network.c
 new file mode 100644
-index 0000000..3a79679
+index 0000000..a9548f2
 --- /dev/null
 +++ b/sdk/src/core/switch_network.c
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,37 @@
 +/* Starts libnx's BSD socket service for the online trial.
 + * Called once, lazily, from the kernel layer, and only when online_fake_live and online_server_host
-+ * are both set. The buffers are small on purpose: the process has only a few MB of memory to spare.
++ * are both set. The buffers are small on purpose: the process has only a few MB of memory to spare,
++ * but the budget must cover every socket the game keeps open at once.
 + * Returns 0 on success, otherwise the libnx result code. The outcome is remembered, so a failure
 + * (no Wi-Fi, no bsd service) is not retried. */
 +#include <switch.h>
@@ -2002,7 +2003,11 @@ index 0000000..3a79679
 +            .tcp_rx_buf_max_size = 0,
 +            .udp_tx_buf_size = 0x2400,
 +            .udp_rx_buf_size = 0x2400,
-+            .sb_efficiency = 1,
++            // libnx's transfer memory is this times one socket's buffers (about 84 KB here): 1 left
++            // room for the account connection only, so every later socket() failed and the game
++            // retried forever. 8 is the top of the documented range (1-8, switchbrew "Sockets
++            // services") and about 0.65 MB, taken from the heap's free space.
++            .sb_efficiency = 8,
 +            .num_bsd_sessions = 3,
 +            .bsd_service_type = BsdServiceType_User,
 +        };
@@ -2638,7 +2643,7 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..9343983 100644
+index 58e36a4..cd9bb08 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
 @@ -12,7 +12,11 @@
@@ -2876,7 +2881,7 @@ index 58e36a4..9343983 100644
      *pdns = dns_guest;
    }
    if (event_handle) {
-@@ -579,6 +753,14 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
+@@ -579,11 +753,24 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
  }
  
  u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
@@ -2891,7 +2896,17 @@ index 58e36a4..9343983 100644
    XSocket* socket = new XSocket(REX_KERNEL_STATE());
    X_STATUS result =
        socket->Initialize(XSocket::AddressFamily((uint32_t)af), XSocket::Type((uint32_t)type),
-@@ -643,6 +825,35 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
+                          XSocket::Protocol((uint32_t)protocol));
+ 
++  const int host_errno = errno;
++  if (REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    FAKE_LIVE_TRACE_UP_TO(16, "fake Live: socket(af {}, type {}, protocol {}) -> {} (errno {})", af,
++                          type, protocol, XFAILED(result) ? "failed" : "ok", host_errno);
++  }
+   if (XFAILED(result)) {
+     socket->Release();
+ 
+@@ -643,6 +830,35 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
    return XSUCCEEDED(status) ? 0 : -1;
  }
  
@@ -2927,7 +2942,7 @@ index 58e36a4..9343983 100644
  u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void arg_ptr) {
    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
    if (!socket) {
-@@ -687,10 +898,43 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -687,10 +903,43 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
      return -1;
    }
  
@@ -2973,7 +2988,7 @@ index 58e36a4..9343983 100644
      return -1;
    }
  
-@@ -783,6 +1027,18 @@ struct host_set {
+@@ -783,6 +1032,18 @@ struct host_set {
      }
    }
  
@@ -2992,7 +3007,7 @@ index 58e36a4..9343983 100644
    void UpdateFrom(fd_set* native_set) {
      uint32_t new_count = 0;
      for (uint32_t i = 0; i < this->count; ++i) {
-@@ -825,8 +1081,18 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -825,8 +1086,18 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
                                               reinterpret_cast<int32_t*>(&timeout.tv_usec));
      timeout_in = &timeout;
    }
@@ -3013,7 +3028,7 @@ index 58e36a4..9343983 100644
    if (readfds) {
      host_readfds.UpdateFrom(&native_readfds);
      host_readfds.Store(readfds);
-@@ -844,6 +1110,17 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -844,6 +1115,17 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
    return ret;
  }
  
@@ -3031,7 +3046,7 @@ index 58e36a4..9343983 100644
  u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
    if (!socket) {
-@@ -852,7 +1129,15 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -852,7 +1134,15 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -3048,7 +3063,7 @@ index 58e36a4..9343983 100644
  }
  
  u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
-@@ -883,13 +1168,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+@@ -883,13 +1173,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
    }
  
    if (ret == -1) {
@@ -3063,7 +3078,7 @@ index 58e36a4..9343983 100644
    }
  
    return ret;
-@@ -903,7 +1182,16 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -903,7 +1187,16 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -3081,7 +3096,7 @@ index 58e36a4..9343983 100644
  }
  
  u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
-@@ -915,6 +1203,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+@@ -915,6 +1208,13 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
      return -1;
    }
  
@@ -3095,7 +3110,7 @@ index 58e36a4..9343983 100644
    N_XSOCKADDR_IN native_to(to_ptr);
    return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
  }
-@@ -963,6 +1258,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+@@ -963,6 +1263,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
             rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
@@ -3104,7 +3119,7 @@ index 58e36a4..9343983 100644
  REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
-@@ -1030,12 +1327,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,12 +1332,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -3119,7 +3134,7 @@ index 58e36a4..9343983 100644
  REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
  REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
  REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
-@@ -1048,7 +1345,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
+@@ -1048,7 +1350,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
  REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
  REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
  REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
@@ -3128,7 +3143,7 @@ index 58e36a4..9343983 100644
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
-@@ -1099,4 +1396,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
+@@ -1099,4 +1401,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
  REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
  REX_EXPORT_STUB(__imp__NetDll_getpeername);
  REX_EXPORT_STUB(__imp__NetDll_getsockname);
