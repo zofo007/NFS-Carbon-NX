@@ -5239,10 +5239,10 @@ index 78826a6..e715bb3 100644
  
  }  // namespace xam
 diff --git a/sdk/src/system/xam/user_profile.cpp b/sdk/src/system/xam/user_profile.cpp
-index a77f5e6..42fa758 100644
+index a77f5e6..2eaec1d 100644
 --- a/sdk/src/system/xam/user_profile.cpp
 +++ b/sdk/src/system/xam/user_profile.cpp
-@@ -9,18 +9,163 @@
+@@ -9,18 +9,172 @@
   * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
@@ -5297,9 +5297,6 @@ index a77f5e6..42fa758 100644
 +  if (!memory) {
 +    return;
 +  }
-+  const auto in_stack_range = [](uint32_t address) {
-+    return address >= 0x40000000u && address < 0xC0000000u && (address & 3) == 0;
-+  };
 +  const auto load32 = [&](uint32_t address) {
 +    return rex::memory::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
 +  };
@@ -5310,18 +5307,30 @@ index a77f5e6..42fa758 100644
 +      continue;
 +    }
 +    const uint32_t sp = context->r1.u32;
++    // The thread's own stack bounds, from its PCR (r13): every read below stays inside them, because the
++    // page just above a stack is not accessible.
++    const uint32_t pcr = context->r13.u32;
++    uint32_t top = 0;
++    uint32_t low = 0;
++    if (pcr >= 0x10000u && pcr < 0xC0000000u && (pcr & 3) == 0) {
++      top = load32(pcr + 0x70);
++      low = load32(pcr + 0x74);
++    }
 +    std::string frames;
 +    uint32_t current = sp;
-+    for (int depth = 0; depth < 16 && in_stack_range(current); ++depth) {
++    for (int depth = 0; depth < 16 && low != 0 && low < top && (current & 3) == 0; ++depth) {
++      if (current < low || current + 4 > top) {
++        break;
++      }
 +      const uint32_t back = load32(current);
-+      if (!in_stack_range(back) || back <= current || back - current > 0x200000u) {
++      if (back <= current || back > top || back < low + 8) {
 +        break;
 +      }
 +      frames += fmt::format(" {:08X}", load32(back - 8));
 +      current = back;
 +    }
-+    REXKRNL_WARN("fake Live: guest thread {:x} lr {:08X} sp {:08X} return addresses:{}", thread->handle(),
-+                 context->lr, sp, frames);
++    REXKRNL_WARN("fake Live: guest thread {:x} lr {:08X} sp {:08X} stack {:08X}-{:08X} return addresses:{}",
++                 thread->handle(), context->lr, sp, low, top, frames);
 +  }
 +}
 +
