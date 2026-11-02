@@ -5239,10 +5239,10 @@ index 78826a6..e715bb3 100644
  
  }  // namespace xam
 diff --git a/sdk/src/system/xam/user_profile.cpp b/sdk/src/system/xam/user_profile.cpp
-index a77f5e6..8a064a2 100644
+index a77f5e6..42fa758 100644
 --- a/sdk/src/system/xam/user_profile.cpp
 +++ b/sdk/src/system/xam/user_profile.cpp
-@@ -9,18 +9,124 @@
+@@ -9,18 +9,163 @@
   * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
@@ -5259,6 +5259,8 @@ index a77f5e6..8a064a2 100644
 +#include <rex/cvar.h>
  #include <rex/logging.h>
  #include <rex/system/kernel_state.h>
++#include <rex/system/thread_state.h>
++#include <rex/system/xthread.h>
  #include <rex/system/xam/user_profile.h>
  
 +REXCVAR_DEFINE_BOOL(online_fake_live, false, "Online",
@@ -5287,6 +5289,42 @@ index a77f5e6..8a064a2 100644
 +      .count();
 +}
 +
++// Where every guest thread is: the saved link register, the stack pointer and the return addresses along
++// the stack chain (each frame saves the caller's stack pointer at 0(sp) and its return address at
++// -8(caller's sp)). Read-only and range-checked: it is a diagnostic for a hang and must not fault.
++static void DumpGuestThreads() {
++  auto* memory = REX_KERNEL_MEMORY();
++  if (!memory) {
++    return;
++  }
++  const auto in_stack_range = [](uint32_t address) {
++    return address >= 0x40000000u && address < 0xC0000000u && (address & 3) == 0;
++  };
++  const auto load32 = [&](uint32_t address) {
++    return rex::memory::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
++  };
++  for (const auto& thread : REX_KERNEL_OBJECTS()->GetObjectsByType<rex::system::XThread>()) {
++    auto* state = thread->thread_state();
++    auto* context = state ? state->context() : nullptr;
++    if (!context) {
++      continue;
++    }
++    const uint32_t sp = context->r1.u32;
++    std::string frames;
++    uint32_t current = sp;
++    for (int depth = 0; depth < 16 && in_stack_range(current); ++depth) {
++      const uint32_t back = load32(current);
++      if (!in_stack_range(back) || back <= current || back - current > 0x200000u) {
++        break;
++      }
++      frames += fmt::format(" {:08X}", load32(back - 8));
++      current = back;
++    }
++    REXKRNL_WARN("fake Live: guest thread {:x} lr {:08X} sp {:08X} return addresses:{}", thread->handle(),
++                 context->lr, sp, frames);
++  }
++}
++
 +// A hang shows as the game making no traced call at all (it polls the network every frame while it
 +// runs). After 6 s of silence the last calls are written to the log, once per silence.
 +static void StartCallWatchdog() {
@@ -5312,6 +5350,7 @@ index a77f5e6..8a064a2 100644
 +                         now - call.time_ms, call.thread & 0xFFFFFF, call.name, call.args[0],
 +                         call.args[1], call.args[2], call.args[3]);
 +          }
++          DumpGuestThreads();
 +        }
 +      });
 +      (void)watchdog;
