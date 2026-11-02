@@ -1522,10 +1522,10 @@ index 0000000..3de7758
 +}  // namespace rex::system::xam::overlapped
 diff --git a/sdk/include/rex/system/xam/udp_tunnel.h b/sdk/include/rex/system/xam/udp_tunnel.h
 new file mode 100644
-index 0000000..ad072db
+index 0000000..7a2d10b
 --- /dev/null
 +++ b/sdk/include/rex/system/xam/udp_tunnel.h
-@@ -0,0 +1,318 @@
+@@ -0,0 +1,455 @@
 +#pragma once
 +/**
 + * The game's UDP tunnel datagrams (DirtySDK ProtoTunnel) in the encrypted mode the PC server uses, and the
@@ -1546,10 +1546,12 @@ index 0000000..ad072db
 + * Header-only and free of kernel dependencies so it can be unit-tested on the host.
 + */
 +
++#include <chrono>
 +#include <cstddef>
 +#include <cstdint>
 +#include <mutex>
 +#include <optional>
++#include <set>
 +#include <string>
 +#include <string_view>
 +#include <vector>
@@ -1772,6 +1774,124 @@ index 0000000..ad072db
 +  int64_t last_forwarded_ = -1;
 +};
 +
++// The server sends many of its records once (latency reports, state messages) and numbers them in one
++// sequence the game must receive in order. Over a lossy path one lost record leaves a hole the server never
++// refills, the game's acknowledgement stops there and the session times out. When a hole has stayed open
++// for `hold_ms` (long enough for the server's own retransmissions of the records it does repeat), this
++// answers with an empty record carrying the missing number, which is what the server sends as an
++// acknowledgement, so the game moves on.
++class ServerGapHealer {
++ public:
++  struct Fill {
++    std::vector<uint8_t> wire;       // the datagram to hand to the game
++    std::vector<uint32_t> sequences;  // the numbers it fills
++  };
++
++  explicit ServerGapHealer(std::string key, int64_t hold_ms = 2000)
++      : key_(std::move(key)), hold_ms_(hold_ms) {}
++
++  void Observe(const Datagram& datagram, int64_t now_ms) {
++    last_prefix_ = datagram.prefix;
++    for (const Packet& packet : datagram.packets) {
++      if (packet.channel != 1 || packet.body.size() <= 8) {
++        continue;
++      }
++      const uint32_t header = ReadBigEndian32(packet.body.data());
++      const uint32_t older = header >> 28;
++      const uint32_t sequence = header & 0x0FFFFFFF;
++      last_ack_ = ReadBigEndian32(packet.body.data() + 4);
++      if (packet.body.size() == 21 && packet.body.back() == 0x40) {
++        footer_.assign(packet.body.begin() + 8, packet.body.begin() + 20);
++      }
++      for (uint32_t k = 0; k <= older && k <= sequence; ++k) {
++        Mark(sequence - k, now_ms);
++      }
++    }
++  }
++
++  std::optional<Fill> Heal(int64_t now_ms) {
++    if (!started_ || above_.empty() || now_ms - blocked_since_ms_ < hold_ms_) {
++      return std::nullopt;
++    }
++    Fill fill;
++    Datagram datagram;
++    datagram.prefix = last_prefix_;
++    const uint32_t newest = *above_.rbegin();
++    for (uint32_t s = contiguous_ + 1; s < newest && fill.sequences.size() < kMaxPackets; ++s) {
++      if (above_.count(s)) {
++        continue;
++      }
++      Packet packet;
++      packet.channel = 1;
++      AppendBigEndian32(&packet.body, s);
++      AppendBigEndian32(&packet.body, last_ack_);
++      if (footer_.size() == 12) {
++        packet.body.insert(packet.body.end(), footer_.begin(), footer_.end());
++      } else {
++        packet.body.insert(packet.body.end(), 12, 0);
++      }
++      packet.body.push_back(0x40);
++      datagram.packets.push_back(std::move(packet));
++      fill.sequences.push_back(s);
++    }
++    if (fill.sequences.empty()) {
++      return std::nullopt;
++    }
++    for (const uint32_t s : fill.sequences) {
++      Mark(s, now_ms);
++    }
++    fill.wire = Encode(datagram, key_);
++    return fill;
++  }
++
++ private:
++  static uint32_t ReadBigEndian32(const uint8_t* bytes) {
++    return (uint32_t{bytes[0]} << 24) | (uint32_t{bytes[1]} << 16) | (uint32_t{bytes[2]} << 8) |
++           uint32_t{bytes[3]};
++  }
++  static void AppendBigEndian32(std::vector<uint8_t>* out, uint32_t value) {
++    for (int shift = 24; shift >= 0; shift -= 8) {
++      out->push_back(static_cast<uint8_t>(value >> shift));
++    }
++  }
++
++  void Mark(uint32_t sequence, int64_t now_ms) {
++    if (!started_) {
++      started_ = true;
++      contiguous_ = sequence ? sequence - 1 : 0;
++    }
++    if (sequence <= contiguous_) {
++      return;
++    }
++    above_.insert(sequence);
++    bool advanced = false;
++    while (!above_.empty() && *above_.begin() == contiguous_ + 1) {
++      above_.erase(above_.begin());
++      ++contiguous_;
++      advanced = true;
++    }
++    if (above_.empty()) {
++      was_blocked_ = false;
++      return;
++    }
++    if (advanced || !was_blocked_) {
++      blocked_since_ms_ = now_ms;
++    }
++    was_blocked_ = true;
++  }
++
++  std::string key_;
++  int64_t hold_ms_;
++  bool started_ = false;
++  bool was_blocked_ = false;
++  uint32_t contiguous_ = 0;      // every sequence up to this one has been seen
++  std::set<uint32_t> above_;      // seen beyond a hole
++  int64_t blocked_since_ms_ = -1;
++  uint16_t last_prefix_ = 0;
++  uint32_t last_ack_ = 0;
++  std::vector<uint8_t> footer_;
++};
++
 +// The tunnel of the game the process is in: the key arrives with the Theater entry reply (EGEG), the
 +// datagrams leave from the socket layer, which are different parts of the program.
 +class TunnelState {
@@ -1780,6 +1900,7 @@ index 0000000..ad072db
 +  void Begin(std::string key, uint16_t server_port = 0) {
 +    std::lock_guard<std::mutex> guard(lock_);
 +    key_ = key;
++    healer_.emplace(key);
 +    normalizer_.emplace(std::move(key));
 +    next_server_word_.reset();
 +    server_port_ = server_port;
@@ -1805,11 +1926,14 @@ index 0000000..ad072db
 +  // keystream they use, so a datagram that never arrived leaves a hole: this returns how many 4-byte
 +  // words of keystream lie between the end of the last new datagram and the start of this one (0 for the
 +  // next one in line, and for a repeat of an older datagram).
-+  size_t ObserveFromServer(const uint8_t* data, size_t size) {
++  size_t ObserveFromServer(const uint8_t* data, size_t size, int64_t now_ms = NowMs()) {
 +    std::lock_guard<std::mutex> guard(lock_);
 +    Datagram datagram;
 +    if (!key_ || !Decode(data, size, *key_, &datagram)) {
 +      return 0;
++    }
++    if (healer_) {
++      healer_->Observe(datagram, now_ms);
 +    }
 +    size_t bytes = 2 * datagram.packets.size();
 +    for (const Packet& packet : datagram.packets) {
@@ -1830,9 +1954,22 @@ index 0000000..ad072db
 +    return ahead;
 +  }
 +
++  // Records the server never refilled, as a datagram of empty ones for the game (see ServerGapHealer).
++  std::optional<ServerGapHealer::Fill> TakeHeal(int64_t now_ms = NowMs()) {
++    std::lock_guard<std::mutex> guard(lock_);
++    return healer_ ? healer_->Heal(now_ms) : std::nullopt;
++  }
++
++  static int64_t NowMs() {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(
++               std::chrono::steady_clock::now().time_since_epoch())
++        .count();
++  }
++
 + private:
 +  std::mutex lock_;
 +  std::optional<ClientNormalizer> normalizer_;
++  std::optional<ServerGapHealer> healer_;
 +  std::optional<std::string> key_;
 +  std::optional<uint32_t> next_server_word_;
 +  uint16_t server_port_ = 0;
@@ -3424,10 +3561,10 @@ index ff6cb56..a7b6b87 100644
  REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
-index 58e36a4..4939b9a 100644
+index 58e36a4..989c79e 100644
 --- a/sdk/src/kernel/xam/xam_net.cpp
 +++ b/sdk/src/kernel/xam/xam_net.cpp
-@@ -12,7 +12,14 @@
+@@ -12,7 +12,16 @@
  // Disable warnings about unused parameters for kernel functions
  #pragma GCC diagnostic ignored "-Wunused-parameter"
  
@@ -3436,13 +3573,15 @@ index 58e36a4..4939b9a 100644
 +#include <cerrno>
 +#include <chrono>
  #include <cstring>
++#include <deque>
 +#include <mutex>
 +#include <string>
 +#include <thread>
++#include <vector>
  
  #if REX_PLATFORM_MAC
  #include <sys/select.h>
-@@ -20,6 +27,7 @@
+@@ -20,6 +29,7 @@
  
  #include <rex/chrono/clock.h>
  #include <rex/kernel/xam/module.h>
@@ -3450,7 +3589,7 @@ index 58e36a4..4939b9a 100644
  #include <rex/kernel/xam/private.h>
  #include <rex/kernel/xboxkrnl/error.h>
  #include <rex/kernel/xboxkrnl/threading.h>
-@@ -28,6 +36,8 @@
+@@ -28,6 +38,8 @@
  #include <rex/types.h>
  #include <rex/string.h>
  #include <rex/system/kernel_state.h>
@@ -3459,7 +3598,7 @@ index 58e36a4..4939b9a 100644
  #include <rex/system/xevent.h>
  #include <rex/system/xsocket.h>
  #include <rex/system/xthread.h>
-@@ -37,19 +47,113 @@
+@@ -37,19 +49,113 @@
  // NOTE: must be included last as it expects windows.h to already be included.
  #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
  #include <winsock2.h>                    // NOLINT(build/include_order)
@@ -3573,7 +3712,7 @@ index 58e36a4..4939b9a 100644
  // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
  enum {
    XNCALLER_INVALID = 0x0,
-@@ -295,25 +399,215 @@ u32 NetDll_WSAGetLastError_entry() {
+@@ -295,25 +401,247 @@ u32 NetDll_WSAGetLastError_entry() {
    return XThread::GetLastError();
  }
  
@@ -3646,6 +3785,23 @@ index 58e36a4..4939b9a 100644
 +// game's socket thread waits for.
 +static void CompletePendingReceives() {
 +  NoteReceivePoll();
++  // Records the server never refilled become a datagram of empty ones (see tunnel::ServerGapHealer); it is
++  // handed to the game like one that arrived, on the socket the server's datagrams come in on.
++  static std::deque<std::vector<uint8_t>> healing;
++  static N_XSOCKADDR_IN server_from;
++  static uint32_t server_socket = 0;
++  static bool server_seen = false;
++  if (server_seen) {
++    if (auto fill = rex::system::xam::tunnel::GlobalTunnel().TakeHeal()) {
++      std::string numbers;
++      for (const uint32_t sequence : fill->sequences) {
++        numbers += fmt::format("{:#x} ", sequence);
++      }
++      FAKE_LIVE_TRACE_UP_TO(100, "fake Live: the server never refilled the records {}: handing the game empty ones",
++                            numbers);
++      healing.push_back(std::move(fill->wire));
++    }
++  }
 +  for (const rex::system::xam::overlapped::PendingReceive& pending : g_pending_receives.Active()) {
 +    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(pending.socket);
 +    if (!socket) {
@@ -3654,8 +3810,23 @@ index 58e36a4..4939b9a 100644
 +    }
 +    N_XSOCKADDR_IN from;
 +    uint32_t from_length = sizeof(XSOCKADDR_IN);
-+    const int received = socket->RecvFrom(REX_KERNEL_MEMORY()->TranslateVirtual(pending.buffer),
-+                                          pending.length, 0, &from, &from_length);
++    int received;
++    if (!healing.empty() && server_seen && pending.socket == server_socket &&
++        healing.front().size() <= pending.length) {
++      received = static_cast<int>(healing.front().size());
++      std::memcpy(REX_KERNEL_MEMORY()->TranslateVirtual(pending.buffer), healing.front().data(),
++                  healing.front().size());
++      healing.pop_front();
++      from = server_from;
++    } else {
++      received = socket->RecvFrom(REX_KERNEL_MEMORY()->TranslateVirtual(pending.buffer),
++                                  pending.length, 0, &from, &from_length);
++      if (received >= 0) {
++        server_from = from;
++        server_socket = pending.socket;
++        server_seen = true;
++      }
++    }
 +    if (received < 0) {
 +      if (errno != EAGAIN && errno != EWOULDBLOCK) {
 +        FAKE_LIVE_TRACE_UP_TO(10, "fake Live: UDP receive on socket {} failed (errno {})", pending.socket,
@@ -3800,7 +3971,7 @@ index 58e36a4..4939b9a 100644
  // If the socket is a VDP socket, buffer 0 is the game data length, and buffer 1
  // is the unencrypted game data.
  u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buffers,
-@@ -363,10 +657,41 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
+@@ -363,10 +691,41 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
    uint64_t timeout_wait = (uint64_t)timeout;
  
    X_STATUS result = 0;
@@ -3846,7 +4017,7 @@ index 58e36a4..4939b9a 100644
  
    if (XFAILED(result)) {
      uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
-@@ -436,6 +761,19 @@ struct XnAddrStatus {
+@@ -436,6 +795,19 @@ struct XnAddrStatus {
  };
  
  u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
@@ -3866,7 +4037,7 @@ index 58e36a4..4939b9a 100644
    // Just return a loopback address atm.
    addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
    addr_ptr->inaOnline.s_addr = 0;
-@@ -505,16 +843,100 @@ struct XEthernetStatus {
+@@ -505,16 +877,100 @@ struct XEthernetStatus {
    static const uint32_t XNET_ETHERNET_LINK_HALF_DUPLEX = 0x10;
  };
  
@@ -3908,9 +4079,9 @@ index 58e36a4..4939b9a 100644
 +    return caller;
 +  }
 +  FAKE_LIVE_TRACE("fake Live: XNetConnect({:#x}) -> 0", ina);
-+  return 0;
-+}
-+
+   return 0;
+ }
+ 
 +u32 NetDll_XNetGetConnectStatus_entry(u32 caller, u32 ina) {
 +  if (!REX_KERNEL_STATE()->user_profile()->fake_live()) {
 +    return caller;
@@ -3923,9 +4094,9 @@ index 58e36a4..4939b9a 100644
 +  if (!REX_KERNEL_STATE()->user_profile()->fake_live()) {
 +    return caller;
 +  }
-   return 0;
- }
- 
++  return 0;
++}
++
 +bool xeOnlineServerAddress(uint32_t* ipv4_host_order) {
 +  const std::string configured = REXCVAR_GET(online_server_host);
 +  in_addr address{};
@@ -3969,7 +4140,7 @@ index 58e36a4..4939b9a 100644
      *pdns = dns_guest;
    }
    if (event_handle) {
-@@ -579,11 +1001,24 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
+@@ -579,11 +1035,24 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
  }
  
  u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
@@ -3994,7 +4165,7 @@ index 58e36a4..4939b9a 100644
    if (XFAILED(result)) {
      socket->Release();
  
-@@ -643,6 +1078,35 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
+@@ -643,6 +1112,35 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
    return XSUCCEEDED(status) ? 0 : -1;
  }
  
@@ -4030,7 +4201,7 @@ index 58e36a4..4939b9a 100644
  u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void arg_ptr) {
    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
    if (!socket) {
-@@ -687,10 +1151,43 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -687,10 +1185,43 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
      return -1;
    }
  
@@ -4076,7 +4247,7 @@ index 58e36a4..4939b9a 100644
      return -1;
    }
  
-@@ -783,6 +1280,18 @@ struct host_set {
+@@ -783,6 +1314,18 @@ struct host_set {
      }
    }
  
@@ -4095,7 +4266,7 @@ index 58e36a4..4939b9a 100644
    void UpdateFrom(fd_set* native_set) {
      uint32_t new_count = 0;
      for (uint32_t i = 0; i < this->count; ++i) {
-@@ -825,8 +1334,18 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -825,8 +1368,18 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
                                               reinterpret_cast<int32_t*>(&timeout.tv_usec));
      timeout_in = &timeout;
    }
@@ -4116,7 +4287,7 @@ index 58e36a4..4939b9a 100644
    if (readfds) {
      host_readfds.UpdateFrom(&native_readfds);
      host_readfds.Store(readfds);
-@@ -844,6 +1363,17 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -844,6 +1397,17 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
    return ret;
  }
  
@@ -4134,7 +4305,7 @@ index 58e36a4..4939b9a 100644
  u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
    if (!socket) {
-@@ -852,7 +1382,15 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -852,7 +1416,15 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -4151,7 +4322,7 @@ index 58e36a4..4939b9a 100644
  }
  
  u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
-@@ -883,13 +1421,12 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+@@ -883,13 +1455,12 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
    }
  
    if (ret == -1) {
@@ -4171,7 +4342,7 @@ index 58e36a4..4939b9a 100644
    }
  
    return ret;
-@@ -903,7 +1440,17 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -903,7 +1474,17 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -4190,7 +4361,7 @@ index 58e36a4..4939b9a 100644
  }
  
  u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
-@@ -915,7 +1462,38 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+@@ -915,7 +1496,38 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
      return -1;
    }
  
@@ -4229,7 +4400,7 @@ index 58e36a4..4939b9a 100644
    return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
  }
  
-@@ -946,6 +1524,9 @@ REX_EXPORT(__imp__NetDll_WSACleanup, rex::kernel::xam::NetDll_WSACleanup_entry)
+@@ -946,6 +1558,9 @@ REX_EXPORT(__imp__NetDll_WSACleanup, rex::kernel::xam::NetDll_WSACleanup_entry)
  REX_EXPORT(__imp__NetDll_WSAGetLastError, rex::kernel::xam::NetDll_WSAGetLastError_entry)
  REX_EXPORT(__imp__NetDll_WSARecvFrom, rex::kernel::xam::NetDll_WSARecvFrom_entry)
  REX_EXPORT(__imp__NetDll_WSASendTo, rex::kernel::xam::NetDll_WSASendTo_entry)
@@ -4239,7 +4410,7 @@ index 58e36a4..4939b9a 100644
  REX_EXPORT(__imp__NetDll_WSAWaitForMultipleEvents,
             rex::kernel::xam::NetDll_WSAWaitForMultipleEvents_entry)
  REX_EXPORT(__imp__NetDll_WSACreateEvent, rex::kernel::xam::NetDll_WSACreateEvent_entry)
-@@ -963,6 +1544,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+@@ -963,6 +1578,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
             rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
@@ -4248,7 +4419,7 @@ index 58e36a4..4939b9a 100644
  REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
  REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
-@@ -1000,9 +1583,7 @@ REX_EXPORT_STUB(__imp__NetDll_UpnpEventUnsubscribe);
+@@ -1000,9 +1617,7 @@ REX_EXPORT_STUB(__imp__NetDll_UpnpEventUnsubscribe);
  REX_EXPORT_STUB(__imp__NetDll_UpnpSearchCreate);
  REX_EXPORT_STUB(__imp__NetDll_UpnpSearchGetDevices);
  REX_EXPORT_STUB(__imp__NetDll_UpnpStartup);
@@ -4258,7 +4429,7 @@ index 58e36a4..4939b9a 100644
  REX_EXPORT_STUB(__imp__NetDll_WSARecv);
  REX_EXPORT_STUB(__imp__NetDll_WSASend);
  REX_EXPORT_STUB(__imp__NetDll_WSAStartupEx);
-@@ -1030,12 +1611,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,12 +1645,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -4273,7 +4444,7 @@ index 58e36a4..4939b9a 100644
  REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
  REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
  REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
-@@ -1048,7 +1629,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
+@@ -1048,7 +1663,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
  REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
  REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
  REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
@@ -4282,7 +4453,7 @@ index 58e36a4..4939b9a 100644
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
-@@ -1099,4 +1680,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
+@@ -1099,4 +1714,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
  REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
  REX_EXPORT_STUB(__imp__NetDll_getpeername);
  REX_EXPORT_STUB(__imp__NetDll_getsockname);

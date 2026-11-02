@@ -766,6 +766,56 @@ void ServerDatagramNumberingShowsLostDatagrams() {
   CHECK(observe(124) == 0);   // and the numbering carries on from the newest
 }
 
+void RecordsTheServerNeverRefillsAreFilledWithEmptyOnes() {
+  // A record as the server sends it: header (older count + sequence), the acknowledgement, then the record.
+  const auto active = [](uint32_t sequence, const std::vector<uint8_t>& record) {
+    tn::Packet packet;
+    packet.channel = 1;
+    for (const uint32_t word : {sequence, uint32_t{0x1ff}}) {
+      for (int shift = 24; shift >= 0; shift -= 8) {
+        packet.body.push_back(static_cast<uint8_t>(word >> shift));
+      }
+    }
+    packet.body.insert(packet.body.end(), record.begin(), record.end());
+    return packet;
+  };
+  const std::vector<uint8_t> footer = Hex("00 02 aa 8a 23 25 27 40 00 00 00 00");
+  std::vector<uint8_t> empty_record = footer;
+  empty_record.push_back(0x40);
+  const std::vector<uint8_t> latency = Hex("00 00 00 00 12 00 00 11 a4 00 00 00 00 04");
+  const auto datagram = [&](uint16_t prefix, tn::Packet packet) {
+    tn::Datagram d;
+    d.prefix = prefix;
+    d.packets.push_back(std::move(packet));
+    return d;
+  };
+  tn::ServerGapHealer healer("4455667788", 2000);
+  healer.Observe(datagram(5, active(0x100, empty_record)), 0);
+  healer.Observe(datagram(11, active(0x101, latency)), 100);
+  CHECK(!healer.Heal(5000).has_value());                      // nothing missing
+  healer.Observe(datagram(23, active(0x103, latency)), 200);  // 0x102 never came
+  healer.Observe(datagram(29, active(0x104, latency)), 300);
+  CHECK(!healer.Heal(1500).has_value());                      // given time to arrive on its own
+  const auto fill = healer.Heal(2300);
+  CHECK(fill.has_value());
+  CHECK(fill->sequences == std::vector<uint32_t>{0x102});
+  tn::Datagram out;
+  CHECK(tn::Decode(fill->wire.data(), fill->wire.size(), "4455667788", &out));
+  CHECK(out.packets.size() == 1 && out.packets[0].channel == 1);
+  std::vector<uint8_t> expected = Hex("00 00 01 02 00 00 01 ff");  // sequence 0x102, the server's last ack
+  expected.insert(expected.end(), empty_record.begin(), empty_record.end());
+  CHECK(out.packets[0].body == expected);
+  CHECK(!healer.Heal(9000).has_value());                      // filled once
+  healer.Observe(datagram(35, active(0x105, latency)), 9100);
+  CHECK(!healer.Heal(20000).has_value());                     // and the numbering goes on without holes
+  // A record that arrives late, before the wait is over, closes the hole by itself.
+  tn::ServerGapHealer late("4455667788", 2000);
+  late.Observe(datagram(5, active(0x100, empty_record)), 0);
+  late.Observe(datagram(11, active(0x102, latency)), 100);
+  late.Observe(datagram(17, active(0x101, latency)), 900);
+  CHECK(!late.Heal(5000).has_value());
+}
+
 void TheaterIsUntouchedWithoutAHost() {
   fesl::Shim account(1, "Racer0001", kSecret, "188.27.34.215");
   FromServer(account, HelloReply(0x80000001));
@@ -995,6 +1045,7 @@ int main(int argc, char** argv) {
   TheaterIsUntouchedWithoutAHost();
   EntryReplyStartsTheTunnelWithItsKey();
   ServerDatagramNumberingShowsLostDatagrams();
+  RecordsTheServerNeverRefillsAreFilledWithEmptyOnes();
   ServerPortReplacesOnlyTheLoginPort();
   HelloPointsTheaterAndMessengerAtTheReachableHost();
   HelloIsUntouchedWithoutAHost();
