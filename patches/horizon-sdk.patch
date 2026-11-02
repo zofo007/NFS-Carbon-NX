@@ -234,6 +234,149 @@ index 0000000..f8d1430
 +}
 +
 +}  // namespace rex::filesystem
+diff --git a/sdk/include/rex/hook.h b/sdk/include/rex/hook.h
+index 4ce4f9b..4e68327 100644
+--- a/sdk/include/rex/hook.h
++++ b/sdk/include/rex/hook.h
+@@ -17,6 +17,8 @@
+ 
+ #include <fmt/format.h>
+ 
++#include <atomic>
++
+ #include <rex/logging.h>
+ #include <rex/ppc/context.h>
+ #include <rex/ppc/function.h>
+@@ -48,29 +50,65 @@
+ // Define a raw hook with direct ctx/base access.
+ #define REX_HOOK_RAW(name) extern "C" REX_FUNC(name)
+ 
++namespace rex::ppc::detail {
++// A stub the game calls in a loop (NetDll_getsockname, 20 times a second) would otherwise write a line,
++// flushed to the SD card, every time: log the first calls, then one in a thousand.
++inline bool StubLogDue(std::atomic<uint32_t>& calls) {
++  const uint32_t n = calls.fetch_add(1, std::memory_order_relaxed);
++  return n < 20 || n % 1000 == 0;
++}
++}  // namespace rex::ppc::detail
++
+ // Stub: logs a warning when called.
+-#define REX_STUB(subroutine)              \
+-  extern "C" REX_FUNC(subroutine) {       \
+-    (void)base;                           \
+-    REXKRNL_WARN("{} STUB", #subroutine); \
++#define REX_STUB(subroutine)                                      \
++  extern "C" REX_FUNC(subroutine) {                               \
++    (void)base;                                                   \
++    static std::atomic<uint32_t> stub_calls{0};                   \
++    if (rex::ppc::detail::StubLogDue(stub_calls)) {               \
++      REXKRNL_WARN("{} STUB", #subroutine);                       \
++    }                                                             \
++  }
++
++#define REX_STUB_LOG(subroutine, msg)                             \
++  extern "C" REX_FUNC(subroutine) {                               \
++    (void)base;                                                   \
++    static std::atomic<uint32_t> stub_calls{0};                   \
++    if (rex::ppc::detail::StubLogDue(stub_calls)) {               \
++      REXKRNL_WARN("{} STUB - {}", #subroutine, msg);             \
++    }                                                             \
+   }
+ 
+-#define REX_STUB_LOG(subroutine, msg)               \
+-  extern "C" REX_FUNC(subroutine) {                 \
+-    (void)base;                                     \
+-    REXKRNL_WARN("{} STUB - {}", #subroutine, msg); \
++#define REX_STUB_RETURN(subroutine, value)                                                  \
++  extern "C" REX_FUNC(subroutine) {                                                         \
++    (void)base;                                                                             \
++    static std::atomic<uint32_t> stub_calls{0};                                             \
++    if (rex::ppc::detail::StubLogDue(stub_calls)) {                                         \
++      REXKRNL_WARN("{} STUB - returning {:#x}", #subroutine, static_cast<uint32_t>(value)); \
++    }                                                                                       \
++    ctx.r3.u64 = (value);                                                                   \
+   }
+ 
+-#define REX_STUB_RETURN(subroutine, value)                                                \
+-  extern "C" REX_FUNC(subroutine) {                                                       \
+-    (void)base;                                                                           \
+-    REXKRNL_WARN("{} STUB - returning {:#x}", #subroutine, static_cast<uint32_t>(value)); \
+-    ctx.r3.u64 = (value);                                                                 \
++namespace rex::ppc::detail {
++// Logs the first calls (name and r3..r6) of an online-related export while online_fake_live is on.
++void TraceOnlineCall(const char* name, const PPCContext& ctx, std::atomic<int>& count,
++                     std::atomic<int64_t>& last_logged_ms);
++}  // namespace rex::ppc::detail
++
++// Same as REX_HOOK, plus the online call trace for the networking and user exports. The name test
++// is a compile-time constant, so other exports pay nothing.
++#define REX_HOOK_TRACED(subroutine, function)                                   \
++  extern "C" REX_FUNC(subroutine) {                                             \
++    if constexpr (rex::system::xam::fake_live::IsOnlineCallName(#subroutine)) { \
++      static std::atomic<int> trace_count{0};                                   \
++      static std::atomic<int64_t> trace_last_ms{0};                             \
++      rex::ppc::detail::TraceOnlineCall(#subroutine, ctx, trace_count, trace_last_ms); \
++    }                                                                           \
++    rex::ppc::HostToGuestFunction<function>(ctx, base);                         \
+   }
+ 
+ // Export: hook + register in global registry for kernel ordinal lookup.
+ #define REX_EXPORT(name, function) \
+-  REX_HOOK(name, function)         \
++  REX_HOOK_TRACED(name, function)  \
+   static rex::ppc::detail::PPCFuncRegistrar _ppc_reg_##name(#name, &name);
+ 
+ #define REX_EXPORT_STUB(name) \
+diff --git a/sdk/include/rex/kernel/xam/private.h b/sdk/include/rex/kernel/xam/private.h
+index 3df4776..1d5e30b 100644
+--- a/sdk/include/rex/kernel/xam/private.h
++++ b/sdk/include/rex/kernel/xam/private.h
+@@ -10,15 +10,45 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++
++#include <rex/logging.h>
+ #include <rex/system/export_resolver.h>
+ #include <rex/system/kernel_state.h>
+ 
++// Hardware-run trace for online_fake_live. The first `limit` uses of a call site are logged, then at
++// most one line per second, so polled calls stay visible over a long wait without flooding the log.
++// Warn level on purpose: it is flushed at once and survives a crash right after.
++#define FAKE_LIVE_TRACE_UP_TO(limit, ...)                                                      \
++  do {                                                                                         \
++    static std::atomic<int> trace_count{0};                                                    \
++    static std::atomic<int64_t> trace_last_ms{0};                                              \
++    bool trace_now = trace_count.fetch_add(1) < (limit);                                       \
++    if (!trace_now) {                                                                          \
++      const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(            \
++                                 std::chrono::steady_clock::now().time_since_epoch())          \
++                                 .count();                                                     \
++      int64_t last_ms = trace_last_ms.load();                                                  \
++      trace_now = now_ms - last_ms >= 1000 && trace_last_ms.compare_exchange_strong(last_ms, now_ms); \
++    }                                                                                          \
++    if (trace_now) {                                                                           \
++      REXKRNL_WARN(__VA_ARGS__);                                                               \
++    }                                                                                          \
++  } while (0)
++#define FAKE_LIVE_TRACE(...) FAKE_LIVE_TRACE_UP_TO(5, __VA_ARGS__)
++
+ namespace rex {
+ namespace kernel {
+ namespace xam {
+ 
+ bool xeXamIsUIActive();
+ 
++// The IPv4 address (as a plain integer, 192.168.0.1 = 0xC0A80001) of the host named by the
++// online_server_host setting; false when it is empty or does not resolve.
++bool xeOnlineServerAddress(uint32_t* ipv4_host_order);
++
+ rex::runtime::Export* RegisterExport_xam(rex::runtime::Export* export_entry);
+ 
+ // Registration functions, one per file.
 diff --git a/sdk/include/rex/system/kernel_state.h b/sdk/include/rex/system/kernel_state.h
 index 9b9cf9e..d853a94 100644
 --- a/sdk/include/rex/system/kernel_state.h
@@ -287,6 +430,1730 @@ index 9b9cf9e..d853a94 100644
    std::vector<object_ref<XNotifyListener>> notify_listeners_;
    bool has_notified_startup_ = false;
  
+diff --git a/sdk/include/rex/system/tail_call_thunk.h b/sdk/include/rex/system/tail_call_thunk.h
+new file mode 100644
+index 0000000..62fe8f2
+--- /dev/null
++++ b/sdk/include/rex/system/tail_call_thunk.h
+@@ -0,0 +1,96 @@
++#pragma once
++/**
++ * Short guest functions that only compute a jump target and tail-call it, such as:
++ *
++ *   virtual call:  lwz r12,0(r3); lwz r11,68(r12); mtctr r11; bctr
++ *   adjustor:      lwz r10,4(r3); lwz r11,12(r3); lwz r9,8(r3); add r3,r11,r10; mtctr r9; bctr
++ *
++ * The recompiler only registers a function it finds a direct call to. These thunks are reached
++ * through vtables and delegate tables, so about 250 in the game were never registered and the
++ * first indirect call into one stopped the game. The dispatcher uses RunTailCallThunk to execute
++ * such a function from the guest code itself.
++ *
++ * Only a straight run of loads, adds, moves and immediate arithmetic that ends in `mtctr; bctr` is
++ * accepted, and only on r0-r12 (the volatile registers a caller does not expect to survive).
++ * Anything else, including stores and branches, is refused so the caller can stop as before.
++ *
++ * Header-only and free of kernel dependencies so it can be unit-tested on the host.
++ */
++
++#include <cstddef>
++#include <cstdint>
++
++namespace rex::system {
++
++constexpr size_t kMaxTailCallThunkWords = 16;
++constexpr int kTailCallThunkRegisters = 13;  // r0-r12
++
++// Runs `code_size` bytes of big-endian guest code against `regs` (r0-r12, updated in place).
++// `load32(address)` reads a guest word. On success sets *target (the value of ctr) and returns true;
++// on anything unsupported returns false, leaving `regs` partly updated (callers use a copy).
++template <typename Load32>
++bool RunTailCallThunk(const uint8_t* code, size_t code_size, uint64_t* regs, Load32&& load32,
++                      uint32_t* target) {
++  constexpr uint32_t kBctr = 0x4E800420;
++  uint64_t ctr = 0;
++  bool ctr_set = false;
++  const size_t words = code_size / 4 < kMaxTailCallThunkWords ? code_size / 4 : kMaxTailCallThunkWords;
++  for (size_t i = 0; i < words; ++i) {
++    const uint8_t* p = code + i * 4;
++    const uint32_t w = (uint32_t{p[0]} << 24) | (uint32_t{p[1]} << 16) | (uint32_t{p[2]} << 8) |
++                       uint32_t{p[3]};
++    if (w == kBctr) {
++      if (!ctr_set) return false;
++      *target = static_cast<uint32_t>(ctr);
++      return true;
++    }
++    const uint32_t op = w >> 26;
++    const uint32_t rt = (w >> 21) & 31;  // rt, or rs for the store-form encodings below
++    const uint32_t ra = (w >> 16) & 31;
++    const uint32_t rb = (w >> 11) & 31;
++    const int64_t d = static_cast<int16_t>(w & 0xFFFF);
++    const auto base_of = [&](uint32_t reg) -> uint64_t { return reg == 0 ? 0 : regs[reg]; };
++    // Every form below names its registers in these fields (mtctr keeps 9 in `ra`); r13 and up
++    // (small-data base, stack) are not modelled.
++    if (rt >= kTailCallThunkRegisters || ra >= kTailCallThunkRegisters) {
++      return false;
++    }
++    switch (op) {
++      case 32: {  // lwz rt,d(ra)
++        regs[rt] = load32(static_cast<uint32_t>(base_of(ra)) + static_cast<uint32_t>(d));
++        break;
++      }
++      case 14:  // addi rt,ra,d
++        regs[rt] = base_of(ra) + static_cast<uint64_t>(d);
++        break;
++      case 15:  // addis rt,ra,d
++        regs[rt] = base_of(ra) + static_cast<uint64_t>(d * 65536);
++        break;
++      case 24:  // ori ra,rs,imm
++        regs[ra] = regs[rt] | (w & 0xFFFF);
++        break;
++      case 31: {
++        const uint32_t xo = (w >> 1) & 0x3FF;
++        if ((w & 1) != 0) return false;  // Rc: no condition register updates
++        if (xo == 266 && (w & 0x400) == 0) {  // add rt,ra,rb
++          if (rb >= kTailCallThunkRegisters) return false;
++          regs[rt] = regs[ra] + regs[rb];
++        } else if (xo == 444) {  // or ra,rs,rb (mr when rs == rb)
++          if (rb >= kTailCallThunkRegisters) return false;
++          regs[ra] = regs[rt] | regs[rb];
++        } else if (xo == 467 && (((w >> 16) & 31) | (((w >> 11) & 31) << 5)) == 9) {  // mtctr rs
++          ctr = regs[rt];
++          ctr_set = true;
++        } else {
++          return false;
++        }
++        break;
++      }
++      default:
++        return false;
++    }
++  }
++  return false;
++}
++
++}  // namespace rex::system
+diff --git a/sdk/include/rex/system/xam/fake_live.h b/sdk/include/rex/system/xam/fake_live.h
+new file mode 100644
+index 0000000..9238c65
+--- /dev/null
++++ b/sdk/include/rex/system/xam/fake_live.h
+@@ -0,0 +1,314 @@
++#pragma once
++
++// Values the kernel reports when the profile is made to look signed in to Xbox Live.
++// Pure functions only, no kernel state, so tests/fake_live_test.cpp can compile it on its own.
++
++#include <rex/filesystem/atomic_file.h>
++
++#include <array>
++#include <cerrno>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <mutex>
++#include <random>
++#include <string_view>
++#include <system_error>
++#include <vector>
++
++namespace rex::system::xam::fake_live {
++
++constexpr uint32_t kSigninLocal = 1;
++constexpr uint32_t kSigninLive = 2;
++constexpr uint32_t kNatOpen = 1;
++
++// XPRIVILEGE_COMMUNICATIONS_FRIENDS_ONLY: granting it restricts the user, so it stays denied.
++constexpr uint32_t kPrivilegeFriendsOnly = 251;
++
++inline uint32_t SigninState(bool live) {
++  return live ? kSigninLive : kSigninLocal;
++}
++
++inline uint32_t PrivilegeValue(bool live, uint32_t privilege_id) {
++  return live && privilege_id != kPrivilegeFriendsOnly ? 1 : 0;
++}
++
++// XNET_ETHERNET_LINK_ACTIVE | _100MBPS | _FULL_DUPLEX
++inline uint32_t EthernetLinkStatus(bool live) {
++  return live ? (0x01 | 0x02 | 0x08) : 0;
++}
++
++// XNET_GET_XNADDR_STATIC, plus ETHERNET | GATEWAY | DNS | ONLINE when live.
++inline uint32_t XnAddrStatus(bool live) {
++  return live ? (0x04 | 0x02 | 0x20 | 0x40 | 0x80) : 0x04;
++}
++
++// The most recent kernel calls the game made, kept so a hang can be read afterwards: when the game
++// stops calling anything for a while, the last few entries show what it was doing.
++struct CallRecord {
++  int64_t time_ms = 0;
++  uint64_t thread = 0;
++  const char* name = "";
++  std::array<uint32_t, 4> args{};
++};
++
++template <size_t Capacity>
++class CallRing {
++ public:
++  void Record(int64_t time_ms, uint64_t thread, const char* name, std::array<uint32_t, 4> args) {
++    std::lock_guard<std::mutex> guard(lock_);
++    entries_[next_ % Capacity] = CallRecord{time_ms, thread, name, args};
++    ++next_;
++    last_call_ms_ = time_ms;
++  }
++
++  // The last `count` calls (fewer if fewer were made), oldest first.
++  std::vector<CallRecord> Snapshot(size_t count) const {
++    std::lock_guard<std::mutex> guard(lock_);
++    const size_t held = next_ < Capacity ? next_ : Capacity;
++    const size_t take = count < held ? count : held;
++    std::vector<CallRecord> out;
++    out.reserve(take);
++    for (size_t i = next_ - take; i < next_; ++i) {
++      out.push_back(entries_[i % Capacity]);
++    }
++    return out;
++  }
++
++  int64_t LastCallMs() const {
++    std::lock_guard<std::mutex> guard(lock_);
++    return last_call_ms_;
++  }
++
++ private:
++  mutable std::mutex lock_;
++  std::array<CallRecord, Capacity> entries_{};
++  size_t next_ = 0;
++  int64_t last_call_ms_ = 0;
++};
++
++struct Identity {
++  uint64_t xuid;
++  char gamertag[16];
++  uint8_t mac[6];
++  uint64_t machine_id;
++};
++
++// XNDNS::status values: 0 once the lookup finished, otherwise a WSA error (WSAHOST_NOT_FOUND).
++constexpr int32_t kDnsOk = 0;
++constexpr int32_t kDnsHostNotFound = 11001;
++
++// True for `ea.com` and any name below it, ignoring ASCII case: the names the game uses for EA's
++// services, which online_server_host stands in for.
++inline bool IsEaServiceHost(std::string_view host) {
++  constexpr std::string_view kDomain = "ea.com";
++  if (host.size() < kDomain.size()) {
++    return false;
++  }
++  const std::string_view tail = host.substr(host.size() - kDomain.size());
++  for (size_t i = 0; i < kDomain.size(); ++i) {
++    const char c = tail[i] >= 'A' && tail[i] <= 'Z' ? static_cast<char>(tail[i] + 32) : tail[i];
++    if (c != kDomain[i]) {
++      return false;
++    }
++  }
++  return host.size() == kDomain.size() || host[host.size() - kDomain.size() - 1] == '.';
++}
++
++namespace detail {
++
++constexpr bool StartsWith(std::string_view text, std::string_view prefix) {
++  return text.size() >= prefix.size() && text.substr(0, prefix.size()) == prefix;
++}
++
++}  // namespace detail
++
++// Names of the kernel exports worth tracing on a hardware run with the fake on: networking and
++// user/session/notification calls, not content or file I/O.
++constexpr bool IsOnlineCallName(std::string_view name) {
++  constexpr std::string_view kPrefixes[] = {
++      "__imp__NetDll_",    "__imp__XNet",        "__imp__XNotify",     "__imp__XUser",
++      "__imp__XOnline",    "__imp__XLive",       "__imp__XSession",    "__imp__XamUser",
++      "__imp__XamShow",    "__imp__XamNotify",   "__imp__XamEnumerate", "__imp__XamSession",
++      "__imp__XamVoice",   "__imp__XamParty",    "__imp__XamLoader",   "__imp__XMsg",
++  };
++  for (const std::string_view prefix : kPrefixes) {
++    if (detail::StartsWith(name, prefix)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++struct Notification {
++  uint32_t id;
++  uint32_t param;
++};
++
++// What a signed-in, Live-connected console has already told every title that listens: the first user
++// is signed in (XN_SYS_SIGNINCHANGED, a bitmask of users), the Live connection is established
++// (XN_LIVE_CONNECTIONCHANGED with XONLINE_S_LOGON_CONNECTION_ESTABLISHED) and the link is up
++// (XN_LIVE_LINK_STATE_CHANGED). The game waits for these before it looks up a server, and a new
++// listener only receives what is queued after it exists, so each new listener gets them at creation.
++// Values are from memory of the Xbox 360 SDK headers; the hardware run is what confirms them.
++inline std::array<Notification, 3> InitialNotifications() {
++  return {{{0x0000000A, 1}, {0x02000001, 0x001510F0}, {0x02000003, 1}}};
++}
++
++// The service id the game asks XOnlineGetServiceInfo for when it looks for EA's online service
++// (seen on hardware: XLiveBase message 0x58007 with 0x45410004), and the port of EA's FESL login.
++constexpr uint32_t kEaServiceId = 0x45410004;
++constexpr uint16_t kEaServicePort = 18210;
++
++// The port the 360 game dials for its account service (seen on hardware). The PC server listens
++// on online_server_port instead; Theater (18215) and the messenger (13505) use the ports its
++// greeting announces, which must be left alone.
++constexpr uint16_t kGameLoginPort = 18220;
++
++inline uint16_t RedirectedPort(uint16_t asked_port, int32_t online_server_port) {
++  return (online_server_port > 0 && asked_port == kGameLoginPort)
++             ? static_cast<uint16_t>(online_server_port)
++             : asked_port;
++}
++
++// XONLINE_SERVICE_INFO as the guest reads it: service id (big-endian 32 bit), IPv4 address in
++// network order, port (big-endian 16 bit), reserved 16 bits = 0. `ipv4_host_order` is the address
++// as a plain integer (192.168.0.1 = 0xC0A80001).
++inline std::array<uint8_t, 12> EncodeServiceInfo(uint32_t service_id, uint32_t ipv4_host_order,
++                                                 uint16_t port) {
++  std::array<uint8_t, 12> bytes{};
++  for (int i = 0; i < 4; ++i) {
++    bytes[i] = static_cast<uint8_t>(service_id >> (24 - 8 * i));
++    bytes[4 + i] = static_cast<uint8_t>(ipv4_host_order >> (24 - 8 * i));
++  }
++  bytes[8] = static_cast<uint8_t>(port >> 8);
++  bytes[9] = static_cast<uint8_t>(port);
++  return bytes;
++}
++
++// XNET_CONNECT_STATUS_*: what XNetGetConnectStatus reports for a secure-address connection.
++constexpr uint32_t kConnectIdle = 0;
++constexpr uint32_t kConnectPending = 1;
++constexpr uint32_t kConnectConnected = 2;
++constexpr uint32_t kConnectLost = 3;
++
++// The Winsock error code a caller sees for a native errno from connect: the game's sockets are
++// non-blocking, so "in progress" must read as WSAEINPROGRESS/WSAEWOULDBLOCK, not a generic failure.
++inline uint32_t WinsockErrorFromErrno(int native_errno) {
++  switch (native_errno) {
++    case EINPROGRESS:
++      return 10036;  // WSAEINPROGRESS
++    case EALREADY:
++      return 10037;  // WSAEALREADY
++    case ECONNREFUSED:
++      return 10061;  // WSAECONNREFUSED
++    case ETIMEDOUT:
++      return 10060;  // WSAETIMEDOUT
++    case ENETUNREACH:
++      return 10051;  // WSAENETUNREACH
++    case EHOSTUNREACH:
++      return 10065;  // WSAEHOSTUNREACH
++    case EISCONN:
++      return 10056;  // WSAEISCONN
++    case ENOTCONN:
++      return 10057;  // WSAENOTCONN
++    case ECONNRESET:
++      return 10054;  // WSAECONNRESET
++    case ECONNABORTED:
++      return 10053;  // WSAECONNABORTED
++    default:
++      break;
++  }
++  if (native_errno == EWOULDBLOCK) {
++    return 10035;  // WSAEWOULDBLOCK
++  }
++  return 10050;  // WSAENETDOWN
++}
++
++// Address the title reports for itself: 10.0.0.2 (host order), Live's usual port 3074.
++constexpr uint32_t kFakeIpv4 = 0x0A000002;
++constexpr uint16_t kFakeOnlinePort = 3074;
++
++// The 20-byte XNADDR::abOnline: the machine id (little-endian) followed by zeros.
++inline std::array<uint8_t, 20> OnlineId(const Identity& id) {
++  std::array<uint8_t, 20> bytes{};
++  for (int i = 0; i < 8; ++i) {
++    bytes[i] = static_cast<uint8_t>(id.machine_id >> (8 * i));
++  }
++  return bytes;
++}
++
++namespace detail {
++
++inline uint64_t Mix(uint64_t& state) {
++  uint64_t z = (state += 0x9E3779B97F4A7C15ull);
++  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
++  z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
++  return z ^ (z >> 31);
++}
++
++}  // namespace detail
++
++inline Identity MakeIdentity(uint64_t seed) {
++  uint64_t state = seed;
++  Identity id{};
++  id.xuid = (uint64_t{0x0009} << 48) | (detail::Mix(state) & 0x0000FFFFFFFFFFFFull);
++  std::memcpy(id.gamertag, "Racer", 5);
++  uint64_t digits = detail::Mix(state) % 10000;
++  for (int i = 8; i >= 5; --i) {
++    id.gamertag[i] = static_cast<char>('0' + digits % 10);
++    digits /= 10;
++  }
++  const uint64_t mac_bits = detail::Mix(state);
++  id.mac[0] = 0x02;
++  for (int i = 1; i < 6; ++i) {
++    id.mac[i] = static_cast<uint8_t>(mac_bits >> (8 * (i - 1)));
++  }
++  id.machine_id = detail::Mix(state) | 1;
++  return id;
++}
++
++// Returns the 8-byte seed stored in `file`. A missing, unreadable or wrong-sized file gets a new
++// random nonzero seed, written back if possible; a failed write still returns the new seed.
++inline uint64_t LoadOrCreateSeed(const std::filesystem::path& file) {
++  std::error_code ec;
++  if (std::filesystem::file_size(file, ec) == 8 && !ec) {
++    std::ifstream in(file, std::ios::binary);
++    uint8_t bytes[8] = {};
++    if (in.read(reinterpret_cast<char*>(bytes), 8) && in.gcount() == 8) {
++      uint64_t seed = 0;
++      for (int i = 7; i >= 0; --i) {
++        seed = (seed << 8) | bytes[i];
++      }
++      if (seed != 0) {
++        return seed;
++      }
++    }
++  }
++
++  std::random_device device;
++  uint64_t seed = 0;
++  while (seed == 0) {
++    seed = (static_cast<uint64_t>(device()) << 32) | device();
++  }
++
++  std::filesystem::create_directories(file.parent_path(), ec);
++  auto temporary = file;
++  temporary += ".tmp";
++  {
++    std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
++    uint8_t bytes[8];
++    for (int i = 0; i < 8; ++i) {
++      bytes[i] = static_cast<uint8_t>(seed >> (8 * i));
++    }
++    out.write(reinterpret_cast<const char*>(bytes), 8);
++    if (!out) {
++      return seed;
++    }
++  }
++  rex::filesystem::CommitFile(temporary, file, ec);
++  return seed;
++}
++
++}  // namespace rex::system::xam::fake_live
+diff --git a/sdk/include/rex/system/xam/fesl_shim.h b/sdk/include/rex/system/xam/fesl_shim.h
+new file mode 100644
+index 0000000..508823d
+--- /dev/null
++++ b/sdk/include/rex/system/xam/fesl_shim.h
+@@ -0,0 +1,541 @@
++#pragma once
++/**
++ * Translation between the Xbox 360 build's online account protocol and the PC one.
++ *
++ * The 360 game talks the same line-based FESL frames as the PC game, but a few account
++ * transactions only exist on the 360 (for example acct GetUserIdsByXuids). A PC-only community
++ * server ignores them and the game waits for an answer that never comes. The shim sits on the
++ * game's connection to the server: frames it understands are answered locally, everything else
++ * goes through untouched.
++ *
++ * The 360 also creates and logs into its account with its own requests (XBL360AddAccount,
++ * XBL360Login). The PC server only knows AddAccount and Login, so the shim plays the PC client: it
++ * sends those, with a password only this console can derive, and hands the game the PC server's
++ * session key (lkey) and user id in the reply the game expects.
++ *
++ * Frame: 4-character command, 4-byte big-endian transaction word, 4-byte big-endian total length
++ * (header included), then "key=value\n" lines and a terminating NUL.
++ *
++ * Header-only and free of kernel dependencies so the logic can be unit-tested on the host.
++ */
++
++#include <cstddef>
++#include <cstdint>
++#include <map>
++#include <mutex>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include <rex/system/xam/udp_tunnel.h>
++
++namespace rex::system::xam::fesl {
++
++constexpr size_t kHeaderSize = 12;
++// A frame longer than this is not a FESL frame (the PC server refuses the same).
++constexpr size_t kMaxFrameSize = 65535;
++
++// One whole frame: header, the given "key=value\n" lines, and the closing NUL.
++inline std::string EncodeFrame(std::string_view command, uint32_t word, std::string_view lines) {
++  const uint32_t length = static_cast<uint32_t>(kHeaderSize + lines.size() + 1);
++  std::string frame;
++  frame.reserve(length);
++  frame.append(command.substr(0, 4));
++  frame.resize(4, ' ');
++  for (int shift = 24; shift >= 0; shift -= 8) {
++    frame.push_back(static_cast<char>((word >> shift) & 0xFF));
++  }
++  for (int shift = 24; shift >= 0; shift -= 8) {
++    frame.push_back(static_cast<char>((length >> shift) & 0xFF));
++  }
++  frame.append(lines);
++  frame.push_back('\0');
++  return frame;
++}
++
++// The user id the shim reports for an Xbox ID: stable, non-zero, and the same on every run.
++inline uint32_t LocalUserId(uint64_t xuid) {
++  return 100000000u + static_cast<uint32_t>(xuid % 800000000u);
++}
++
++// The password of the PC account this console creates: 12 characters (the PC server takes 1 to 16)
++// derived from a secret that never leaves the console. Not the Xbox ID or gamertag, which the
++// server sees and other players know.
++inline std::string AccountPassword(uint64_t secret) {
++  uint64_t z = secret + 0x9E3779B97F4A7C15ULL;
++  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
++  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
++  z ^= z >> 31;
++  static constexpr char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
++  std::string password;
++  for (int i = 0; i < 12; ++i) {
++    password.push_back(kAlphabet[(z >> (59 - 5 * i)) & 31]);
++  }
++  return password;
++}
++
++// Standard base64 (the 360 sends large requests as "size=<bytes>" plus "data=<base64>" pieces).
++// Characters outside the alphabet are skipped; decoding stops at the first '='.
++inline std::string Base64Decode(std::string_view text) {
++  std::string out;
++  uint32_t buffer = 0;
++  int bits = 0;
++  for (const char c : text) {
++    int value;
++    if (c >= 'A' && c <= 'Z') {
++      value = c - 'A';
++    } else if (c >= 'a' && c <= 'z') {
++      value = c - 'a' + 26;
++    } else if (c >= '0' && c <= '9') {
++      value = c - '0' + 52;
++    } else if (c == '+') {
++      value = 62;
++    } else if (c == '/') {
++      value = 63;
++    } else if (c == '=') {
++      break;
++    } else {
++      continue;
++    }
++    buffer = (buffer << 6) | static_cast<uint32_t>(value);
++    bits += 6;
++    if (bits >= 8) {
++      bits -= 8;
++      out.push_back(static_cast<char>((buffer >> bits) & 0xFF));
++    }
++  }
++  return out;
++}
++
++// The address the server announced for its own services in the greeting (before it is replaced by
++// the one that answers). Theater and messenger connections run in other Shim objects, so the
++// account connection's Hello records it here for the whole process.
++inline std::mutex& AnnouncedHostLock() {
++  static std::mutex lock;
++  return lock;
++}
++inline std::string& AnnouncedHostValue() {
++  static std::string host;
++  return host;
++}
++inline void SetAnnouncedHost(std::string host) {
++  std::lock_guard<std::mutex> guard(AnnouncedHostLock());
++  AnnouncedHostValue() = std::move(host);
++}
++inline std::string AnnouncedHost() {
++  std::lock_guard<std::mutex> guard(AnnouncedHostLock());
++  return AnnouncedHostValue();
++}
++
++struct Translation {
++  std::vector<uint8_t> to_server;  // bytes to send to the real server
++  std::vector<uint8_t> to_game;    // bytes to hand to the game as if the server had sent them
++};
++
++class Shim {
++ public:
++  // `service_host` is the address the server was reached at (dotted decimal). The server's greeting
++  // announces its own idea of the Theater and messenger addresses, which may not answer from here
++  // (it announced 188.27.48.18 while the name resolves to 188.27.34.215); with a host given, the
++  // greeting is rewritten to point them at the address that is known to work.
++  Shim(uint64_t own_xuid, std::string own_gamertag, uint64_t account_secret = 0,
++       std::string service_host = {})
++      : own_xuid_(own_xuid),
++        own_gamertag_(std::move(own_gamertag)),
++        password_(AccountPassword(account_secret)),
++        service_host_(std::move(service_host)) {}
++
++  // Bytes the game sent. Whole frames are handled one by one; a partial frame waits for the rest.
++  Translation FromGame(const uint8_t* data, size_t size) {
++    Translation out;
++    Pump(data, size, &game_pending_, &game_passthrough_, &out.to_server,
++         [&](const uint8_t* frame, size_t length) { HandleGameFrame(frame, length, &out); });
++    return out;
++  }
++
++  // Readable text of requests the game split over several frames (only the match request, "pnow"),
++  // for the log. Each is returned once.
++  std::vector<std::string> TakeTrace() {
++    std::vector<std::string> taken;
++    taken.swap(trace_);
++    return taken;
++  }
++
++  // Bytes the server sent. Replies to requests the shim made itself are consumed and answered to the
++  // game in its own terms; everything else reaches the game untouched.
++  Translation FromServer(const uint8_t* data, size_t size) {
++    Translation out;
++    Pump(data, size, &server_pending_, &server_passthrough_, &out.to_game,
++         [&](const uint8_t* frame, size_t length) { HandleServerFrame(frame, length, &out); });
++    return out;
++  }
++
++ private:
++  // Which of the game's requests a job serves, and where it is.
++  enum class Stage { kAdd, kLogin };
++  struct Job {
++    uint32_t game_word = 0;
++    std::string game_txn;  // XBL360AddAccount or XBL360Login
++    std::string name;      // the PC account name
++    Stage stage = Stage::kLogin;
++    std::string login_error_code;  // set when Login failed first and AddAccount is being tried
++    std::string login_error_message;
++  };
++
++  static uint32_t ReadBigEndian32(const uint8_t* bytes) {
++    return (uint32_t{bytes[0]} << 24) | (uint32_t{bytes[1]} << 16) | (uint32_t{bytes[2]} << 8) |
++           uint32_t{bytes[3]};
++  }
++
++  // Splits a byte stream into whole frames. A stream that stops looking like frames is handed on
++  // as it is (`raw`) from then on.
++  template <typename Handler>
++  static void Pump(const uint8_t* data, size_t size, std::vector<uint8_t>* pending,
++                   bool* passthrough, std::vector<uint8_t>* raw, Handler&& handle) {
++    if (*passthrough) {
++      raw->insert(raw->end(), data, data + size);
++      return;
++    }
++    pending->insert(pending->end(), data, data + size);
++    size_t offset = 0;
++    while (pending->size() - offset >= kHeaderSize) {
++      const uint8_t* head = pending->data() + offset;
++      const size_t length = ReadBigEndian32(head + 8);
++      if (length < kHeaderSize || length > kMaxFrameSize) {
++        *passthrough = true;
++        raw->insert(raw->end(), pending->begin() + offset, pending->end());
++        pending->clear();
++        return;
++      }
++      if (pending->size() - offset < length) {
++        break;
++      }
++      handle(head, length);
++      offset += length;
++    }
++    pending->erase(pending->begin(), pending->begin() + offset);
++  }
++
++  // The value of `key` in a "key=value\n" body, empty when absent.
++  static std::string_view Field(std::string_view body, std::string_view key) {
++    size_t start = 0;
++    while (start < body.size()) {
++      size_t end = body.find('\n', start);
++      if (end == std::string_view::npos) {
++        end = body.size();
++      }
++      const std::string_view line = body.substr(start, end - start);
++      if (line.size() > key.size() && line.substr(0, key.size()) == key &&
++          line[key.size()] == '=') {
++        std::string_view value = line.substr(key.size() + 1);
++        while (!value.empty() && (value.back() == '\0' || value.back() == '\r')) {
++          value.remove_suffix(1);
++        }
++        return value;
++      }
++      start = end + 1;
++    }
++    return {};
++  }
++
++  static void Append(std::vector<uint8_t>* bytes, const std::string& frame) {
++    bytes->insert(bytes->end(), frame.begin(), frame.end());
++  }
++
++  void HandleGameFrame(const uint8_t* frame, size_t length, Translation* out) {
++    const std::string_view command(reinterpret_cast<const char*>(frame), 4);
++    const std::string_view body(reinterpret_cast<const char*>(frame) + kHeaderSize,
++                                length - kHeaderSize);
++    if (command == "pnow") {
++      TraceFragment(command, ReadBigEndian32(frame + 4), body);
++    }
++    if (command == "acct") {
++      const std::string_view txn = Field(body, "TXN");
++      if (txn == "GetUserIdsByXuids") {
++        AnswerUserIdLookup(ReadBigEndian32(frame + 4), body, out);
++        return;
++      }
++      if (txn == "XBL360AddAccount" || txn == "XBL360Login") {
++        StartJob(ReadBigEndian32(frame + 4), std::string(txn), body, out);
++        return;
++      }
++    }
++    out->to_server.insert(out->to_server.end(), frame, frame + length);
++  }
++
++  // Collects the pieces of a split request; when the last one arrives, adds its decoded text (lines
++  // joined with '|') to the trace. The frames themselves are forwarded unchanged.
++  void TraceFragment(std::string_view command, uint32_t word, std::string_view body) {
++    const std::string_view data = Field(body, "data");
++    const std::string size_text(Field(body, "size"));
++    if (data.empty() || size_text.empty() || size_text.size() > 9) {
++      return;
++    }
++    Pieces& pieces = fragments_[word];
++    pieces.size = std::stoul(size_text);
++    pieces.base64.append(data);
++    if (pieces.base64.size() < pieces.size) {  // "size" counts the base64 characters
++      return;
++    }
++    std::string text = Base64Decode(pieces.base64);
++    fragments_.erase(word);
++    for (char& c : text) {
++      c = c == '\n' ? '|' : (c >= 0x20 && c < 0x7F ? c : '.');
++    }
++    if (text.size() > 6000) {
++      text.resize(6000);
++    }
++    trace_.push_back(std::string(command) + " request (" + std::to_string(text.size()) + " chars): " + text);
++  }
++
++  void HandleServerFrame(const uint8_t* frame, size_t length, Translation* out) {
++    const std::string_view command(reinterpret_cast<const char*>(frame), 4);
++    if (command == "EGEG") {
++      // The entry reply carries the key of the game's UDP tunnel: the socket layer needs it to split
++      // the 360's bundled packets (udp_tunnel.h). Each entry starts a fresh tunnel.
++      const std::string_view entry_body(reinterpret_cast<const char*>(frame) + kHeaderSize,
++                                        length - kHeaderSize);
++      const std::string_view key = Field(entry_body, "EKEY");
++      if (!key.empty()) {
++        std::string_view port_text = Field(entry_body, "INT-PORT");
++        if (port_text.empty()) {
++          port_text = Field(entry_body, "P");
++        }
++        uint16_t port = 0;
++        if (!port_text.empty() && port_text.size() <= 5) {
++          const unsigned long value = std::stoul(std::string(port_text));
++          port = value > 0 && value <= 65535 ? static_cast<uint16_t>(value) : 0;
++        }
++        tunnel::GlobalTunnel().Begin(std::string(key), port);
++      }
++    }
++    if (command == "fsys" && !service_host_.empty()) {
++      const std::string_view hello_body(reinterpret_cast<const char*>(frame) + kHeaderSize,
++                                        length - kHeaderSize);
++      if (Field(hello_body, "TXN") == "Hello") {
++        Append(&out->to_game, RewriteHello(ReadBigEndian32(frame + 4), hello_body));
++        return;
++      }
++    }
++    if (command != "acct" && command != "fsys" && !service_host_.empty()) {
++      // Theater and messenger replies name the server's game address (I=, INT-IP=) the same way
++      // the greeting does. Values equal to the announced address become the reachable one; any
++      // other value (another player's address, say) is left alone.
++      const std::string announced = AnnouncedHost();
++      const std::string_view theater_body(reinterpret_cast<const char*>(frame) + kHeaderSize,
++                                          length - kHeaderSize);
++      if (!announced.empty() && theater_body.find(announced) != std::string_view::npos) {
++        const std::string rewritten =
++            ReplaceValues(command, ReadBigEndian32(frame + 4), theater_body, announced);
++        if (!rewritten.empty()) {
++          Append(&out->to_game, rewritten);
++          return;
++        }
++      }
++    }
++    const auto found = pending_.find(ReadBigEndian32(frame + 4));
++    if (command != "acct" || found == pending_.end()) {
++      out->to_game.insert(out->to_game.end(), frame, frame + length);
++      return;
++    }
++    const std::string_view body(reinterpret_cast<const char*>(frame) + kHeaderSize,
++                                length - kHeaderSize);
++    Job job = std::move(found->second);
++    pending_.erase(found);
++    Continue(std::move(job), body, out);
++  }
++
++  // The frame with every "key=<announced>" line changed to "key=<service_host_>", or an empty string
++  // when no line has exactly that value (the caller then forwards the original bytes untouched).
++  std::string ReplaceValues(std::string_view command, uint32_t word, std::string_view body,
++                            const std::string& announced) const {
++    std::string lines;
++    bool changed = false;
++    size_t start = 0;
++    while (start < body.size()) {
++      size_t end = body.find('\n', start);
++      if (end == std::string_view::npos) {
++        end = body.size();
++      }
++      std::string_view line = body.substr(start, end - start);
++      while (!line.empty() && (line.back() == '\0' || line.back() == '\r')) {
++        line.remove_suffix(1);
++      }
++      const size_t equals = line.find('=');
++      if (equals != std::string_view::npos && line.substr(equals + 1) == announced) {
++        lines += std::string(line.substr(0, equals + 1)) + service_host_ + "\n";
++        changed = true;
++      } else if (!line.empty()) {
++        lines += std::string(line) + "\n";
++      }
++      start = end + 1;
++    }
++    return changed ? EncodeFrame(command, word, lines) : std::string();
++  }
++
++  // The greeting with theaterIp and messengerIp replaced by the address that is known to answer;
++  // every other line, and the transaction word, stay as the server sent them.
++  std::string RewriteHello(uint32_t word, std::string_view body) const {
++    std::string lines;
++    size_t start = 0;
++    while (start < body.size()) {
++      size_t end = body.find('\n', start);
++      if (end == std::string_view::npos) {
++        end = body.size();
++      }
++      std::string_view line = body.substr(start, end - start);
++      while (!line.empty() && (line.back() == '\0' || line.back() == '\r')) {
++        line.remove_suffix(1);
++      }
++      if (line.substr(0, 10) == "theaterIp=") {
++        if (line.size() > 10 && line.substr(10) != service_host_) {
++          SetAnnouncedHost(std::string(line.substr(10)));  // Theater's other traffic names it too
++        }
++        lines += "theaterIp=" + service_host_ + "\n";
++      } else if (line.substr(0, 12) == "messengerIp=") {
++        lines += "messengerIp=" + service_host_ + "\n";
++      } else if (!line.empty()) {
++        lines += std::string(line) + "\n";
++      }
++      start = end + 1;
++    }
++    return EncodeFrame("fsys", word, lines);
++  }
++
++  void StartJob(uint32_t game_word, std::string game_txn, std::string_view body, Translation* out) {
++    Job job;
++    job.game_word = game_word;
++    job.game_txn = std::move(game_txn);
++    std::string name(Field(body, "gamertag"));
++    if (name.empty()) {
++      name = own_gamertag_;
++    }
++    if (name.size() > 32) {
++      name.resize(32);
++    }
++    job.name = std::move(name);
++    if (job.game_txn == "XBL360AddAccount") {
++      SendAdd(std::move(job), out);
++    } else {
++      SendLogin(std::move(job), out);
++    }
++  }
++
++  void SendAdd(Job job, Translation* out) {
++    job.stage = Stage::kAdd;
++    const uint32_t word = next_word_++;
++    Append(&out->to_server,
++           EncodeFrame("acct", word,
++                       "TXN=AddAccount\nname=" + job.name + "\npassword=" + password_ + "\n"));
++    pending_.emplace(word, std::move(job));
++  }
++
++  void SendLogin(Job job, Translation* out) {
++    job.stage = Stage::kLogin;
++    const uint32_t word = next_word_++;
++    Append(&out->to_server,
++           EncodeFrame("acct", word,
++                       "TXN=Login\nname=" + job.name + "\npassword=" + password_ + "\n"));
++    pending_.emplace(word, std::move(job));
++  }
++
++  // The PC server answered one of the shim's own requests.
++  void Continue(Job job, std::string_view body, Translation* out) {
++    const std::string error(Field(body, "errorCode"));
++    const std::string message(Field(body, "localizedMessage"));
++    if (job.stage == Stage::kAdd) {
++      if (error.empty() || error == "160") {
++        if (!job.login_error_code.empty() && error == "160") {
++          // Login refused us and the name is taken: it belongs to someone else.
++          ReplyError(job, job.login_error_code, job.login_error_message, out);
++          return;
++        }
++        SendLogin(std::move(job), out);  // created, or already ours: the login decides
++        return;
++      }
++      ReplyError(job, error, message, out);
++      return;
++    }
++    if (error.empty() && !Field(body, "lkey").empty()) {
++      std::string lines = "TXN=" + job.game_txn + "\n";
++      for (const char* key : {"lkey", "name", "profileId", "userId", "displayName"}) {
++        const std::string_view value = Field(body, key);
++        if (!value.empty()) {
++          lines += std::string(key) + "=" + std::string(value) + "\n";
++        }
++      }
++      Append(&out->to_game, EncodeFrame("acct", job.game_word, lines));
++      return;
++    }
++    if (job.game_txn == "XBL360Login" && job.login_error_code.empty()) {
++      // Probably no account yet: create it once, then log in again.
++      job.login_error_code = error.empty() ? "101" : error;
++      job.login_error_message = message;
++      SendAdd(std::move(job), out);
++      return;
++    }
++    ReplyError(job, error.empty() ? "101" : error, message, out);
++  }
++
++  void ReplyError(const Job& job, const std::string& code, const std::string& message,
++                  Translation* out) {
++    std::string lines = "TXN=" + job.game_txn + "\n";
++    if (!message.empty()) {
++      lines += "localizedMessage=" + message + "\n";
++    }
++    lines += "errorCode=" + code + "\nerrorContainer.[]=0\n";
++    Append(&out->to_game, EncodeFrame("acct", job.game_word, lines));
++  }
++
++  // The 360 asks which user id belongs to each Xbox ID. The reply lists every requested ID under the
++  // key shapes the game's account code reads.
++  void AnswerUserIdLookup(uint32_t word, std::string_view body, Translation* out) {
++    std::vector<std::string> xuids;
++    const std::string count_text(Field(body, "xuids.[]"));
++    const size_t count = count_text.empty() ? 0 : static_cast<size_t>(std::stoul(count_text));
++    for (size_t i = 0; i < count && i < 64; ++i) {
++      const std::string_view value = Field(body, "xuids." + std::to_string(i));
++      if (!value.empty()) {
++        xuids.emplace_back(value);
++      }
++    }
++    // The game's account manager reads userIds.{<own xuid>}.userId (any int64 above zero) and goes
++    // on to XBL360Login on a hit; without it, it shows the terms and creates an account. Always
++    // answering with a hit lets the PC Login decide: an unknown account fails there and the game
++    // falls back to creating one itself.
++    std::string lines = "TXN=GetUserIdsByXuids\n";
++    lines += "userIds.[]=" + std::to_string(xuids.size()) + "\n";
++    lines += "userInfo.[]=" + std::to_string(xuids.size()) + "\n";
++    for (size_t i = 0; i < xuids.size(); ++i) {
++      const uint64_t xuid = std::stoull(xuids[i]);
++      const std::string user_id = std::to_string(LocalUserId(xuid));
++      const std::string index = std::to_string(i);
++      lines += "userIds.{" + xuids[i] + "}.userId=" + user_id + "\n";
++      lines += "userInfo." + index + ".xuid=" + xuids[i] + "\n";
++      lines += "userInfo." + index + ".userId=" + user_id + "\n";
++      lines += "userInfo." + index + ".userName=" +
++               (xuid == own_xuid_ ? own_gamertag_ : std::string("Player")) + "\n";
++    }
++    Append(&out->to_game, EncodeFrame("acct", word, lines));
++  }
++
++  uint64_t own_xuid_;
++  std::string own_gamertag_;
++  std::string password_;
++  std::string service_host_;
++  std::vector<uint8_t> game_pending_;
++  std::vector<uint8_t> server_pending_;
++  bool game_passthrough_ = false;
++  bool server_passthrough_ = false;
++  struct Pieces {
++    size_t size = 0;
++    std::string base64;
++  };
++  std::map<uint32_t, Pieces> fragments_;  // split requests being collected, by frame word
++  std::vector<std::string> trace_;
++  std::map<uint32_t, Job> pending_;  // requests the shim made, by the word it used
++  uint32_t next_word_ = 0x80000100;
++};
++
++}  // namespace rex::system::xam::fesl
+diff --git a/sdk/include/rex/system/xam/overlapped_recv.h b/sdk/include/rex/system/xam/overlapped_recv.h
+new file mode 100644
+index 0000000..3de7758
+--- /dev/null
++++ b/sdk/include/rex/system/xam/overlapped_recv.h
+@@ -0,0 +1,115 @@
++#pragma once
++/**
++ * Overlapped UDP receives for the 360 game's socket layer (DirtySDK).
++ *
++ * The game does not call recvfrom on its UDP sockets. It posts WSARecvFrom with an OVERLAPPED
++ * structure, expects "pending" (WSA_IO_PENDING, 997) when nothing has arrived, then waits on the
++ * overlapped's event and collects the result with WSAGetOverlappedResult. Its socket thread posts a
++ * new receive only while its "bytes received" field is zero, so a plain "would block" error would
++ * leave that field set and the socket would never be read again.
++ *
++ * This table remembers the receives the game posted until they complete and are collected. All
++ * addresses are guest addresses. Header-only and free of kernel dependencies so it can be unit-tested
++ * on the host.
++ */
++
++#include <algorithm>
++#include <cstdint>
++#include <mutex>
++#include <vector>
++
++namespace rex::system::xam::overlapped {
++
++struct PendingReceive {
++  uint32_t socket = 0;      // the guest's socket handle
++  uint32_t buffer = 0;      // where the datagram goes
++  uint32_t length = 0;      // size of that buffer
++  uint32_t from = 0;        // sockaddr_in the sender is written to (0 = none)
++  uint32_t from_length = 0; // pointer to its size (0 = none)
++  uint32_t overlapped = 0;  // the game's OVERLAPPED, the key
++  uint32_t event = 0;       // event handle to signal when the datagram arrives (0 = none)
++  bool done = false;
++  uint32_t bytes = 0;
++};
++
++class PendingReceiveTable {
++ public:
++  // The same OVERLAPPED posted again replaces the earlier receive.
++  void Add(const PendingReceive& receive) {
++    std::lock_guard<std::mutex> guard(lock_);
++    for (PendingReceive& existing : receives_) {
++      if (existing.overlapped == receive.overlapped) {
++        existing = receive;
++        return;
++      }
++    }
++    receives_.push_back(receive);
++  }
++
++  // Receives still waiting for a datagram (completed ones are not polled again).
++  std::vector<PendingReceive> Active() const {
++    std::lock_guard<std::mutex> guard(lock_);
++    std::vector<PendingReceive> active;
++    for (const PendingReceive& receive : receives_) {
++      if (!receive.done) {
++        active.push_back(receive);
++      }
++    }
++    return active;
++  }
++
++  bool HasActive() const {
++    std::lock_guard<std::mutex> guard(lock_);
++    return std::any_of(receives_.begin(), receives_.end(),
++                       [](const PendingReceive& receive) { return !receive.done; });
++  }
++
++  // True from the post until the game collects the result (or the socket is cancelled).
++  bool IsPending(uint32_t overlapped) const {
++    std::lock_guard<std::mutex> guard(lock_);
++    return std::any_of(receives_.begin(), receives_.end(), [&](const PendingReceive& receive) {
++      return receive.overlapped == overlapped;
++    });
++  }
++
++  // A datagram of `bytes` arrived for this receive.
++  void Complete(uint32_t overlapped, uint32_t bytes) {
++    std::lock_guard<std::mutex> guard(lock_);
++    for (PendingReceive& receive : receives_) {
++      if (receive.overlapped == overlapped && !receive.done) {
++        receive.done = true;
++        receive.bytes = bytes;
++        return;
++      }
++    }
++  }
++
++  // The game asks for the result: only a completed receive is handed over, once.
++  bool Collect(uint32_t overlapped, uint32_t* bytes) {
++    std::lock_guard<std::mutex> guard(lock_);
++    for (auto it = receives_.begin(); it != receives_.end(); ++it) {
++      if (it->overlapped == overlapped && it->done) {
++        *bytes = it->bytes;
++        receives_.erase(it);
++        return true;
++      }
++    }
++    return false;
++  }
++
++  // WSACancelOverlappedIO: forget everything posted on this socket.
++  void CancelSocket(uint32_t socket) {
++    std::lock_guard<std::mutex> guard(lock_);
++    receives_.erase(std::remove_if(receives_.begin(), receives_.end(),
++                                   [&](const PendingReceive& receive) {
++                                     return receive.socket == socket;
++                                   }),
++                    receives_.end());
++  }
++
++ private:
++  mutable std::mutex lock_;
++  std::vector<PendingReceive> receives_;
++};
++
++}  // namespace rex::system::xam::overlapped
+diff --git a/sdk/include/rex/system/xam/udp_tunnel.h b/sdk/include/rex/system/xam/udp_tunnel.h
+new file mode 100644
+index 0000000..7a2d10b
+--- /dev/null
++++ b/sdk/include/rex/system/xam/udp_tunnel.h
+@@ -0,0 +1,455 @@
++#pragma once
++/**
++ * The game's UDP tunnel datagrams (DirtySDK ProtoTunnel) in the encrypted mode the PC server uses, and the
++ * one translation the 360 needs on the way out.
++ *
++ * Datagram: be16 prefix, then a table of 2 bytes per virtual packet (length 12 bits, channel 4 bits) and
++ * the packets' bodies. Everything on the channels 1, 2 and 7 (table included) is RC4-encrypted with the
++ * game's key (EGEG's EKEY); the prefix is the position in that RC4 stream in 4-byte words (the table starts
++ * at prefix * 4, each encrypted body follows the previous one). Other channels travel in clear and do not
++ * use the stream.
++ *
++ * Channel 1 carries CommUDP "active" packets: be32 [n:4 | sequence:28], be32 ack, then the newest record,
++ * then n older records each followed by its length byte (newest first). The PC server only accepts a
++ * packet that holds a single record, but the 360 bundles history into each one, so its ticket arrives as
++ * the second record of a packet and is dropped silently. ClientNormalizer splits the bundle back into one
++ * packet per record, oldest first, keeping every record's own sequence number.
++ *
++ * Header-only and free of kernel dependencies so it can be unit-tested on the host.
++ */
++
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <mutex>
++#include <optional>
++#include <set>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace rex::system::xam::tunnel {
++
++constexpr size_t kMaxDatagram = 1000;  // the server refuses anything longer
++constexpr size_t kMaxPackets = 9;      // and a table with more entries
++
++// `count` bytes of the RC4 keystream of `key`, after skipping `skip` bytes.
++inline std::vector<uint8_t> Rc4Keystream(std::string_view key, size_t skip, size_t count) {
++  uint8_t state[256];
++  for (int i = 0; i < 256; ++i) {
++    state[i] = static_cast<uint8_t>(i);
++  }
++  uint8_t j = 0;
++  for (int i = 0; i < 256; ++i) {
++    j = static_cast<uint8_t>(j + state[i] + static_cast<uint8_t>(key[static_cast<size_t>(i) % key.size()]));
++    const uint8_t swap = state[i];
++    state[i] = state[j];
++    state[j] = swap;
++  }
++  std::vector<uint8_t> out;
++  out.reserve(count);
++  uint8_t a = 0;
++  uint8_t b = 0;
++  for (size_t produced = 0; produced < skip + count; ++produced) {
++    a = static_cast<uint8_t>(a + 1);
++    b = static_cast<uint8_t>(b + state[a]);
++    const uint8_t swap = state[a];
++    state[a] = state[b];
++    state[b] = swap;
++    if (produced >= skip) {
++      out.push_back(state[static_cast<uint8_t>(state[a] + state[b])]);
++    }
++  }
++  return out;
++}
++
++struct Packet {
++  uint8_t channel = 0;
++  std::vector<uint8_t> body;
++};
++
++struct Datagram {
++  uint16_t prefix = 0;
++  std::vector<Packet> packets;
++};
++
++inline bool IsEncryptedChannel(uint8_t channel) {
++  return channel == 1 || channel == 2 || channel == 7;
++}
++
++// Decodes a datagram as the server does: tries table sizes 1 to 9 until the lengths add up exactly.
++inline bool Decode(const uint8_t* data, size_t size, std::string_view key, Datagram* out) {
++  if (size < 4 || size > kMaxDatagram) {
++    return false;
++  }
++  const uint16_t prefix = static_cast<uint16_t>((data[0] << 8) | data[1]);
++  const std::vector<uint8_t> stream = Rc4Keystream(key, static_cast<size_t>(prefix) * 4, size - 2);
++  for (size_t count = 1; count <= kMaxPackets && 2 + 2 * count <= size; ++count) {
++    std::vector<size_t> lengths;
++    std::vector<uint8_t> channels;
++    size_t total = 0;
++    bool valid = true;
++    for (size_t i = 0; i < count; ++i) {
++      const uint8_t high = data[2 + 2 * i] ^ stream[2 * i];
++      const uint8_t low = data[3 + 2 * i] ^ stream[2 * i + 1];
++      const size_t length = (static_cast<size_t>(high) << 4) | (low >> 4);
++      if (length == 0) {
++        valid = false;
++        break;
++      }
++      lengths.push_back(length);
++      channels.push_back(low & 0x0F);
++      total += length;
++    }
++    if (!valid || 2 + 2 * count + total != size) {
++      continue;
++    }
++    Datagram datagram;
++    datagram.prefix = prefix;
++    size_t position = 2 + 2 * count;
++    size_t used = 2 * count;  // keystream bytes consumed so far
++    for (size_t i = 0; i < count; ++i) {
++      Packet packet;
++      packet.channel = channels[i];
++      packet.body.assign(data + position, data + position + lengths[i]);
++      if (IsEncryptedChannel(packet.channel)) {
++        for (size_t k = 0; k < lengths[i]; ++k) {
++          packet.body[k] ^= stream[used + k];
++        }
++        used += lengths[i];
++      }
++      position += lengths[i];
++      datagram.packets.push_back(std::move(packet));
++    }
++    *out = std::move(datagram);
++    return true;
++  }
++  return false;
++}
++
++inline std::vector<uint8_t> Encode(const Datagram& datagram, std::string_view key) {
++  const size_t count = datagram.packets.size();
++  size_t encrypted = 2 * count;
++  for (const Packet& packet : datagram.packets) {
++    if (IsEncryptedChannel(packet.channel)) {
++      encrypted += packet.body.size();
++    }
++  }
++  const std::vector<uint8_t> stream = Rc4Keystream(key, static_cast<size_t>(datagram.prefix) * 4, encrypted);
++  std::vector<uint8_t> wire;
++  wire.push_back(static_cast<uint8_t>(datagram.prefix >> 8));
++  wire.push_back(static_cast<uint8_t>(datagram.prefix));
++  size_t used = 0;
++  for (const Packet& packet : datagram.packets) {
++    const size_t length = packet.body.size();
++    wire.push_back(static_cast<uint8_t>((length >> 4) ^ stream[used]));
++    wire.push_back(static_cast<uint8_t>((((length & 0x0F) << 4) | packet.channel) ^ stream[used + 1]));
++    used += 2;
++  }
++  for (const Packet& packet : datagram.packets) {
++    for (const uint8_t byte : packet.body) {
++      wire.push_back(IsEncryptedChannel(packet.channel) ? static_cast<uint8_t>(byte ^ stream[used++]) : byte);
++    }
++  }
++  return wire;
++}
++
++class ClientNormalizer {
++ public:
++  explicit ClientNormalizer(std::string key) : key_(std::move(key)) {}
++
++  // The datagram rewritten with every bundled CommUDP packet split into single records, or nothing when
++  // there is nothing to split (or it is not a datagram), in which case it is sent as it is.
++  std::optional<std::vector<uint8_t>> Normalize(const uint8_t* data, size_t size) {
++    Datagram in;
++    if (!Decode(data, size, key_, &in)) {
++      return std::nullopt;
++    }
++    Datagram out;
++    out.prefix = in.prefix;
++    bool changed = false;
++    for (Packet& packet : in.packets) {
++      std::vector<Packet> records;
++      if (packet.channel == 1 && packet.body.size() > 8 && (packet.body[0] >> 4) != 0 &&
++          Split(packet.body, &records)) {
++        changed = true;
++        for (Packet& record : records) {
++          out.packets.push_back(std::move(record));
++        }
++      } else {
++        out.packets.push_back(std::move(packet));
++      }
++    }
++    if (!changed || out.packets.size() > kMaxPackets) {
++      return std::nullopt;
++    }
++    std::vector<uint8_t> wire = Encode(out, key_);
++    if (wire.size() > kMaxDatagram) {
++      return std::nullopt;
++    }
++    return wire;
++  }
++
++ private:
++  static uint32_t ReadBigEndian32(const uint8_t* bytes) {
++    return (uint32_t{bytes[0]} << 24) | (uint32_t{bytes[1]} << 16) | (uint32_t{bytes[2]} << 8) |
++           uint32_t{bytes[3]};
++  }
++
++  // One packet per record, oldest first: records the server has already been given are skipped, but
++  // the newest is always sent (the game retransmits it until it is acknowledged).
++  bool Split(const std::vector<uint8_t>& body, std::vector<Packet>* out) {
++    const uint32_t header = ReadBigEndian32(body.data());
++    const size_t older = header >> 28;
++    const int64_t latest = header & 0x0FFFFFFF;
++    size_t position = body.size();
++    std::vector<std::vector<uint8_t>> popped;  // the oldest record comes off the end first
++    for (size_t i = 0; i < older; ++i) {
++      if (position < 8 + 2) {
++        return false;
++      }
++      const size_t length = body[position - 1];
++      if (length == 0 || position < 8 + 1 + length + 1) {
++        return false;
++      }
++      popped.emplace_back(body.begin() + (position - 1 - length), body.begin() + (position - 1));
++      position -= length + 1;
++    }
++    if (position <= 8) {
++      return false;
++    }
++    const auto make = [&](int64_t sequence, const uint8_t* begin, const uint8_t* end) {
++      Packet packet;
++      packet.channel = 1;
++      const uint32_t value = static_cast<uint32_t>(sequence) & 0x0FFFFFFF;
++      for (int shift = 24; shift >= 0; shift -= 8) {
++        packet.body.push_back(static_cast<uint8_t>(value >> shift));
++      }
++      packet.body.insert(packet.body.end(), body.begin() + 4, body.begin() + 8);  // the ack
++      packet.body.insert(packet.body.end(), begin, end);
++      return packet;
++    };
++    for (size_t i = 0; i < popped.size(); ++i) {
++      const int64_t sequence = latest - static_cast<int64_t>(older - i);
++      if (sequence >= 0 && sequence > last_forwarded_) {
++        out->push_back(make(sequence, popped[i].data(), popped[i].data() + popped[i].size()));
++      }
++    }
++    out->push_back(make(latest, body.data() + 8, body.data() + position));
++    if (latest > last_forwarded_) {
++      last_forwarded_ = latest;
++    }
++    return true;
++  }
++
++  std::string key_;
++  int64_t last_forwarded_ = -1;
++};
++
++// The server sends many of its records once (latency reports, state messages) and numbers them in one
++// sequence the game must receive in order. Over a lossy path one lost record leaves a hole the server never
++// refills, the game's acknowledgement stops there and the session times out. When a hole has stayed open
++// for `hold_ms` (long enough for the server's own retransmissions of the records it does repeat), this
++// answers with an empty record carrying the missing number, which is what the server sends as an
++// acknowledgement, so the game moves on.
++class ServerGapHealer {
++ public:
++  struct Fill {
++    std::vector<uint8_t> wire;       // the datagram to hand to the game
++    std::vector<uint32_t> sequences;  // the numbers it fills
++  };
++
++  explicit ServerGapHealer(std::string key, int64_t hold_ms = 2000)
++      : key_(std::move(key)), hold_ms_(hold_ms) {}
++
++  void Observe(const Datagram& datagram, int64_t now_ms) {
++    last_prefix_ = datagram.prefix;
++    for (const Packet& packet : datagram.packets) {
++      if (packet.channel != 1 || packet.body.size() <= 8) {
++        continue;
++      }
++      const uint32_t header = ReadBigEndian32(packet.body.data());
++      const uint32_t older = header >> 28;
++      const uint32_t sequence = header & 0x0FFFFFFF;
++      last_ack_ = ReadBigEndian32(packet.body.data() + 4);
++      if (packet.body.size() == 21 && packet.body.back() == 0x40) {
++        footer_.assign(packet.body.begin() + 8, packet.body.begin() + 20);
++      }
++      for (uint32_t k = 0; k <= older && k <= sequence; ++k) {
++        Mark(sequence - k, now_ms);
++      }
++    }
++  }
++
++  std::optional<Fill> Heal(int64_t now_ms) {
++    if (!started_ || above_.empty() || now_ms - blocked_since_ms_ < hold_ms_) {
++      return std::nullopt;
++    }
++    Fill fill;
++    Datagram datagram;
++    datagram.prefix = last_prefix_;
++    const uint32_t newest = *above_.rbegin();
++    for (uint32_t s = contiguous_ + 1; s < newest && fill.sequences.size() < kMaxPackets; ++s) {
++      if (above_.count(s)) {
++        continue;
++      }
++      Packet packet;
++      packet.channel = 1;
++      AppendBigEndian32(&packet.body, s);
++      AppendBigEndian32(&packet.body, last_ack_);
++      if (footer_.size() == 12) {
++        packet.body.insert(packet.body.end(), footer_.begin(), footer_.end());
++      } else {
++        packet.body.insert(packet.body.end(), 12, 0);
++      }
++      packet.body.push_back(0x40);
++      datagram.packets.push_back(std::move(packet));
++      fill.sequences.push_back(s);
++    }
++    if (fill.sequences.empty()) {
++      return std::nullopt;
++    }
++    for (const uint32_t s : fill.sequences) {
++      Mark(s, now_ms);
++    }
++    fill.wire = Encode(datagram, key_);
++    return fill;
++  }
++
++ private:
++  static uint32_t ReadBigEndian32(const uint8_t* bytes) {
++    return (uint32_t{bytes[0]} << 24) | (uint32_t{bytes[1]} << 16) | (uint32_t{bytes[2]} << 8) |
++           uint32_t{bytes[3]};
++  }
++  static void AppendBigEndian32(std::vector<uint8_t>* out, uint32_t value) {
++    for (int shift = 24; shift >= 0; shift -= 8) {
++      out->push_back(static_cast<uint8_t>(value >> shift));
++    }
++  }
++
++  void Mark(uint32_t sequence, int64_t now_ms) {
++    if (!started_) {
++      started_ = true;
++      contiguous_ = sequence ? sequence - 1 : 0;
++    }
++    if (sequence <= contiguous_) {
++      return;
++    }
++    above_.insert(sequence);
++    bool advanced = false;
++    while (!above_.empty() && *above_.begin() == contiguous_ + 1) {
++      above_.erase(above_.begin());
++      ++contiguous_;
++      advanced = true;
++    }
++    if (above_.empty()) {
++      was_blocked_ = false;
++      return;
++    }
++    if (advanced || !was_blocked_) {
++      blocked_since_ms_ = now_ms;
++    }
++    was_blocked_ = true;
++  }
++
++  std::string key_;
++  int64_t hold_ms_;
++  bool started_ = false;
++  bool was_blocked_ = false;
++  uint32_t contiguous_ = 0;      // every sequence up to this one has been seen
++  std::set<uint32_t> above_;      // seen beyond a hole
++  int64_t blocked_since_ms_ = -1;
++  uint16_t last_prefix_ = 0;
++  uint32_t last_ack_ = 0;
++  std::vector<uint8_t> footer_;
++};
++
++// The tunnel of the game the process is in: the key arrives with the Theater entry reply (EGEG), the
++// datagrams leave from the socket layer, which are different parts of the program.
++class TunnelState {
++ public:
++  // `server_port` is the UDP port the server's reply names for the game (0 = not stated).
++  void Begin(std::string key, uint16_t server_port = 0) {
++    std::lock_guard<std::mutex> guard(lock_);
++    key_ = key;
++    healer_.emplace(key);
++    normalizer_.emplace(std::move(key));
++    next_server_word_.reset();
++    server_port_ = server_port;
++  }
++
++  // Where the server's UDP socket listens, or 0 when no game has been entered. The first reply to the
++  // game can come from another port (a router or relay in front of the server rewrote it); the game
++  // then sends everything there, which may never reach the server, so the sender uses this port.
++  uint16_t ServerPort() {
++    std::lock_guard<std::mutex> guard(lock_);
++    return server_port_;
++  }
++
++  std::optional<std::vector<uint8_t>> Normalize(const uint8_t* data, size_t size) {
++    std::lock_guard<std::mutex> guard(lock_);
++    if (!normalizer_) {
++      return std::nullopt;
++    }
++    return normalizer_->Normalize(data, size);
++  }
++
++  // Called for each datagram the game receives. The server numbers its datagrams by the position in the
++  // keystream they use, so a datagram that never arrived leaves a hole: this returns how many 4-byte
++  // words of keystream lie between the end of the last new datagram and the start of this one (0 for the
++  // next one in line, and for a repeat of an older datagram).
++  size_t ObserveFromServer(const uint8_t* data, size_t size, int64_t now_ms = NowMs()) {
++    std::lock_guard<std::mutex> guard(lock_);
++    Datagram datagram;
++    if (!key_ || !Decode(data, size, *key_, &datagram)) {
++      return 0;
++    }
++    if (healer_) {
++      healer_->Observe(datagram, now_ms);
++    }
++    size_t bytes = 2 * datagram.packets.size();
++    for (const Packet& packet : datagram.packets) {
++      if (IsEncryptedChannel(packet.channel)) {
++        bytes += packet.body.size();
++      }
++    }
++    const uint32_t words = static_cast<uint32_t>((bytes + 3) / 4);
++    if (!next_server_word_) {
++      next_server_word_ = (datagram.prefix + words) & 0xFFFF;
++      return 0;
++    }
++    const uint32_t ahead = (datagram.prefix - *next_server_word_) & 0xFFFF;
++    if (ahead >= 0x8000) {
++      return 0;  // behind what was seen already: the server repeating a datagram
++    }
++    next_server_word_ = (datagram.prefix + words) & 0xFFFF;
++    return ahead;
++  }
++
++  // Records the server never refilled, as a datagram of empty ones for the game (see ServerGapHealer).
++  std::optional<ServerGapHealer::Fill> TakeHeal(int64_t now_ms = NowMs()) {
++    std::lock_guard<std::mutex> guard(lock_);
++    return healer_ ? healer_->Heal(now_ms) : std::nullopt;
++  }
++
++  static int64_t NowMs() {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(
++               std::chrono::steady_clock::now().time_since_epoch())
++        .count();
++  }
++
++ private:
++  std::mutex lock_;
++  std::optional<ClientNormalizer> normalizer_;
++  std::optional<ServerGapHealer> healer_;
++  std::optional<std::string> key_;
++  std::optional<uint32_t> next_server_word_;
++  uint16_t server_port_ = 0;
++};
++
++inline TunnelState& GlobalTunnel() {
++  static TunnelState state;
++  return state;
++}
++
++}  // namespace rex::system::xam::tunnel
+diff --git a/sdk/include/rex/system/xam/user_profile.h b/sdk/include/rex/system/xam/user_profile.h
+index ec37017..fe12c46 100644
+--- a/sdk/include/rex/system/xam/user_profile.h
++++ b/sdk/include/rex/system/xam/user_profile.h
+@@ -20,6 +20,7 @@
+ 
+ #include <rex/memory.h>
+ #include <rex/stream.h>
++#include <rex/system/xam/fake_live.h>
+ #include <rex/system/xtypes.h>
+ 
+ namespace rex::system {
+@@ -216,11 +217,25 @@ class UserProfile {
+ 
+   UserProfile();
+ 
++  // The offline identity. Saves and per-profile settings are stored under it, so it never changes.
+   uint64_t xuid() const { return xuid_; }
+   std::string name() const { return name_; }
+-  uint32_t signin_state() const { return 1; }
++  // What the game is told through the Xam user calls: the fake Live identity when it is on.
++  uint64_t online_xuid() const { return fake_live_ ? fake_identity_.xuid : xuid_; }
++  std::string online_name() const { return fake_live_ ? fake_identity_.gamertag : name_; }
++  uint32_t signin_state() const { return fake_live::SigninState(fake_live_); }
+   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
+ 
++  // When the online_fake_live setting is on, makes up an identity stored under `user_data_root`,
++  // reports it through online_xuid()/online_name() and reports the profile as signed in to Live.
++  // xuid() and name() are left alone so existing saves stay where they are.
++  void MaybeEnableFakeLive(const std::filesystem::path& user_data_root);
++  bool fake_live() const { return fake_live_; }
++  const fake_live::Identity& fake_identity() const { return fake_identity_; }
++  // A random secret kept on this console only (online_account.bin), unrelated to the identity above
++  // so nothing the server or other players see reveals it. The PC account password comes from it.
++  uint64_t fake_account_secret() const { return fake_account_secret_; }
++
+   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
+ 
+   void AddSetting(std::unique_ptr<Setting> setting);
+@@ -229,6 +244,9 @@ class UserProfile {
+  private:
+   uint64_t xuid_;
+   std::string name_;
++  bool fake_live_ = false;
++  fake_live::Identity fake_identity_{};
++  uint64_t fake_account_secret_ = 0;
+   std::vector<std::unique_ptr<Setting>> setting_list_;
+   std::unordered_map<uint32_t, Setting*> settings_;
+   KernelState* kernel_state_ = nullptr;
+diff --git a/sdk/include/rex/system/xam/xlive_async.h b/sdk/include/rex/system/xam/xlive_async.h
+new file mode 100644
+index 0000000..da81337
+--- /dev/null
++++ b/sdk/include/rex/system/xam/xlive_async.h
+@@ -0,0 +1,51 @@
++#pragma once
++/**
++ * Asynchronous Xbox Live tasks the title starts through XMsgStartIORequest on the XLiveBase app
++ * (0xFC). The message id is 0x50000 | a schema index that depends on the SDK the title was built
++ * with, so the id alone does not say which Xbox Live function it is. The buffer the title passes
++ * is a 0x28-byte message whose first word points to a 0x4C-byte task, and the task's `ordinal`
++ * names the function (for example 0x0A03 XUserFindUsers, 0x0604 XAccountGetUserInfo).
++ *
++ *   task +0x00 ordinal            +0x18 marshalled request pointer   +0x2C results pointer
++ *   task +0x1C request size       +0x30 results size                 (all big-endian words)
++ *
++ * Layout from the public xenia-canary netplay fork (xnet.h, XLIVE_ASYNC_TASK) and confirmed
++ * against the game: it stores the request size at task +0x1C before it starts the request.
++ *
++ * Pure functions only, no kernel state, so tests/fake_live_test.cpp can compile it on its own.
++ */
++
++#include <cstddef>
++#include <cstdint>
++
++namespace rex::system::xam::xlive_async {
++
++constexpr size_t kTaskSize = 0x4C;
++constexpr size_t kMessageSize = 0x28;
++
++// 0x5xxxx with bit 0x8000 clear: the 0x580xx messages (logon id, NAT type, service info...) are
++// synchronous queries with their own handlers.
++inline bool IsAsyncTaskMessage(uint32_t message) {
++  return (message & 0xFFFF8000u) == 0x00050000u;
++}
++
++struct Task {
++  uint32_t ordinal;
++  uint32_t request_ptr;
++  uint32_t request_size;
++  uint32_t results_ptr;
++  uint32_t results_size;
++};
++
++inline uint32_t ReadWord(const uint8_t* bytes) {
++  return (uint32_t{bytes[0]} << 24) | (uint32_t{bytes[1]} << 16) | (uint32_t{bytes[2]} << 8) |
++         uint32_t{bytes[3]};
++}
++
++// `task` points at kTaskSize bytes of guest memory.
++inline Task DecodeTask(const uint8_t* task) {
++  return {ReadWord(task + 0x00), ReadWord(task + 0x18), ReadWord(task + 0x1C),
++          ReadWord(task + 0x2C), ReadWord(task + 0x30)};
++}
++
++}  // namespace rex::system::xam::xlive_async
+diff --git a/sdk/include/rex/system/xsocket.h b/sdk/include/rex/system/xsocket.h
+index a1b4443..5078abc 100644
+--- a/sdk/include/rex/system/xsocket.h
++++ b/sdk/include/rex/system/xsocket.h
+@@ -11,9 +11,13 @@
+  */
+ 
+ #include <cstring>
++#include <deque>
++#include <memory>
+ #include <queue>
++#include <string>
+ 
+ #include <rex/math.h>
++#include <rex/system/xam/fesl_shim.h>
+ #include <rex/system/xobject.h>
+ #include <rex/types.h>
+ 
+@@ -101,13 +105,30 @@ class XSocket : public XObject {
+ 
+   X_STATUS SetOption(uint32_t level, uint32_t optname, void* optval_ptr, uint32_t optlen);
+   X_STATUS IOControl(uint32_t cmd, uint8_t* arg_ptr);
++  // Reads a 4-byte socket option into value (host order). SO_ERROR comes back as a Winsock code
++  // (what a non-blocking connect left behind), other options as the host reports them.
++  X_STATUS GetOption(uint32_t level, uint32_t optname, uint32_t* value);
+ 
+   X_STATUS Connect(N_XSOCKADDR* name, int name_len);
++  // The Winsock error code of the last failed Connect (0 if it did not fail), kept so the caller
++  // can report "in progress" or "refused" instead of a generic failure.
++  uint32_t last_connect_error() const { return last_connect_error_; }
++  // The raw host error (errno, or the Winsock code on Windows) behind it, for the hardware trace.
++  int last_native_errno() const { return last_native_errno_; }
+   X_STATUS Bind(N_XSOCKADDR_IN* name, int name_len);
+   X_STATUS Listen(int backlog);
+   object_ref<XSocket> Accept(N_XSOCKADDR* name, int* name_len);
+   int Shutdown(int how);
+ 
++  // Puts the 360-to-PC account translation on this connection (see xam/fesl_shim.h). Frames the PC
++  // server cannot answer are answered locally and handed to the game by Recv.
++  void EnableFeslShim(uint64_t own_xuid, std::string own_gamertag, uint64_t account_secret,
++                      std::string service_host) {
++    shim_ = std::make_unique<xam::fesl::Shim>(own_xuid, std::move(own_gamertag), account_secret,
++                                              std::move(service_host));
++  }
++  bool has_fesl_shim() const { return shim_ != nullptr; }
++
+   int Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags);
+   int Send(const uint8_t* buf, uint32_t buf_len, uint32_t flags);
+ 
+@@ -135,12 +156,17 @@ class XSocket : public XObject {
+   Type type_;           // Type (DGRAM/Stream/etc)
+   Protocol proto_;      // Protocol (TCP/UDP/etc)
+   bool secure_ = true;  // Secure socket (encryption enabled)
++  uint32_t last_connect_error_ = 0;
++  int last_native_errno_ = 0;
+ 
+   bool bound_ = false;  // Explicitly bound to an IP address?
+   uint16_t bound_port_ = 0;
+ 
+   bool broadcast_socket_ = false;
+ 
++  std::unique_ptr<xam::fesl::Shim> shim_;  // set only on the connection to the online server
++  std::deque<uint8_t> shim_inbox_;         // locally answered bytes waiting for the game's Recv
++
+   std::unique_ptr<rex::thread::Event> event_;
+   std::mutex incoming_packet_mutex_;
+   std::queue<uint8_t*> incoming_packets_;
 diff --git a/sdk/include/rex/system/xthread.h b/sdk/include/rex/system/xthread.h
 index a72911e..e0c27c2 100644
 --- a/sdk/include/rex/system/xthread.h
@@ -939,14 +2806,15 @@ index 0000000..1fd34dc
 +
 +}  // namespace rex::audio
 diff --git a/sdk/src/core/CMakeLists.txt b/sdk/src/core/CMakeLists.txt
-index 10cb9f1..2493491 100644
+index 10cb9f1..dd69b7f 100644
 --- a/sdk/src/core/CMakeLists.txt
 +++ b/sdk/src/core/CMakeLists.txt
-@@ -79,6 +79,7 @@ elseif(REXGLUE_PLATFORM_SWITCH)
+@@ -79,6 +79,8 @@ elseif(REXGLUE_PLATFORM_SWITCH)
          memory_switch.cpp             # rex::memory API on top of the core
          seh_switch.cpp                # SEH interface; faults inside SEH scopes are fatal
          switch_libc_supplement.c      # pread, pwrite and friends: newlib declares them, libnx does not
 +        switch_entropy.c
++        switch_network.c              # BSD socket service for online_server_host, started on demand
      )
  elseif(UNIX)
      # Linux and macOS/Darwin share the POSIX sources; Darwin-specific behavior
@@ -1003,6 +2871,49 @@ index d604044..2531785 100644
  /* --- timegm ----------------------------------------------------------------
   *
   * newlib has mktime, which interprets struct tm in the local time zone, but not
+diff --git a/sdk/src/core/switch_network.c b/sdk/src/core/switch_network.c
+new file mode 100644
+index 0000000..a9548f2
+--- /dev/null
++++ b/sdk/src/core/switch_network.c
+@@ -0,0 +1,37 @@
++/* Starts libnx's BSD socket service for the online trial.
++ * Called once, lazily, from the kernel layer, and only when online_fake_live and online_server_host
++ * are both set. The buffers are small on purpose: the process has only a few MB of memory to spare,
++ * but the budget must cover every socket the game keeps open at once.
++ * Returns 0 on success, otherwise the libnx result code. The outcome is remembered, so a failure
++ * (no Wi-Fi, no bsd service) is not retried. */
++#include <switch.h>
++
++unsigned int rex_switch_network_start(void) {
++    static Mutex lock;
++    static int tried;
++    static Result result;
++
++    mutexLock(&lock);
++    if (!tried) {
++        tried = 1;
++        const SocketInitConfig config = {
++            .tcp_tx_buf_size = 0x4000,
++            .tcp_rx_buf_size = 0x4000,
++            .tcp_tx_buf_max_size = 0,
++            .tcp_rx_buf_max_size = 0,
++            .udp_tx_buf_size = 0x2400,
++            .udp_rx_buf_size = 0x2400,
++            // libnx's transfer memory is this times one socket's buffers (about 84 KB here): 1 left
++            // room for the account connection only, so every later socket() failed and the game
++            // retried forever. 8 is the top of the documented range (1-8, switchbrew "Sockets
++            // services") and about 0.65 MB, taken from the heap's free space.
++            .sb_efficiency = 8,
++            .num_bsd_sessions = 3,
++            .bsd_service_type = BsdServiceType_User,
++        };
++        result = socketInitialize(&config);
++    }
++    const Result outcome = result;
++    mutexUnlock(&lock);
++    return outcome;
++}
 diff --git a/sdk/src/core/threading_posix.cpp b/sdk/src/core/threading_posix.cpp
 index 5d26022..15bdee4 100644
 --- a/sdk/src/core/threading_posix.cpp
@@ -1474,6 +3385,99 @@ index ccf5e2a..ee36923 100644
      const uint64_t bit = uint64_t(1) << i;
      const bool ahora = modificador && (held & kAtajos[i].boton) != 0;
      const bool antes = (slot.menu_shortcuts & bit) != 0;
+diff --git a/sdk/src/kernel/xam/apps/xlivebase_app.cpp b/sdk/src/kernel/xam/apps/xlivebase_app.cpp
+index 3593403..534782b 100644
+--- a/sdk/src/kernel/xam/apps/xlivebase_app.cpp
++++ b/sdk/src/kernel/xam/apps/xlivebase_app.cpp
+@@ -9,8 +9,15 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++
+ #include <rex/kernel/xam/apps/xlivebase_app.h>
++#include <rex/kernel/xam/private.h>
+ #include <rex/logging.h>
++#include <rex/system/xam/xlive_async.h>
+ #include <rex/thread.h>
+ 
+ namespace rex {
+@@ -48,6 +55,21 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
+       // and pServiceInfo. pServiceInfo should contain pointer to
+       // XONLINE_SERVICE_INFO structure.
+       REXKRNL_DEBUG("CXLiveLogon::GetServiceInfo({:08X}, {:08X})", buffer_ptr, buffer_length);
++      // Seen on hardware: the first argument is the service id, the second the guest pointer to
++      // the XONLINE_SERVICE_INFO to fill. With online_fake_live on and online_server_host set,
++      // EA's service (0x45410004) is the configured server; everything else stays an error.
++      uint32_t server_address = 0;
++      if (kernel_state_->user_profile()->fake_live() && buffer_ptr == fake_live::kEaServiceId &&
++          buffer_length && xeOnlineServerAddress(&server_address)) {
++        const auto info = fake_live::EncodeServiceInfo(buffer_ptr, server_address,
++                                                       fake_live::kEaServicePort);
++        std::memcpy(memory_->TranslateVirtual(buffer_length), info.data(), info.size());
++        FAKE_LIVE_TRACE("fake Live: GetServiceInfo({:#x}) -> {}.{}.{}.{}:{}", buffer_ptr,
++                        (server_address >> 24) & 0xFF, (server_address >> 16) & 0xFF,
++                        (server_address >> 8) & 0xFF, server_address & 0xFF,
++                        fake_live::kEaServicePort);
++        return X_E_SUCCESS;
++      }
+       return 0x80151802;  // ERROR_CONNECTION_INVALID
+     }
+     case 0x00058020: {
+@@ -78,10 +100,46 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
+       return X_E_SUCCESS;
+     }
+   }
+-  REXKRNL_ERROR(
+-      "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, "
+-      "arg2={:08X}",
+-      app_id(), message, buffer_ptr, buffer_length);
++  if (kernel_state_->user_profile()->fake_live() && xlive_async::IsAsyncTaskMessage(message) &&
++      buffer_ptr && buffer_length >= xlive_async::kMessageSize) {
++    // An Xbox Live task nobody serves. Say which function it is (the ordinal) and what it asked,
++    // then finish it with an empty successful result so the title can go on to its next step.
++    const uint32_t task_ptr = memory::load_and_swap<uint32_t>(buffer);
++    if (task_ptr) {
++      const auto task = xlive_async::DecodeTask(memory_->TranslateVirtual(task_ptr));
++      FAKE_LIVE_TRACE(
++          "fake Live: XLiveBase task msg {:#x} ordinal {:#x} request {:#x}+{} results {:#x}+{}",
++          message, task.ordinal, task.request_ptr, task.request_size, task.results_ptr,
++          task.results_size);
++      if (task.request_ptr && task.request_size) {
++        const auto* request = memory_->TranslateVirtual(task.request_ptr);
++        std::string hex;
++        for (uint32_t i = 0; i < task.request_size && i < 160; ++i) {
++          hex += fmt::format("{:02x} ", request[i]);
++        }
++        FAKE_LIVE_TRACE("fake Live: XLiveBase task request bytes: {}", hex);
++      }
++      if (task.results_ptr && task.results_size) {
++        std::memset(memory_->TranslateVirtual(task.results_ptr), 0, task.results_size);
++      }
++      return X_E_SUCCESS;
++    }
++  }
++  // The title asks some of these (0x5800E) about eleven times a second; every line is flushed to the
++  // SD card, so log the first few of each message and then one in a thousand.
++  static std::mutex counts_lock;
++  static std::unordered_map<uint32_t, uint32_t> counts;
++  uint32_t seen;
++  {
++    std::lock_guard<std::mutex> guard(counts_lock);
++    seen = counts[message]++;
++  }
++  if (seen < 5 || seen % 1000 == 0) {
++    REXKRNL_ERROR(
++        "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, "
++        "arg2={:08X} (call {})",
++        app_id(), message, buffer_ptr, buffer_length, seen + 1);
++  }
+   return X_E_FAIL;
+ }
+ 
 diff --git a/sdk/src/kernel/xam/xam_content.cpp b/sdk/src/kernel/xam/xam_content.cpp
 index 78734b4..454f1ad 100644
 --- a/sdk/src/kernel/xam/xam_content.cpp
@@ -1514,11 +3518,1089 @@ index 78734b4..454f1ad 100644
          auto item = e->AppendItem();
          *item = content_data;
        }
+diff --git a/sdk/src/kernel/xam/xam_enum.cpp b/sdk/src/kernel/xam/xam_enum.cpp
+index 9dcab94..0faf4a3 100644
+--- a/sdk/src/kernel/xam/xam_enum.cpp
++++ b/sdk/src/kernel/xam/xam_enum.cpp
+@@ -73,7 +73,9 @@ uint32_t xeXamEnumerate(uint32_t handle, uint32_t flags, mapped_void buffer_ptr,
+ 
+ u32 XamEnumerate_entry(u32 handle, u32 flags, mapped_void buffer, u32 buffer_length,
+                        mapped_u32 items_returned, ppc_ptr_t<XAM_OVERLAPPED> overlapped) {
+-  uint32_t dummy;
++  // Zero it: xeXamEnumerate returns early on a bad handle without writing the count, and the
++  // game then walked that many entries off the end of its stack (found with online_fake_live).
++  uint32_t dummy = 0;
+   auto result =
+       xeXamEnumerate(handle, flags, buffer, buffer_length,
+                      !overlapped.guest_address() ? &dummy : nullptr, overlapped.guest_address());
+@@ -85,6 +87,8 @@ u32 XamEnumerate_entry(u32 handle, u32 flags, mapped_void buffer, u32 buffer_len
+ 
+ u32 XamCreateEnumeratorHandle_entry(u32 unk1, u32 unk2, u32 unk3, u32 unk4, u32 unk5, u32 unk6,
+                                     u32 unk7, u32 unk8) {
++  REXKRNL_WARN("XamCreateEnumeratorHandle({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) not implemented",
++               unk1, unk2, unk3, unk4, unk5, unk6, unk7, unk8);
+   return X_ERROR_INVALID_PARAMETER;
+ }
+ 
+diff --git a/sdk/src/kernel/xam/xam_misc.cpp b/sdk/src/kernel/xam/xam_misc.cpp
+index ff6cb56..a7b6b87 100644
+--- a/sdk/src/kernel/xam/xam_misc.cpp
++++ b/sdk/src/kernel/xam/xam_misc.cpp
+@@ -237,13 +237,11 @@ REX_EXPORT_STUB(__imp__XNetLogonGetExtendedStatus);
+ REX_EXPORT_STUB(__imp__XNetLogonGetFlowToken);
+ REX_EXPORT_STUB(__imp__XNetLogonGetLastUPnPStatus);
+ REX_EXPORT_STUB(__imp__XNetLogonGetLoggedOnUsers);
+-REX_EXPORT_STUB(__imp__XNetLogonGetMachineID);
+ REX_EXPORT_STUB(__imp__XNetLogonGetNatType);
+ REX_EXPORT_STUB(__imp__XNetLogonGetServiceInfo);
+ REX_EXPORT_STUB(__imp__XNetLogonGetServiceNetworkID);
+ REX_EXPORT_STUB(__imp__XNetLogonGetState);
+ REX_EXPORT_STUB(__imp__XNetLogonGetTicketOpt);
+-REX_EXPORT_STUB(__imp__XNetLogonGetTitleID);
+ REX_EXPORT_STUB(__imp__XNetLogonGetTitleVersion);
+ REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
+ REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
+diff --git a/sdk/src/kernel/xam/xam_net.cpp b/sdk/src/kernel/xam/xam_net.cpp
+index 58e36a4..989c79e 100644
+--- a/sdk/src/kernel/xam/xam_net.cpp
++++ b/sdk/src/kernel/xam/xam_net.cpp
+@@ -12,7 +12,16 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <algorithm>
++#include <atomic>
++#include <cerrno>
++#include <chrono>
+ #include <cstring>
++#include <deque>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
+ 
+ #if REX_PLATFORM_MAC
+ #include <sys/select.h>
+@@ -20,6 +29,7 @@
+ 
+ #include <rex/chrono/clock.h>
+ #include <rex/kernel/xam/module.h>
++#include <rex/cvar.h>
+ #include <rex/kernel/xam/private.h>
+ #include <rex/kernel/xboxkrnl/error.h>
+ #include <rex/kernel/xboxkrnl/threading.h>
+@@ -28,6 +38,8 @@
+ #include <rex/types.h>
+ #include <rex/string.h>
+ #include <rex/system/kernel_state.h>
++#include <rex/system/xam/overlapped_recv.h>
++#include <rex/system/xam/udp_tunnel.h>
+ #include <rex/system/xevent.h>
+ #include <rex/system/xsocket.h>
+ #include <rex/system/xthread.h>
+@@ -37,19 +49,113 @@
+ // NOTE: must be included last as it expects windows.h to already be included.
+ #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
+ #include <winsock2.h>                    // NOLINT(build/include_order)
++#include <ws2tcpip.h>                    // NOLINT(build/include_order)
+ #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+ #include <arpa/inet.h>
++#include <netdb.h>
+ #include <netinet/in.h>
+ #include <netinet/ip.h>
+ #include <sys/socket.h>
+ #endif
+ 
++REXCVAR_DECLARE(std::string, online_server_host);
++REXCVAR_DECLARE(int32_t, online_server_port);
++
++#if defined(__SWITCH__)
++// src/core/switch_network.c
++extern "C" unsigned int rex_switch_network_start(void);
++#endif
++
+ namespace rex {
+ namespace kernel {
+ namespace xam {
+ using namespace rex::system;
+ using namespace rex::system::xam;
+ 
++static std::string Ipv4ToString(uint32_t host_order_address) {
++  return std::to_string((host_order_address >> 24) & 0xFF) + "." +
++         std::to_string((host_order_address >> 16) & 0xFF) + "." +
++         std::to_string((host_order_address >> 8) & 0xFF) + "." +
++         std::to_string(host_order_address & 0xFF);
++}
++
++// Up to 32 bytes as hex, for the first-bytes trace (a TLS handshake starts with 16 03).
++// Metrics, stats and match-request uploads are thousands of base64 characters per frame and say
++// nothing in a hex or text prefix (the match request is logged decoded by the shim instead).
++static bool IsBulkUpload(const uint8_t* bytes, size_t length) {
++  if (length < 1000) {
++    return false;
++  }
++  return std::memcmp(bytes, "mtrx", 4) == 0 || std::memcmp(bytes, "rank", 4) == 0 ||
++         std::memcmp(bytes, "pnow", 4) == 0;
++}
++
++// Up to `limit` bytes as hex: whole UDP datagrams, which can be decoded afterwards with the game's key.
++static std::string HexBytes(const uint8_t* bytes, size_t length, size_t limit) {
++  static const char kDigits[] = "0123456789abcdef";
++  std::string text;
++  for (size_t i = 0; i < length && i < limit; ++i) {
++    text += kDigits[bytes[i] >> 4];
++    text += kDigits[bytes[i] & 15];
++    text += ' ';
++  }
++  return text;
++}
++
++static std::string HexPrefix(const uint8_t* bytes, size_t length) {
++  static const char kDigits[] = "0123456789abcdef";
++  std::string text;
++  for (size_t i = 0; i < length && i < 32; ++i) {
++    text += kDigits[bytes[i] >> 4];
++    text += kDigits[bytes[i] & 15];
++    text += ' ';
++  }
++  return text;
++}
++
++// Up to 600 bytes as text for the protocol trace (the online protocol is line-based text): printable
++// characters as they are, a newline as '|', everything else as '.'.
++static std::string TextPrefix(const uint8_t* bytes, size_t length) {
++  std::string text;
++  for (size_t i = 0; i < length && i < 600; ++i) {
++    const uint8_t c = bytes[i];
++    text += c == 0x0A ? '|' : (c >= 0x20 && c < 0x7F ? static_cast<char>(c) : '.');
++  }
++  return text;
++}
++
++// Resolves an IPv4 literal or a name to an IPv4 address in network byte order. Blocks while the
++// system resolver works; on the Switch the socket service is started first.
++static bool ResolveIpv4(const std::string& host, in_addr* out) {
++  const in_addr_t literal = inet_addr(host.c_str());
++  if (literal != INADDR_NONE) {
++    out->s_addr = literal;
++    return true;
++  }
++#if defined(__SWITCH__)
++  if (rex_switch_network_start() != 0) {
++    return false;
++  }
++#endif
++  addrinfo hints{};
++  hints.ai_family = AF_INET;
++  hints.ai_socktype = SOCK_STREAM;
++  addrinfo* found = nullptr;
++  if (getaddrinfo(host.c_str(), nullptr, &hints, &found) != 0 || !found) {
++    return false;
++  }
++  bool ok = false;
++  for (addrinfo* entry = found; entry; entry = entry->ai_next) {
++    if (entry->ai_family == AF_INET) {
++      *out = reinterpret_cast<sockaddr_in*>(entry->ai_addr)->sin_addr;
++      ok = true;
++      break;
++    }
++  }
++  freeaddrinfo(found);
++  return ok;
++}
++
+ // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
+ enum {
+   XNCALLER_INVALID = 0x0,
+@@ -295,25 +401,247 @@ u32 NetDll_WSAGetLastError_entry() {
+   return XThread::GetLastError();
+ }
+ 
+-u32 NetDll_WSARecvFrom_entry(u32 caller, u32 socket, ppc_ptr_t<XWSABUF> buffers_ptr,
++// The UDP receives the game posted and has not collected yet (see xam/overlapped_recv.h).
++static rex::system::xam::overlapped::PendingReceiveTable g_pending_receives;
++
++// Writes one received datagram's sender (address, port and length) into the guest's sockaddr_in.
++static void StoreSender(uint32_t from_guest, uint32_t from_length_guest, const N_XSOCKADDR_IN& from,
++                        uint32_t from_length) {
++  if (from_guest) {
++    auto* out = reinterpret_cast<XSOCKADDR_IN*>(REX_KERNEL_MEMORY()->TranslateVirtual(from_guest));
++    out->sin_family = from.sin_family;
++    out->sin_port = from.sin_port;
++    out->sin_addr = from.sin_addr;
++    std::memset(out->x_sin_zero, 0, sizeof(out->x_sin_zero));
++  }
++  if (from_length_guest) {
++    memory::store_and_swap<uint32_t>(REX_KERNEL_MEMORY()->TranslateVirtual(from_length_guest),
++                                     from_length);
++  }
++}
++
++// What the receive path saw in the last few seconds, to tell a slow game (long gaps between its polls)
++// from a lossy network (holes in the server's datagram numbering) when datagrams go missing.
++static void NoteReceivePoll() {
++  using Clock = std::chrono::steady_clock;
++  static std::mutex lock;
++  static Clock::time_point last_poll{};
++  static Clock::time_point window_start{};
++  static int64_t longest_gap_ms = 0;
++  static int polls = 0;
++  if (!REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    return;
++  }
++  std::lock_guard<std::mutex> guard(lock);
++  const auto now = Clock::now();
++  if (last_poll.time_since_epoch().count() != 0) {
++    longest_gap_ms = std::max<int64_t>(
++        longest_gap_ms, std::chrono::duration_cast<std::chrono::milliseconds>(now - last_poll).count());
++  }
++  last_poll = now;
++  ++polls;
++  if (window_start.time_since_epoch().count() == 0) {
++    window_start = now;
++  }
++  if (now - window_start >= std::chrono::seconds(5)) {
++    FAKE_LIVE_TRACE_UP_TO(200, "fake Live: UDP receive polled {} times in the last 5 s, longest gap {} ms",
++                          polls, longest_gap_ms);
++    window_start = now;
++    longest_gap_ms = 0;
++    polls = 0;
++  }
++}
++
++// A datagram from the server is about to reach the game: say when the numbering shows that datagrams
++// before it never arrived.
++static void NoteDatagramFromServer(const uint8_t* data, size_t size) {
++  const size_t skipped_words = rex::system::xam::tunnel::GlobalTunnel().ObserveFromServer(data, size);
++  if (skipped_words) {
++    FAKE_LIVE_TRACE_UP_TO(200,
++                          "fake Live: the server's datagram numbering skips {} words ({} bytes) before "
++                          "this {} byte datagram: datagrams were lost on the way",
++                          skipped_words, skipped_words * 4, size);
++  }
++}
++
++// Reads every socket the game has a receive posted on; a datagram that arrived is copied into the
++// game's buffer, the receive is marked done and the overlapped's event is signalled, which is what the
++// game's socket thread waits for.
++static void CompletePendingReceives() {
++  NoteReceivePoll();
++  // Records the server never refilled become a datagram of empty ones (see tunnel::ServerGapHealer); it is
++  // handed to the game like one that arrived, on the socket the server's datagrams come in on.
++  static std::deque<std::vector<uint8_t>> healing;
++  static N_XSOCKADDR_IN server_from;
++  static uint32_t server_socket = 0;
++  static bool server_seen = false;
++  if (server_seen) {
++    if (auto fill = rex::system::xam::tunnel::GlobalTunnel().TakeHeal()) {
++      std::string numbers;
++      for (const uint32_t sequence : fill->sequences) {
++        numbers += fmt::format("{:#x} ", sequence);
++      }
++      FAKE_LIVE_TRACE_UP_TO(100, "fake Live: the server never refilled the records {}: handing the game empty ones",
++                            numbers);
++      healing.push_back(std::move(fill->wire));
++    }
++  }
++  for (const rex::system::xam::overlapped::PendingReceive& pending : g_pending_receives.Active()) {
++    auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(pending.socket);
++    if (!socket) {
++      g_pending_receives.CancelSocket(pending.socket);  // closed under it
++      continue;
++    }
++    N_XSOCKADDR_IN from;
++    uint32_t from_length = sizeof(XSOCKADDR_IN);
++    int received;
++    if (!healing.empty() && server_seen && pending.socket == server_socket &&
++        healing.front().size() <= pending.length) {
++      received = static_cast<int>(healing.front().size());
++      std::memcpy(REX_KERNEL_MEMORY()->TranslateVirtual(pending.buffer), healing.front().data(),
++                  healing.front().size());
++      healing.pop_front();
++      from = server_from;
++    } else {
++      received = socket->RecvFrom(REX_KERNEL_MEMORY()->TranslateVirtual(pending.buffer),
++                                  pending.length, 0, &from, &from_length);
++      if (received >= 0) {
++        server_from = from;
++        server_socket = pending.socket;
++        server_seen = true;
++      }
++    }
++    if (received < 0) {
++      if (errno != EAGAIN && errno != EWOULDBLOCK) {
++        FAKE_LIVE_TRACE_UP_TO(10, "fake Live: UDP receive on socket {} failed (errno {})", pending.socket,
++                              errno);
++      }
++      continue;  // nothing yet
++    }
++    NoteDatagramFromServer(REX_KERNEL_MEMORY()->TranslateVirtual(pending.buffer),
++                           static_cast<size_t>(received));
++    StoreSender(pending.from, pending.from_length, from, from_length);
++    auto* overlapped_out =
++        reinterpret_cast<XWSAOVERLAPPED*>(REX_KERNEL_MEMORY()->TranslateVirtual(pending.overlapped));
++    overlapped_out->internal = 0;  // STATUS_SUCCESS
++    overlapped_out->internal_high = static_cast<uint32_t>(received);
++    g_pending_receives.Complete(pending.overlapped, static_cast<uint32_t>(received));
++    if (pending.event) {
++      xboxkrnl::xeNtSetEvent(pending.event, nullptr);
++    }
++    FAKE_LIVE_TRACE_UP_TO(300, "fake Live: UDP datagram of {} bytes from {}:{} given to the game: {}",
++                          received, Ipv4ToString(from.sin_addr), static_cast<uint16_t>(from.sin_port),
++                          HexBytes(REX_KERNEL_MEMORY()->TranslateVirtual(pending.buffer),
++                                   static_cast<size_t>(received), 128));
++  }
++}
++
++// The game never reads its UDP sockets with recvfrom: it posts this call with an OVERLAPPED. A datagram
++// that is already there is returned at once; otherwise the receive stays pending (WSA_IO_PENDING) and
++// is completed later by CompletePendingReceives. A plain "would block" error is not enough: the game
++// posts again only while its byte count is zero, which an error leaves set.
++u32 NetDll_WSARecvFrom_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buffers_ptr,
+                              u32 buffer_count, mapped_u32 num_bytes_recv, mapped_u32 flags_ptr,
+-                             ppc_ptr_t<XSOCKADDR_IN> from_addr,
++                             ppc_ptr_t<XSOCKADDR_IN> from_addr, mapped_u32 from_length_ptr,
+                              ppc_ptr_t<XWSAOVERLAPPED> overlapped_ptr,
+                              mapped_void completion_routine_ptr) {
+-  if (overlapped_ptr) {
+-    // auto evt = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(
+-    //    overlapped_ptr->event_handle);
+-
+-    // if (evt) {
+-    //  //evt->Set(0, false);
+-    //}
++  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
++  if (!socket) {
++    XThread::SetLastError(0x2736);  // WSAENOTSOCK
++    return -1;
+   }
++  if (!buffers_ptr || buffer_count == 0) {
++    XThread::SetLastError(10014);  // WSAEFAULT
++    return -1;
++  }
++  // The game posts one buffer; any further ones are not filled.
++  const uint32_t buffer_guest = buffers_ptr[0].buf_ptr;
++  const uint32_t buffer_length = buffers_ptr[0].len;
+ 
+-  // we're not going to be receiving packets any time soon
+-  // return error so we don't wait on that - Cancerous
++  N_XSOCKADDR_IN native_from;
++  uint32_t native_from_length = sizeof(XSOCKADDR_IN);
++  const int received = socket->RecvFrom(REX_KERNEL_MEMORY()->TranslateVirtual(buffer_guest),
++                                        buffer_length, 0, &native_from, &native_from_length);
++  if (received >= 0) {
++    NoteDatagramFromServer(REX_KERNEL_MEMORY()->TranslateVirtual(buffer_guest),
++                           static_cast<size_t>(received));
++    FAKE_LIVE_TRACE_UP_TO(300, "fake Live: UDP datagram of {} bytes from {}:{} given to the game: {}",
++                          received, Ipv4ToString(native_from.sin_addr),
++                          static_cast<uint16_t>(native_from.sin_port),
++                          HexBytes(REX_KERNEL_MEMORY()->TranslateVirtual(buffer_guest),
++                                   static_cast<size_t>(received), 128));
++    StoreSender(from_addr ? from_addr.guest_address() : 0,
++                from_length_ptr ? from_length_ptr.guest_address() : 0, native_from,
++                native_from_length);
++    if (num_bytes_recv) {
++      *num_bytes_recv = static_cast<uint32_t>(received);
++    }
++    if (flags_ptr) {
++      *flags_ptr = 0;
++    }
++    return 0;
++  }
++  if (!overlapped_ptr) {
++    XThread::SetLastError(10035);  // WSAEWOULDBLOCK
++    return -1;
++  }
++  rex::system::xam::overlapped::PendingReceive pending;
++  pending.socket = socket_handle;
++  pending.buffer = buffer_guest;
++  pending.length = buffer_length;
++  pending.from = from_addr ? from_addr.guest_address() : 0;
++  pending.from_length = from_length_ptr ? from_length_ptr.guest_address() : 0;
++  pending.overlapped = overlapped_ptr.guest_address();
++  pending.event = overlapped_ptr->event_handle;
++  overlapped_ptr->internal = 0x103;  // STATUS_PENDING
++  overlapped_ptr->internal_high = 0;
++  g_pending_receives.Add(pending);
++  FAKE_LIVE_TRACE_UP_TO(12, "fake Live: WSARecvFrom posted on socket {} (buffer {} bytes, overlapped {:#x})",
++                        socket_handle, buffer_length, pending.overlapped);
++  XThread::SetLastError(997);  // WSA_IO_PENDING
+   return -1;
+ }
+ 
++// Collects the result of a receive posted with WSARecvFrom: TRUE with the byte count once a datagram
++// arrived, otherwise FALSE with WSA_IO_INCOMPLETE (996); an OVERLAPPED the table does not know fails
++// with WSA_INVALID_HANDLE (6), which lets the game clear its pending flag and post again.
++u32 NetDll_WSAGetOverlappedResult_entry(u32 caller, u32 socket_handle,
++                                        ppc_ptr_t<XWSAOVERLAPPED> overlapped_ptr,
++                                        mapped_u32 num_bytes_ptr, u32 wait, mapped_u32 flags_ptr) {
++  if (!overlapped_ptr) {
++    XThread::SetLastError(6);
++    return 0;
++  }
++  const uint32_t key = overlapped_ptr.guest_address();
++  for (;;) {
++    CompletePendingReceives();
++    uint32_t bytes = 0;
++    if (g_pending_receives.Collect(key, &bytes)) {
++      if (num_bytes_ptr) {
++        *num_bytes_ptr = bytes;
++      }
++      if (flags_ptr) {
++        *flags_ptr = 0;
++      }
++      return 1;
++    }
++    if (!g_pending_receives.IsPending(key)) {
++      XThread::SetLastError(6);  // WSA_INVALID_HANDLE
++      return 0;
++    }
++    if (!wait) {
++      XThread::SetLastError(996);  // WSA_IO_INCOMPLETE
++      return 0;
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds(1));
++  }
++}
++
++u32 NetDll_WSACancelOverlappedIO_entry(u32 caller, u32 socket_handle) {
++  g_pending_receives.CancelSocket(socket_handle);
++  return 0;
++}
++
+ // If the socket is a VDP socket, buffer 0 is the game data length, and buffer 1
+ // is the unencrypted game data.
+ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buffers,
+@@ -363,10 +691,41 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
+   uint64_t timeout_wait = (uint64_t)timeout;
+ 
+   X_STATUS result = 0;
+-  do {
+-    result = xboxkrnl::xeNtWaitForMultipleObjectsEx(num_events, events, wait_all, 1, alertable,
+-                                                    timeout != -1 ? &timeout_wait : nullptr);
+-  } while (result == X_STATUS_ALERTED);
++  if (REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    // The game's socket thread waits here (usually with no timeout) for its UDP receives to complete.
++    // Nothing in the host signals the events by itself, so wait in 10 ms slices and look for arrived
++    // datagrams in between; a datagram completes its receive and signals the event.
++    const auto started = std::chrono::steady_clock::now();
++    for (;;) {
++      CompletePendingReceives();
++      uint64_t slice = static_cast<uint64_t>(-100000LL);  // 10 ms, relative, in 100 ns units
++      result = xboxkrnl::xeNtWaitForMultipleObjectsEx(num_events, events, wait_all, 1, alertable,
++                                                      &slice);
++      if (result == X_STATUS_ALERTED) {
++        continue;
++      }
++      if (result != 0x00000102 /* STATUS_TIMEOUT */) {
++        break;
++      }
++      const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
++                              std::chrono::steady_clock::now() - started)
++                              .count();
++      // The game's socket thread holds its socket-list lock for the whole wait and waits with no limit,
++      // while the threads that open or close sockets (the game's main thread among them) wait for that
++      // lock before they signal it. On the console something else wakes the wait; here nothing does,
++      // so cut an unlimited wait at 100 ms and report it as a wake-up: the game's loop then goes round
++      // again, which releases the lock each time.
++      const int64_t limit = timeout == static_cast<u32>(-1) ? 100 : static_cast<int64_t>(timeout);
++      if (waited >= limit) {
++        break;
++      }
++    }
++  } else {
++    do {
++      result = xboxkrnl::xeNtWaitForMultipleObjectsEx(num_events, events, wait_all, 1, alertable,
++                                                      timeout != -1 ? &timeout_wait : nullptr);
++    } while (result == X_STATUS_ALERTED);
++  }
+ 
+   if (XFAILED(result)) {
+     uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
+@@ -436,6 +795,19 @@ struct XnAddrStatus {
+ };
+ 
+ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
++  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
++  if (user_profile->fake_live()) {
++    const auto& identity = user_profile->fake_identity();
++    addr_ptr->ina.s_addr = htonl(fake_live::kFakeIpv4);
++    addr_ptr->inaOnline.s_addr = htonl(fake_live::kFakeIpv4);
++    addr_ptr->wPortOnline = fake_live::kFakeOnlinePort;
++    std::memcpy(addr_ptr->abEnet, identity.mac, sizeof(addr_ptr->abEnet));
++    const auto online_id = fake_live::OnlineId(identity);
++    std::memcpy(addr_ptr->abOnline, online_id.data(), online_id.size());
++    FAKE_LIVE_TRACE("fake Live: XNetGetTitleXnAddr -> status {:#x}", fake_live::XnAddrStatus(true));
++    return fake_live::XnAddrStatus(true);
++  }
++
+   // Just return a loopback address atm.
+   addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
+   addr_ptr->inaOnline.s_addr = 0;
+@@ -505,16 +877,100 @@ struct XEthernetStatus {
+   static const uint32_t XNET_ETHERNET_LINK_HALF_DUPLEX = 0x10;
+ };
+ 
++// The game calls this while building a request for Live's web services and only checks the sign.
++u32 XNetLogonGetMachineID_entry(mapped_u64 machine_id_ptr) {
++  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
++  if (machine_id_ptr && user_profile->fake_live()) {
++    *machine_id_ptr = user_profile->fake_identity().machine_id;
++  }
++  if (user_profile->fake_live()) {
++    FAKE_LIVE_TRACE("fake Live: XNetLogonGetMachineID -> 0");
++  }
++  return 0;
++}
++
++// The argument is a service category (the game passes 2 and 5) and the result goes into the same
++// request. Off: hand the argument back, as the old stub did. On: the game's own title id (a guess).
++u32 XNetLogonGetTitleID_entry(u32 service) {
++  if (REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    FAKE_LIVE_TRACE("fake Live: XNetLogonGetTitleID({}) -> 0x454107EC", service);
++    return 0x454107EC;
++  }
++  return service;
++}
++
+ u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
++  const bool live = REX_KERNEL_STATE()->user_profile()->fake_live();
++  if (live) {
++    FAKE_LIVE_TRACE("fake Live: XNetGetEthernetLinkStatus -> {:#x}", fake_live::EthernetLinkStatus(true));
++  }
++  return fake_live::EthernetLinkStatus(live);
++}
++
++// Secure connections to the Live "service" address are pretended. With online_fake_live on,
++// XNetConnect succeeds at once and the connection reads as connected, so the game goes on to its
++// own TCP connection to the server. Off: return the first argument, as the old stubs did.
++u32 NetDll_XNetConnect_entry(u32 caller, u32 ina) {
++  if (!REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    return caller;
++  }
++  FAKE_LIVE_TRACE("fake Live: XNetConnect({:#x}) -> 0", ina);
+   return 0;
+ }
+ 
++u32 NetDll_XNetGetConnectStatus_entry(u32 caller, u32 ina) {
++  if (!REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    return caller;
++  }
++  FAKE_LIVE_TRACE("fake Live: XNetGetConnectStatus({:#x}) -> connected", ina);
++  return fake_live::kConnectConnected;
++}
++
++u32 NetDll_XNetUnregisterKey_entry(u32 caller, u32 xnkid_ptr) {
++  if (!REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    return caller;
++  }
++  return 0;
++}
++
++bool xeOnlineServerAddress(uint32_t* ipv4_host_order) {
++  const std::string configured = REXCVAR_GET(online_server_host);
++  in_addr address{};
++  if (configured.empty() || !ResolveIpv4(configured, &address)) {
++    return false;
++  }
++  *ipv4_host_order = ntohl(address.s_addr);
++  return true;
++}
++
+ u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle, mapped_u32 pdns) {
+-  // TODO(gibbed): actually implement this
++  // Only EA's service names are answered, and only with online_fake_live on and online_server_host
++  // set: they resolve to that host. Everything else keeps failing as before.
++  const bool fake_live = REX_KERNEL_STATE()->user_profile()->fake_live();
++  const std::string configured = REXCVAR_GET(online_server_host);
++  const char* requested = host;
++  int32_t status = 1;  // non-zero = error
++  in_addr address{};
++  if (fake_live) {
++    if (requested && !configured.empty() && fake_live::IsEaServiceHost(requested)) {
++      status = ResolveIpv4(configured, &address) ? fake_live::kDnsOk : fake_live::kDnsHostNotFound;
++      FAKE_LIVE_TRACE_UP_TO(20, "fake Live: DNS {} -> {} -> {}", requested, configured,
++                            status == fake_live::kDnsOk ? Ipv4ToString(ntohl(address.s_addr))
++                                                        : std::string("not found"));
++    } else {
++      FAKE_LIVE_TRACE_UP_TO(20, "fake Live: DNS {} not redirected (online_server_host {})",
++                            requested ? requested : "(null)", configured.empty() ? "empty" : "set");
++    }
++  }
+   if (pdns) {
+     auto dns_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNDNS));
+     auto dns = REX_KERNEL_MEMORY()->TranslateVirtual<XNDNS*>(dns_guest);
+-    dns->status = 1;  // non-zero = error
++    std::memset(dns, 0, sizeof(XNDNS));
++    dns->status = status;
++    if (status == fake_live::kDnsOk) {
++      dns->cina = 1;
++      dns->aina[0] = address;
++    }
+     *pdns = dns_guest;
+   }
+   if (event_handle) {
+@@ -579,11 +1035,24 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
+ }
+ 
+ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
++#if defined(__SWITCH__)
++  // The game connects by address, without a DNS lookup, so start the Switch socket service here
++  // as well (only when online_fake_live and online_server_host are set; it is started once).
++  if (REX_KERNEL_STATE()->user_profile()->fake_live() && !REXCVAR_GET(online_server_host).empty()) {
++    const unsigned int network_result = rex_switch_network_start();
++    FAKE_LIVE_TRACE("fake Live: Switch socket service start -> {:#x}", network_result);
++  }
++#endif
+   XSocket* socket = new XSocket(REX_KERNEL_STATE());
+   X_STATUS result =
+       socket->Initialize(XSocket::AddressFamily((uint32_t)af), XSocket::Type((uint32_t)type),
+                          XSocket::Protocol((uint32_t)protocol));
+ 
++  const int host_errno = errno;
++  if (REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    FAKE_LIVE_TRACE_UP_TO(16, "fake Live: socket(af {}, type {}, protocol {}) -> {} (errno {})", af,
++                          type, protocol, XFAILED(result) ? "failed" : "ok", host_errno);
++  }
+   if (XFAILED(result)) {
+     socket->Release();
+ 
+@@ -643,6 +1112,35 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
+   return XSUCCEEDED(status) ? 0 : -1;
+ }
+ 
++u32 NetDll_getsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optname,
++                            mapped_void optval_ptr, mapped_u32 optlen_ptr) {
++  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
++  if (!socket) {
++    // WSAENOTSOCK
++    XThread::SetLastError(0x2736);
++    return -1;
++  }
++  if (!optval_ptr || !optlen_ptr || optlen_ptr.value() < 4) {
++    // WSAEFAULT
++    XThread::SetLastError(0x271E);
++    return -1;
++  }
++
++  uint32_t value = 0;
++  if (XFAILED(socket->GetOption(level, optname, &value))) {
++    // WSAENOPROTOOPT
++    XThread::SetLastError(0x2735);
++    return -1;
++  }
++  optval_ptr.as_array<uint32_t>()[0] = value;
++  *optlen_ptr = 4;
++  if (REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    FAKE_LIVE_TRACE("fake Live: getsockopt socket {} level {:#x} opt {:#x} -> {}", socket_handle,
++                    level, optname, value);
++  }
++  return 0;
++}
++
+ u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void arg_ptr) {
+   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+   if (!socket) {
+@@ -687,10 +1185,43 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+     return -1;
+   }
+ 
+-  N_XSOCKADDR native_name(name);
++  const bool fake_live = REX_KERNEL_STATE()->user_profile()->fake_live();
++  const XSOCKADDR* raw = name;
++  const auto* sin = reinterpret_cast<const XSOCKADDR_IN*>(raw);
++  // With online_server_port set, connections to the redirected server use that port (the 360 game
++  // dials its own login port, the PC server listens elsewhere).
++  XSOCKADDR_IN patched = *sin;
++  uint32_t server_address = 0;
++  const int32_t port_override = REXCVAR_GET(online_server_port);
++  if (fake_live && port_override > 0 && xeOnlineServerAddress(&server_address) &&
++      static_cast<uint32_t>(sin->sin_addr) == server_address) {
++    patched.sin_port = fake_live::RedirectedPort(static_cast<uint16_t>(sin->sin_port), port_override);
++    raw = reinterpret_cast<const XSOCKADDR*>(&patched);
++  }
++  N_XSOCKADDR native_name(raw);
+   X_STATUS status = socket->Connect(&native_name, namelen);
++  if (fake_live && !socket->has_fesl_shim() && xeOnlineServerAddress(&server_address) &&
++      static_cast<uint32_t>(sin->sin_addr) == server_address) {
++    // The 360's account requests the PC server cannot answer are answered here instead.
++    const auto& identity = REX_KERNEL_STATE()->user_profile()->fake_identity();
++    socket->EnableFeslShim(
++        identity.xuid,
++        std::string(identity.gamertag, strnlen(identity.gamertag, sizeof(identity.gamertag))),
++        REX_KERNEL_STATE()->user_profile()->fake_account_secret(), Ipv4ToString(server_address));
++  }
++  if (fake_live) {
++    FAKE_LIVE_TRACE_UP_TO(20, "fake Live: connect socket {} to {}:{} (asked {}) -> {} (winsock {}, errno {})",
++                          socket_handle, Ipv4ToString(sin->sin_addr),
++                          static_cast<uint32_t>(patched.sin_port),
++                          static_cast<uint32_t>(sin->sin_port),
++                          XFAILED(status) ? "failed" : "ok", socket->last_connect_error(),
++                          socket->last_native_errno());
++  }
+   if (XFAILED(status)) {
+-    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
++    // With the fake on, report the real reason (in progress, refused, ...) as the game's
++    // non-blocking sockets expect; otherwise keep the generic code.
++    XThread::SetLastError(fake_live ? socket->last_connect_error()
++                                    : xboxkrnl::xeRtlNtStatusToDosError(status));
+     return -1;
+   }
+ 
+@@ -783,6 +1314,18 @@ struct host_set {
+     }
+   }
+ 
++  // One past the highest host descriptor in the set (0 when empty).
++  int NativeBound() const {
++    int bound = 0;
++    for (uint32_t i = 0; i < this->count; ++i) {
++      const int next = static_cast<int>(this->sockets[i]->native_handle()) + 1;
++      if (next > bound) {
++        bound = next;
++      }
++    }
++    return bound;
++  }
++
+   void UpdateFrom(fd_set* native_set) {
+     uint32_t new_count = 0;
+     for (uint32_t i = 0; i < this->count; ++i) {
+@@ -825,8 +1368,18 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+                                              reinterpret_cast<int32_t*>(&timeout.tv_usec));
+     timeout_in = &timeout;
+   }
+-  int ret = select(nfds, readfds ? &native_readfds : nullptr, writefds ? &native_writefds : nullptr,
+-                   exceptfds ? &native_exceptfds : nullptr, timeout_in);
++  // The guest's nfds is ignored by Winsock; a BSD host needs the highest descriptor plus one, and
++  // the guest's value (1) would hide every real socket.
++  const int host_nfds = std::max({host_readfds.NativeBound(), host_writefds.NativeBound(),
++                                  host_exceptfds.NativeBound()});
++  const uint32_t asked_write = writefds ? host_writefds.count : 0;
++  int ret = select(host_nfds, readfds ? &native_readfds : nullptr,
++                   writefds ? &native_writefds : nullptr, exceptfds ? &native_exceptfds : nullptr,
++                   timeout_in);
++  if (REX_KERNEL_STATE()->user_profile()->fake_live() && (ret != 0 || asked_write != 0)) {
++    FAKE_LIVE_TRACE_UP_TO(30, "fake Live: select({} sockets to write) -> {} (host nfds {})",
++                          asked_write, ret, host_nfds);
++  }
+   if (readfds) {
+     host_readfds.UpdateFrom(&native_readfds);
+     host_readfds.Store(readfds);
+@@ -844,6 +1397,17 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+   return ret;
+ }
+ 
++// After a failed host socket call: the game's WSAGetLastError() must say why (would-block on a
++// non-blocking socket is normal and the game polls again, anything else ends the connection).
++static void SetLastErrorFromHost(int host_errno) {
++#if REX_PLATFORM_WIN32
++  XThread::SetLastError(static_cast<uint32_t>(WSAGetLastError()));
++  (void)host_errno;
++#else
++  XThread::SetLastError(fake_live::WinsockErrorFromErrno(host_errno));
++#endif
++}
++
+ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
+   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+   if (!socket) {
+@@ -852,7 +1416,15 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+     return -1;
+   }
+ 
+-  return socket->Recv(buf_ptr, buf_len, flags);
++  const int ret = socket->Recv(buf_ptr, buf_len, flags);
++  if (ret < 0) {
++    SetLastErrorFromHost(errno);
++  } else if (REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    FAKE_LIVE_TRACE_UP_TO(400, "fake Live: recv socket {} {} bytes: {} text: {}", socket_handle, ret,
++                          HexPrefix(buf_ptr.as<const uint8_t*>(), static_cast<uint32_t>(ret)),
++                          TextPrefix(buf_ptr.as<const uint8_t*>(), static_cast<uint32_t>(ret)));
++  }
++  return ret;
+ }
+ 
+ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
+@@ -883,13 +1455,12 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+   }
+ 
+   if (ret == -1) {
+-// TODO: Better way of getting the error code
+-#if REX_PLATFORM_WIN32
+-    uint32_t error_code = WSAGetLastError();
+-    XThread::SetLastError(error_code);
+-#else
+-    XThread::SetLastError(0x0);
+-#endif
++    SetLastErrorFromHost(errno);
++  } else if (ret > 0 && REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    FAKE_LIVE_TRACE_UP_TO(60, "fake Live: recvfrom socket {} {} bytes from {}:{}: {}", socket_handle,
++                          ret, Ipv4ToString(native_from.sin_addr),
++                          static_cast<uint16_t>(native_from.sin_port),
++                          HexPrefix(buf_ptr.as<const uint8_t*>(), static_cast<uint32_t>(ret)));
+   }
+ 
+   return ret;
+@@ -903,7 +1474,17 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+     return -1;
+   }
+ 
+-  return socket->Send(buf_ptr, buf_len, flags);
++  if (REX_KERNEL_STATE()->user_profile()->fake_live() &&
++      !IsBulkUpload(buf_ptr.as<const uint8_t*>(), buf_len)) {
++    FAKE_LIVE_TRACE_UP_TO(400, "fake Live: send socket {} {} bytes: {} text: {}", socket_handle,
++                          buf_len, HexPrefix(buf_ptr.as<const uint8_t*>(), buf_len),
++                          TextPrefix(buf_ptr.as<const uint8_t*>(), buf_len));
++  }
++  const int ret = socket->Send(buf_ptr, buf_len, flags);
++  if (ret < 0) {
++    SetLastErrorFromHost(errno);
++  }
++  return ret;
+ }
+ 
+ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
+@@ -915,7 +1496,38 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+     return -1;
+   }
+ 
++  if (REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    const XSOCKADDR_IN* sin = to_ptr;
++    FAKE_LIVE_TRACE_UP_TO(300, "fake Live: sendto socket {} {} bytes to {}:{}: {}", socket_handle,
++                          buf_len, sin ? Ipv4ToString(sin->sin_addr) : std::string("?"),
++                          sin ? static_cast<uint32_t>(sin->sin_port) : 0,
++                          HexBytes(buf_ptr.as<const uint8_t*>(), buf_len, 128));
++  }
+   N_XSOCKADDR_IN native_to(to_ptr);
++  uint32_t server_address = 0;
++  if (REX_KERNEL_STATE()->user_profile()->fake_live() && to_ptr &&
++      xeOnlineServerAddress(&server_address) &&
++      static_cast<uint32_t>(to_ptr->sin_addr) == server_address) {
++    // The server answered the game's first datagram from another port (a router or relay in front of
++    // it rewrote it) and the game now sends everything there. Whether that port leads back to the
++    // server is unknown, while the port the first datagram used is known to: send to that one.
++    const uint16_t server_port = rex::system::xam::tunnel::GlobalTunnel().ServerPort();
++    if (server_port != 0 && static_cast<uint16_t>(to_ptr->sin_port) != server_port) {
++      FAKE_LIVE_TRACE_UP_TO(10, "fake Live: UDP the game addressed to port {} goes to port {}",
++                            static_cast<uint16_t>(to_ptr->sin_port), server_port);
++      native_to.sin_port = server_port;
++    }
++    // The PC server's race transport wants one record per packet, but the 360 bundles its recent
++    // history into each (udp_tunnel.h): split the bundle and send that instead.
++    if (auto rewritten = rex::system::xam::tunnel::GlobalTunnel().Normalize(
++            buf_ptr.as<const uint8_t*>(), buf_len)) {
++      FAKE_LIVE_TRACE_UP_TO(300, "fake Live: UDP datagram split: {} bytes became {} bytes: {}", buf_len,
++                            rewritten->size(), HexBytes(rewritten->data(), rewritten->size(), 128));
++      const int sent = socket->SendTo(rewritten->data(), static_cast<uint32_t>(rewritten->size()),
++                                      flags, &native_to, to_len);
++      return sent < 0 ? static_cast<u32>(-1) : buf_len;
++    }
++  }
+   return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+ }
+ 
+@@ -946,6 +1558,9 @@ REX_EXPORT(__imp__NetDll_WSACleanup, rex::kernel::xam::NetDll_WSACleanup_entry)
+ REX_EXPORT(__imp__NetDll_WSAGetLastError, rex::kernel::xam::NetDll_WSAGetLastError_entry)
+ REX_EXPORT(__imp__NetDll_WSARecvFrom, rex::kernel::xam::NetDll_WSARecvFrom_entry)
+ REX_EXPORT(__imp__NetDll_WSASendTo, rex::kernel::xam::NetDll_WSASendTo_entry)
++REX_EXPORT(__imp__NetDll_WSAGetOverlappedResult,
++           rex::kernel::xam::NetDll_WSAGetOverlappedResult_entry)
++REX_EXPORT(__imp__NetDll_WSACancelOverlappedIO, rex::kernel::xam::NetDll_WSACancelOverlappedIO_entry)
+ REX_EXPORT(__imp__NetDll_WSAWaitForMultipleEvents,
+            rex::kernel::xam::NetDll_WSAWaitForMultipleEvents_entry)
+ REX_EXPORT(__imp__NetDll_WSACreateEvent, rex::kernel::xam::NetDll_WSACreateEvent_entry)
+@@ -963,6 +1578,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+            rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
+ REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
+            rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
++REX_EXPORT(__imp__XNetLogonGetMachineID, rex::kernel::xam::XNetLogonGetMachineID_entry)
++REX_EXPORT(__imp__XNetLogonGetTitleID, rex::kernel::xam::XNetLogonGetTitleID_entry)
+ REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
+ REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
+ REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
+@@ -1000,9 +1617,7 @@ REX_EXPORT_STUB(__imp__NetDll_UpnpEventUnsubscribe);
+ REX_EXPORT_STUB(__imp__NetDll_UpnpSearchCreate);
+ REX_EXPORT_STUB(__imp__NetDll_UpnpSearchGetDevices);
+ REX_EXPORT_STUB(__imp__NetDll_UpnpStartup);
+-REX_EXPORT_STUB(__imp__NetDll_WSACancelOverlappedIO);
+ REX_EXPORT_STUB(__imp__NetDll_WSAEventSelect);
+-REX_EXPORT_STUB(__imp__NetDll_WSAGetOverlappedResult);
+ REX_EXPORT_STUB(__imp__NetDll_WSARecv);
+ REX_EXPORT_STUB(__imp__NetDll_WSASend);
+ REX_EXPORT_STUB(__imp__NetDll_WSAStartupEx);
+@@ -1030,12 +1645,12 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+ REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
+ REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
+ REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
+-REX_EXPORT_STUB(__imp__NetDll_XNetConnect);
++REX_EXPORT(__imp__NetDll_XNetConnect, rex::kernel::xam::NetDll_XNetConnect_entry)
+ REX_EXPORT_STUB(__imp__NetDll_XNetCreateKey);
+ REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
+ REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseRelease);
+ REX_EXPORT_STUB(__imp__NetDll_XNetGetBroadcastVersionStatus);
+-REX_EXPORT_STUB(__imp__NetDll_XNetGetConnectStatus);
++REX_EXPORT(__imp__NetDll_XNetGetConnectStatus, rex::kernel::xam::NetDll_XNetGetConnectStatus_entry)
+ REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
+ REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
+ REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
+@@ -1048,7 +1663,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
+ REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
+ REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
+ REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
+-REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterKey);
++REX_EXPORT(__imp__NetDll_XNetUnregisterKey, rex::kernel::xam::NetDll_XNetUnregisterKey_entry)
+ REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
+ REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
+ REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
+@@ -1099,4 +1714,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
+ REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
+ REX_EXPORT_STUB(__imp__NetDll_getpeername);
+ REX_EXPORT_STUB(__imp__NetDll_getsockname);
+-REX_EXPORT_STUB(__imp__NetDll_getsockopt);
++REX_EXPORT(__imp__NetDll_getsockopt, rex::kernel::xam::NetDll_getsockopt_entry)
+diff --git a/sdk/src/kernel/xam/xam_notify.cpp b/sdk/src/kernel/xam/xam_notify.cpp
+index 9abcef6..c9968ab 100644
+--- a/sdk/src/kernel/xam/xam_notify.cpp
++++ b/sdk/src/kernel/xam/xam_notify.cpp
+@@ -33,6 +33,14 @@ uint32_t xeXamNotifyCreateListener(uint64_t mask, uint32_t is_system, uint32_t m
+   auto listener = object_ref<XNotifyListener>(new XNotifyListener(REX_KERNEL_STATE()));
+   listener->Initialize(mask, max_version);
+ 
++  // With online_fake_live on, tell the new listener what a signed-in, Live-connected console
++  // already announced (the game waits for the Live connection before it looks up a server).
++  if (REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    for (const auto& note : fake_live::InitialNotifications()) {
++      listener->EnqueueNotification(XNotificationID(note.id), note.param);
++    }
++  }
++
+   // Handle ref is incremented, so return that.
+   uint32_t handle = listener->handle();
+ 
+@@ -80,6 +88,12 @@ u32 XNotifyGetNext_entry(u32 handle, u32 match_id, mapped_u32 id_ptr, mapped_u32
+     dequeued = listener->DequeueNotification(&id, &param);
+   }
+ 
++  if (REX_KERNEL_STATE()->user_profile()->fake_live() && (dequeued || match_id != 0x2000002)) {
++    // The invite poll (0x2000002) is constant and uninteresting; everything else shows what the
++    // game waits for and what it was given.
++    FAKE_LIVE_TRACE_UP_TO(40, "fake Live: XNotifyGetNext({:#x}, match {:#x}) -> {} id {:#x} param {:#x}",
++                          uint32_t(handle), uint32_t(match_id), dequeued ? "got" : "empty", id, param);
++  }
+   *id_ptr = dequeued ? id : 0;
+   // param_ptr may be null - 555307F0 Demo explicitly passes nullptr in the
+   // code.
 diff --git a/sdk/src/kernel/xam/xam_user.cpp b/sdk/src/kernel/xam/xam_user.cpp
-index 8778066..93f380f 100644
+index 8778066..ff6a4ce 100644
 --- a/sdk/src/kernel/xam/xam_user.cpp
 +++ b/sdk/src/kernel/xam/xam_user.cpp
-@@ -598,6 +598,8 @@ class XStaticAchievementEnumerator : public XEnumerator {
+@@ -12,6 +12,7 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <atomic>
+ #include <cstring>
+ 
+ #include <rex/cvar.h>
+@@ -30,6 +31,7 @@
+ 
+ REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
+ 
++
+ namespace rex {
+ namespace kernel {
+ namespace xam {
+@@ -50,11 +52,11 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
+       auto type = user_profile->type() & type_mask;
+       if (type & (2 | 4)) {
+         // maybe online profile?
+-        xuid = user_profile->xuid();
++        xuid = user_profile->online_xuid();
+         result = X_E_SUCCESS;
+       } else if (type & 1) {
+         // maybe offline profile?
+-        xuid = user_profile->xuid();
++        xuid = user_profile->online_xuid();
+         result = X_E_SUCCESS;
+       }
+     }
+@@ -71,6 +73,9 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
+     if (user_index == 0) {
+       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+       signin_state = user_profile->signin_state();
++      if (user_profile->fake_live()) {
++        FAKE_LIVE_TRACE("fake Live: XamUserGetSigninState(0) -> {}", signin_state);
++      }
+     }
+   }
+   return signin_state;
+@@ -97,9 +102,9 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
+   }
+ 
+   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+-  info->xuid = user_profile->xuid();
++  info->xuid = user_profile->online_xuid();
+   info->signin_state = user_profile->signin_state();
+-  rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
++  rex::string::copy_truncating(info->name, user_profile->online_name(), rex::countof(info->name));
+   return X_E_SUCCESS;
+ }
+ 
+@@ -113,7 +118,7 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
+   }
+ 
+   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+-  const auto& user_name = user_profile->name();
++  const auto& user_name = user_profile->online_name();
+   rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
+   return X_E_SUCCESS;
+ }
+@@ -132,7 +137,7 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
+   }
+ 
+   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+-  auto user_name = rex::string::to_utf16(user_profile->name());
++  auto user_name = rex::string::to_utf16(user_profile->online_name());
+   rex::string::copy_and_swap_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
+   return X_E_SUCCESS;
+ }
+@@ -156,7 +161,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
+     assert_not_null(xuids);
+     // TODO(gibbed): allow proper lookup of arbitrary XUIDs
+     const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+-    assert_true(static_cast<uint64_t>(xuids[0]) == user_profile->xuid());
++    assert_true(static_cast<uint64_t>(xuids[0]) == user_profile->online_xuid());
+     // TODO(gibbed): we assert here, but in case a title passes xuid_count > 1
+     // until it's implemented for release builds...
+     xuid_count = 1;
+@@ -264,7 +269,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
+     std::memset(out_setting, 0, sizeof(X_USER_PROFILE_SETTING));
+     out_setting->from = !setting || !setting->is_set ? 0 : setting->is_title_specific() ? 2 : 1;
+     if (xuids) {
+-      out_setting->xuid = user_profile->xuid();
++      out_setting->xuid = user_profile->online_xuid();
+     } else {
+       out_setting->user_index = static_cast<uint32_t>(user_index);
+     }
+@@ -382,8 +387,14 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value)
+     }
+   }
+ 
+-  // If we deny everything, games should hopefully not try to do stuff.
+-  *out_value = 0;
++  // If we deny everything, games should hopefully not try to do stuff. With online_fake_live on,
++  // the first user is granted the online privileges instead.
++  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
++  *out_value = rex::system::xam::fake_live::PrivilegeValue(user_profile->fake_live(), mask);
++  if (user_profile->fake_live()) {
++    FAKE_LIVE_TRACE("fake Live: XamUserCheckPrivilege({:#x}, {}) -> {}", user_index, mask,
++                    static_cast<uint32_t>(*out_value));
++  }
+   return X_ERROR_SUCCESS;
+ }
+ 
+@@ -598,6 +609,8 @@ class XStaticAchievementEnumerator : public XEnumerator {
  u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 xuid, u32 flags,
                                               u32 offset, u32 count, mapped_u32 buffer_size_ptr,
                                               mapped_u32 handle_ptr) {
@@ -1689,8 +4771,57 @@ index f4e0efd..3fe81be 100644
    }
  }
  
+diff --git a/sdk/src/system/function_dispatcher.cpp b/sdk/src/system/function_dispatcher.cpp
+index bd43109..a54a20e 100644
+--- a/sdk/src/system/function_dispatcher.cpp
++++ b/sdk/src/system/function_dispatcher.cpp
+@@ -20,6 +20,7 @@
+ #include <rex/memory.h>
+ #include <rex/ppc/context.h>
+ #include <rex/runtime.h>
++#include <rex/system/tail_call_thunk.h>
+ #include <rex/system/function_dispatcher.h>
+ #include <rex/system/thread_state.h>
+ 
+@@ -34,9 +35,33 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
+ 
+ }  // namespace
+ 
+-static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
+-  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
+-            ctx.last_indirect_target);
++static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* base) {
++  const uint32_t address = ctx.last_indirect_target;
++  // A short vtable or delegate thunk nobody called directly was never registered: run it from its
++  // own code (see rex/system/tail_call_thunk.h) and carry on to where it jumps.
++  PPCRegister* const gpr[rex::system::kTailCallThunkRegisters] = {
++      &ctx.r0, &ctx.r1, &ctx.r2, &ctx.r3, &ctx.r4,  &ctx.r5,  &ctx.r6,
++      &ctx.r7, &ctx.r8, &ctx.r9, &ctx.r10, &ctx.r11, &ctx.r12};
++  uint64_t regs[rex::system::kTailCallThunkRegisters];
++  for (int i = 0; i < rex::system::kTailCallThunkRegisters; ++i) {
++    regs[i] = gpr[i]->u64;
++  }
++  uint32_t target = 0;
++  if (rex::system::RunTailCallThunk(
++          base + address, rex::system::kMaxTailCallThunkWords * 4, regs,
++          [base](uint32_t guest) { return memory::load_and_swap<uint32_t>(base + guest); },
++          &target)) {
++    for (int i = 0; i < rex::system::kTailCallThunkRegisters; ++i) {
++      gpr[i]->u64 = regs[i];
++    }
++    const auto saved_ctr = ctx.ctr;
++    ctx.ctr.u64 = target;
++    ctx.last_indirect_target = target;
++    ResolveIndirectFunction(target)(ctx, base);
++    ctx.ctr = saved_ctr;
++    return;
++  }
++  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}", address);
+ }
+ 
+ PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
 diff --git a/sdk/src/system/kernel_state.cpp b/sdk/src/system/kernel_state.cpp
-index 697399c..33ee983 100644
+index 697399c..f8c6a3a 100644
 --- a/sdk/src/system/kernel_state.cpp
 +++ b/sdk/src/system/kernel_state.cpp
 @@ -23,6 +23,7 @@
@@ -1711,7 +4842,15 @@ index 697399c..33ee983 100644
  
  namespace rex::system {
  
-@@ -121,6 +125,9 @@ KernelState::KernelState(Runtime* emulator)
+@@ -72,6 +76,7 @@ KernelState::KernelState(Runtime* emulator)
+   if (!user_data_root.empty()) {
+     user_data_root = std::filesystem::absolute(user_data_root);
+   }
++  user_profile_->MaybeEnableFakeLive(user_data_root);
+   content_manager_ = std::make_unique<xam::ContentManager>(this, user_data_root);
+ 
+   if (shared_kernel_state_ != nullptr) {
+@@ -121,6 +126,9 @@ KernelState::KernelState(Runtime* emulator)
    // SetExecutableModule() (e.g. XMA decoder) can link into its thread_list.
    // SetExecutableModule() will re-initialize it fully with XEX header values.
    InitializeProcess(&globals->title_process, X_PROCTYPE_USER, 0, 0, 0);
@@ -1721,7 +4860,7 @@ index 697399c..33ee983 100644
  }
  
  void KernelState::InitializeProcess(X_KPROCESS* process, uint32_t process_type, uint8_t unk_18,
-@@ -161,14 +168,30 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
+@@ -161,14 +169,30 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
  }
  
  KernelState::~KernelState() {
@@ -1755,7 +4894,7 @@ index 697399c..33ee983 100644
  
    // Unload through UnloadUserModule so the recompiled-DLL teardown runs.
    // call_entry=false because guest DllMain is unsafe at shutdown.
-@@ -649,14 +672,14 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
+@@ -649,14 +673,14 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
      dispatch_thread_running_ = true;
      dispatch_thread_ = object_ref<XHostThread>(new XHostThread(this, 128 * 1024, 0, [this]() {
        auto global_lock = global_critical_region_.AcquireDeferred();
@@ -1777,7 +4916,7 @@ index 697399c..33ee983 100644
          }
          auto fn = std::move(dispatch_queue_.front());
          dispatch_queue_.pop_front();
-@@ -1070,10 +1093,106 @@ void KernelState::OnThreadExit(XThread* thread) {
+@@ -1070,10 +1094,106 @@ void KernelState::OnThreadExit(XThread* thread) {
    // Must be called on executing thread.
    assert_true(XThread::GetCurrentThread() == thread);
  
@@ -1884,6 +5023,81 @@ index 697399c..33ee983 100644
  object_ref<XThread> KernelState::GetThreadByID(uint32_t thread_id) {
    auto global_lock = global_critical_region_.Acquire();
    XThread* thread = nullptr;
+diff --git a/sdk/src/system/xam/app_manager.cpp b/sdk/src/system/xam/app_manager.cpp
+index 9b882af..b99d1b5 100644
+--- a/sdk/src/system/xam/app_manager.cpp
++++ b/sdk/src/system/xam/app_manager.cpp
+@@ -9,6 +9,10 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <map>
++#include <mutex>
++
++#include <rex/logging.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xam/app_manager.h>
+ 
+@@ -16,6 +20,27 @@ namespace rex {
+ namespace system {
+ namespace xam {
+ 
++namespace {
++// With online_fake_live on: log the first few messages of each (app, message) pair with their
++// arguments and result, so a hardware run shows which Live service calls the game makes.
++void TraceAppMessage(const char* kind, uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
++                     uint32_t buffer_length, uint32_t result, bool found) {
++  if (!REX_KERNEL_STATE()->user_profile()->fake_live()) {
++    return;
++  }
++  static std::mutex lock;
++  static std::map<uint64_t, int> seen;
++  {
++    std::lock_guard<std::mutex> guard(lock);
++    if (++seen[(uint64_t(app_id) << 32) | message] > 5) {
++      return;
++    }
++  }
++  REXSYS_WARN("fake Live: {} app {:#x} msg {:#x} ({:#x}, {:#x}) -> {:#x}{}", kind, app_id, message,
++              buffer_ptr, buffer_length, result, found ? "" : " (no such app)");
++}
++}  // namespace
++
+ App::App(KernelState* kernel_state, uint32_t app_id)
+     : kernel_state_(kernel_state), memory_(kernel_state->memory()), app_id_(app_id) {}
+ 
+@@ -31,11 +56,14 @@ X_HRESULT AppManager::DispatchMessageSync(uint32_t app_id, uint32_t message, uin
+   {
+     auto it = app_lookup_.find(app_id);
+     if (it == app_lookup_.end()) {
++      TraceAppMessage("sync", app_id, message, buffer_ptr, buffer_length, X_E_NOTFOUND, false);
+       return X_E_NOTFOUND;
+     }
+     app = it->second;
+   }
+-  return app->DispatchMessageSync(message, buffer_ptr, buffer_length);
++  const X_HRESULT result = app->DispatchMessageSync(message, buffer_ptr, buffer_length);
++  TraceAppMessage("sync", app_id, message, buffer_ptr, buffer_length, result, true);
++  return result;
+ }
+ 
+ X_HRESULT AppManager::DispatchMessageAsync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
+@@ -44,11 +72,14 @@ X_HRESULT AppManager::DispatchMessageAsync(uint32_t app_id, uint32_t message, ui
+   {
+     auto it = app_lookup_.find(app_id);
+     if (it == app_lookup_.end()) {
++      TraceAppMessage("async", app_id, message, buffer_ptr, buffer_length, X_E_NOTFOUND, false);
+       return X_E_NOTFOUND;
+     }
+     app = it->second;
+   }
+-  return app->DispatchMessageSync(message, buffer_ptr, buffer_length);
++  const X_HRESULT result = app->DispatchMessageSync(message, buffer_ptr, buffer_length);
++  TraceAppMessage("async", app_id, message, buffer_ptr, buffer_length, result, true);
++  return result;
+ }
+ 
+ }  // namespace xam
 diff --git a/sdk/src/system/xam/content_manager.cpp b/sdk/src/system/xam/content_manager.cpp
 index 78826a6..e715bb3 100644
 --- a/sdk/src/system/xam/content_manager.cpp
@@ -2361,6 +5575,184 @@ index 78826a6..e715bb3 100644
  }
  
  }  // namespace xam
+diff --git a/sdk/src/system/xam/user_profile.cpp b/sdk/src/system/xam/user_profile.cpp
+index a77f5e6..a4d0749 100644
+--- a/sdk/src/system/xam/user_profile.cpp
++++ b/sdk/src/system/xam/user_profile.cpp
+@@ -9,18 +9,173 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
++#include <chrono>
++#include <exception>
++#include <functional>
++#include <mutex>
+ #include <sstream>
++#include <thread>
+ 
+ #include <fmt/format.h>
+ 
++#include <rex/cvar.h>
+ #include <rex/logging.h>
+ #include <rex/system/kernel_state.h>
++#include <rex/system/thread_state.h>
++#include <rex/system/xthread.h>
+ #include <rex/system/xam/user_profile.h>
+ 
++REXCVAR_DEFINE_BOOL(online_fake_live, false, "Online",
++                    "Pretend the profile is signed in to Xbox Live so the online menus open");
++
++REXCVAR_DEFINE_STRING(online_server_host, "", "Online",
++                      "Host or IPv4 address that EA service names (fesl.ea.com, ...) are redirected to "
++                      "when online_fake_live is on; empty means no redirect")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++static std::atomic<bool> g_trace_online_calls{false};
++
++REXCVAR_DEFINE_INT32(online_server_port, 0, "Online",
++                     "When not 0, the game's login connection to the online_server_host address (it dials "
++                     "port 18220) uses this TCP port instead (the PC server listens on 18210); its "
++                     "other connections keep the ports the server announces")
++    .range(0, 65535)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++// The last traced kernel calls, whatever the log rate limit hides; read back when the game goes quiet.
++static rex::system::xam::fake_live::CallRing<256> g_call_ring;
++
++static int64_t NowMs() {
++  return std::chrono::duration_cast<std::chrono::milliseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++
++// Where every guest thread is: the saved link register, the stack pointer and the return addresses along
++// the stack chain (each frame saves the caller's stack pointer at 0(sp) and its return address at
++// -8(caller's sp)). Read-only and range-checked: it is a diagnostic for a hang and must not fault.
++static void DumpGuestThreads() {
++  auto* memory = REX_KERNEL_MEMORY();
++  if (!memory) {
++    return;
++  }
++  const auto load32 = [&](uint32_t address) {
++    return rex::memory::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
++  };
++  for (const auto& thread : REX_KERNEL_OBJECTS()->GetObjectsByType<rex::system::XThread>()) {
++    auto* state = thread->thread_state();
++    auto* context = state ? state->context() : nullptr;
++    if (!context) {
++      continue;
++    }
++    const uint32_t sp = context->r1.u32;
++    // The thread's own stack bounds, from its PCR (r13): every read below stays inside them, because the
++    // page just above a stack is not accessible.
++    const uint32_t pcr = context->r13.u32;
++    uint32_t top = 0;
++    uint32_t low = 0;
++    if (pcr >= 0x10000u && pcr < 0xC0000000u && (pcr & 3) == 0) {
++      top = load32(pcr + 0x70);
++      low = load32(pcr + 0x74);
++    }
++    std::string frames;
++    uint32_t current = sp;
++    for (int depth = 0; depth < 16 && low != 0 && low < top && (current & 3) == 0; ++depth) {
++      if (current < low || current + 4 > top) {
++        break;
++      }
++      const uint32_t back = load32(current);
++      if (back <= current || back > top || back < low + 8) {
++        break;
++      }
++      frames += fmt::format(" {:08X}", load32(back - 8));
++      current = back;
++    }
++    REXKRNL_WARN("fake Live: guest thread {:x} lr {:08X} sp {:08X} stack {:08X}-{:08X} return addresses:{}",
++                 thread->handle(), context->lr, sp, low, top, frames);
++  }
++}
++
++// A hang shows as the game making no traced call at all (it polls the network every frame while it
++// runs). After 6 s of silence the last calls are written to the log, once per silence.
++static void StartCallWatchdog() {
++  static std::once_flag started;
++  std::call_once(started, [] {
++    try {
++      // Never detached or destroyed: on the Switch std::thread::detach() throws std::system_error (see
++      // xma_context.cpp), and a joinable std::thread destroyed at exit would terminate. A failure to
++      // start is only logged: this is a diagnostic and must never stop the game.
++      static std::thread* watchdog = new std::thread([] {
++        int64_t reported_for = 0;
++        for (;;) {
++          std::this_thread::sleep_for(std::chrono::seconds(2));
++          const int64_t last = g_call_ring.LastCallMs();
++          const int64_t now = NowMs();
++          if (last == 0 || now - last < 6000 || reported_for == last) {
++            continue;
++          }
++          reported_for = last;
++          REXKRNL_WARN("fake Live: no traced kernel calls for {} ms; the last calls were:", now - last);
++          for (const auto& call : g_call_ring.Snapshot(40)) {
++            REXKRNL_WARN("fake Live:   -{} ms thread {:x} {} ({:#x}, {:#x}, {:#x}, {:#x})",
++                         now - call.time_ms, call.thread & 0xFFFFFF, call.name, call.args[0],
++                         call.args[1], call.args[2], call.args[3]);
++          }
++          DumpGuestThreads();
++        }
++      });
++      (void)watchdog;
++    } catch (const std::exception& error) {
++      REXKRNL_WARN("fake Live: the call watchdog did not start: {}", error.what());
++    }
++  });
++}
++
++namespace rex::ppc::detail {
++void TraceOnlineCall(const char* name, const PPCContext& ctx, std::atomic<int>& count,
++                     std::atomic<int64_t>& last_logged_ms) {
++  if (!g_trace_online_calls.load(std::memory_order_relaxed)) {
++    return;
++  }
++  g_call_ring.Record(NowMs(), std::hash<std::thread::id>()(std::this_thread::get_id()), name,
++                     {ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32});
++  const int n = count.fetch_add(1);
++  if (n >= 40) {
++    // After the first 40, one line per ten seconds per export: every line is flushed to the SD card
++    // (about 12 ms), and the call ring above already keeps the recent calls for the watchdog.
++    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                               std::chrono::steady_clock::now().time_since_epoch())
++                               .count();
++    int64_t last_ms = last_logged_ms.load();
++    if (now_ms - last_ms < 10000 || !last_logged_ms.compare_exchange_strong(last_ms, now_ms)) {
++      return;
++    }
++  }
++  REXKRNL_WARN("fake Live: call {} #{} ({:#x}, {:#x}, {:#x}, {:#x})", name, n + 1, ctx.r3.u32,
++               ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
++}
++}  // namespace rex::ppc::detail
++
+ namespace rex {
+ namespace system {
+ namespace xam {
+ 
++void UserProfile::MaybeEnableFakeLive(const std::filesystem::path& user_data_root) {
++  if (!REXCVAR_GET(online_fake_live)) {
++    return;
++  }
++  REXSYS_WARN("fake Live: setting is on, loading identity from {}", user_data_root.string());
++  const auto seed = fake_live::LoadOrCreateSeed(user_data_root / "online_identity.bin");
++  fake_identity_ = fake_live::MakeIdentity(seed);
++  fake_account_secret_ = fake_live::LoadOrCreateSeed(user_data_root / "online_account.bin");
++  fake_live_ = true;
++  g_trace_online_calls = true;
++  StartCallWatchdog();
++  // Warn level on purpose: it is flushed at once, so it survives a crash.
++  REXSYS_WARN("fake Live on: {} {:016x}", online_name(), online_xuid());
++}
++
+ UserProfile::UserProfile() {
+   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
+   // if non-zero, it prevents the user from playing the game.
 diff --git a/sdk/src/system/xobject.cpp b/sdk/src/system/xobject.cpp
 index d358f39..e3bee26 100644
 --- a/sdk/src/system/xobject.cpp
@@ -2465,6 +5857,209 @@ index d358f39..e3bee26 100644
      XThread::CheckTitleTermination();
      switch (result) {
        case rex::thread::WaitResult::kSuccess:
+diff --git a/sdk/src/system/xsocket.cpp b/sdk/src/system/xsocket.cpp
+index 2d13ac8..c5ba5be 100644
+--- a/sdk/src/system/xsocket.cpp
++++ b/sdk/src/system/xsocket.cpp
+@@ -9,9 +9,13 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
++#include <cerrno>
+ #include <cstring>
++#include <string>
+ 
+ #include <rex/kernel/xam/module.h>
++#include <rex/logging.h>
+ #include <rex/platform.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xsocket.h>
+@@ -90,6 +94,27 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
+   return X_STATUS_SUCCESS;
+ }
+ 
++X_STATUS XSocket::GetOption(uint32_t level, uint32_t optname, uint32_t* value) {
++  int host_value = 0;
++#if REX_PLATFORM_WIN32
++  int host_len = sizeof(host_value);
++#else
++  socklen_t host_len = sizeof(host_value);
++#endif
++  if (getsockopt(native_handle_, level, optname, reinterpret_cast<char*>(&host_value),
++                 &host_len) < 0) {
++    return X_STATUS_UNSUCCESSFUL;
++  }
++  // SO_ERROR on the host is an errno (Winsock already reports Winsock codes).
++#if !REX_PLATFORM_WIN32
++  if (level == 0xFFFF && optname == 0x1007 && host_value != 0) {
++    host_value = static_cast<int>(system::xam::fake_live::WinsockErrorFromErrno(host_value));
++  }
++#endif
++  *value = static_cast<uint32_t>(host_value);
++  return X_STATUS_SUCCESS;
++}
++
+ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
+   int ret = rex::net::socket_ioctl(native_handle_, cmd, arg_ptr);
+   if (ret < 0) {
+@@ -100,17 +125,57 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
+   return X_STATUS_SUCCESS;
+ }
+ 
++#if !REX_PLATFORM_WIN32
++// The host's own sockaddr_in, built from the guest's address bytes (port, then IPv4 address, both
++// already in network order). Passing the guest's struct through breaks on platforms whose sockaddr
++// starts with a length byte and an 8-bit family, such as the Switch's BSD stack (the 16-bit family
++// reads as 0 and connect fails).
++static sockaddr_in HostSockaddrIn(const uint8_t* port_bytes, const uint8_t* address_bytes) {
++  sockaddr_in host{};
++#if defined(__SWITCH__)
++  host.sin_len = sizeof(host);
++#endif
++  host.sin_family = AF_INET;
++  std::memcpy(&host.sin_port, port_bytes, 2);
++  std::memcpy(&host.sin_addr, address_bytes, 4);
++  return host;
++}
++#endif
++
+ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
++#if REX_PLATFORM_WIN32
+   int ret = connect(native_handle_, (sockaddr*)name, name_len);
++#else
++  const sockaddr_in host =
++      HostSockaddrIn(reinterpret_cast<const uint8_t*>(name->sa_data),
++                     reinterpret_cast<const uint8_t*>(name->sa_data) + 2);
++  int ret = connect(native_handle_, reinterpret_cast<const sockaddr*>(&host), sizeof(host));
++#endif
+   if (ret < 0) {
++#if REX_PLATFORM_WIN32
++    last_connect_error_ = static_cast<uint32_t>(WSAGetLastError());
++    last_native_errno_ = static_cast<int>(last_connect_error_);
++#else
++    last_native_errno_ = errno;
++    last_connect_error_ = system::xam::fake_live::WinsockErrorFromErrno(errno);
++#endif
+     return X_STATUS_UNSUCCESSFUL;
+   }
++  last_connect_error_ = 0;
++  last_native_errno_ = 0;
+ 
+   return X_STATUS_SUCCESS;
+ }
+ 
+ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
++#if REX_PLATFORM_WIN32
+   int ret = bind(native_handle_, (sockaddr*)name, name_len);
++#else
++  const sockaddr_in host =
++      HostSockaddrIn(reinterpret_cast<const uint8_t*>(&name->sin_port),
++                     reinterpret_cast<const uint8_t*>(&name->sin_addr));
++  int ret = bind(native_handle_, reinterpret_cast<const sockaddr*>(&host), sizeof(host));
++#endif
+   if (ret < 0) {
+     return X_STATUS_UNSUCCESSFUL;
+   }
+@@ -158,6 +223,50 @@ int XSocket::Shutdown(int how) {
+ }
+ 
+ int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
++  if (shim_ && shim_inbox_.empty()) {
++    // Everything the server sends goes through the shim: replies to its own account requests are
++    // answered to the game in the game's terms, the rest is queued as it came.
++    uint8_t chunk[4096];
++    const int got = recv(native_handle_, reinterpret_cast<char*>(chunk), sizeof(chunk), 0);
++    if (got <= 0) {
++      return got;  // closed (0) or failed (-1): the caller reports why
++    }
++    const xam::fesl::Translation translated = shim_->FromServer(chunk, static_cast<size_t>(got));
++    static int traced = 0;
++    if (traced < 40) {
++      ++traced;
++      std::string text;
++      for (int i = 0; i < got && i < 400; ++i) {
++        const uint8_t c = chunk[i];
++        text.push_back(c == 0x0A ? '|' : (c >= 0x20 && c < 0x7F ? static_cast<char>(c) : '.'));
++      }
++      REXKRNL_WARN("fake Live: server sent {} bytes, to game {} bytes, to server {} bytes: {}", got,
++                   translated.to_game.size(), translated.to_server.size(), text);
++    }
++    shim_inbox_.insert(shim_inbox_.end(), translated.to_game.begin(), translated.to_game.end());
++    if (!translated.to_server.empty()) {
++      send(native_handle_, reinterpret_cast<const char*>(translated.to_server.data()),
++           static_cast<int>(translated.to_server.size()), 0);
++    }
++    if (shim_inbox_.empty()) {
++      // Only part of a frame so far, or a reply the shim consumed: nothing for the game yet.
++#if REX_PLATFORM_WIN32
++      WSASetLastError(WSAEWOULDBLOCK);
++#else
++      errno = EAGAIN;
++#endif
++      return -1;
++    }
++  }
++  if (!shim_inbox_.empty()) {
++    // A locally answered frame comes first, as far as the game's buffer allows.
++    const size_t count = std::min<size_t>(buf_len, shim_inbox_.size());
++    std::copy_n(shim_inbox_.begin(), count, buf);
++    if (!(flags & 0x2 /* MSG_PEEK */)) {
++      shim_inbox_.erase(shim_inbox_.begin(), shim_inbox_.begin() + count);
++    }
++    return static_cast<int>(count);
++  }
+   return recv(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags);
+ }
+ 
+@@ -205,7 +314,25 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
+ }
+ 
+ int XSocket::Send(const uint8_t* buf, uint32_t buf_len, uint32_t flags) {
+-  return send(native_handle_, reinterpret_cast<const char*>(buf), buf_len, flags);
++  if (!shim_) {
++    return send(native_handle_, reinterpret_cast<const char*>(buf), buf_len, flags);
++  }
++  const xam::fesl::Translation translated = shim_->FromGame(buf, buf_len);
++  static int traced_requests = 0;
++  for (const std::string& line : shim_->TakeTrace()) {
++    if (traced_requests++ < 12) {
++      REXKRNL_WARN("fake Live: {}", line);
++    }
++  }
++  shim_inbox_.insert(shim_inbox_.end(), translated.to_game.begin(), translated.to_game.end());
++  if (!translated.to_server.empty()) {
++    const int sent = send(native_handle_, reinterpret_cast<const char*>(translated.to_server.data()),
++                          static_cast<int>(translated.to_server.size()), flags);
++    if (sent < 0) {
++      return sent;
++    }
++  }
++  return static_cast<int>(buf_len);  // the game handed over its bytes; the shim took them all
+ }
+ 
+ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_IN* to,
+@@ -221,12 +348,20 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
+   }
+   */
+ 
++#if REX_PLATFORM_WIN32
+   sockaddr_in nto;
+   if (to) {
+     nto.sin_addr.s_addr = to->sin_addr;
+     nto.sin_family = to->sin_family;
+     nto.sin_port = to->sin_port;
+   }
++#else
++  sockaddr_in nto{};
++  if (to) {
++    nto = HostSockaddrIn(reinterpret_cast<const uint8_t*>(&to->sin_port),
++                         reinterpret_cast<const uint8_t*>(&to->sin_addr));
++  }
++#endif
+ 
+   return sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
+                 to ? (sockaddr*)&nto : nullptr, to_len);
 diff --git a/sdk/src/system/xthread.cpp b/sdk/src/system/xthread.cpp
 index af02bc0..b2de00e 100644
 --- a/sdk/src/system/xthread.cpp

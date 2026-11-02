@@ -1,0 +1,70 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8f8d329..613ad0b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -119,7 +119,8 @@ if(REXGLUE_PLATFORM_SWITCH)
+     if(NFSCARBON_EDITION STREQUAL "standard")
+         target_sources(nfscarbon PRIVATE src/audio_resampler_hook.cpp src/render_pass_profile_hook.cpp
+                        src/frame_handoff_hook.cpp src/audio_server_wait_hook.cpp src/audio_rate_hook.cpp
+-                       src/video_hook.cpp src/video_wmv3.cpp src/lod_bias_hook.cpp src/audio_mixer_diag.cpp src/car_lod_hook.cpp)
++                       src/video_hook.cpp src/video_wmv3.cpp src/lod_bias_hook.cpp src/audio_mixer_diag.cpp src/car_lod_hook.cpp
++                       src/tunnel_mode_hook.cpp)
+         target_link_libraries(nfscarbon PRIVATE libavcodec libavutil)
+     else()
+         # Collector's Edition shares only the verified scheduling and audio hooks (addresses in src/edition.h,
+diff --git a/src/edition.h b/src/edition.h
+index 80e5f34..93c0ad9 100644
+--- a/src/edition.h
++++ b/src/edition.h
+@@ -138,6 +138,7 @@ constexpr bool kConservativeContext = false;
+ #define MP_14 sub_825C49C8
+ #define MP_15 sub_825C8C30
+ #define CAR_RENDER sub_825A43A8
++#define TUNNEL_CREATE sub_82A432B8  // ProtoTunnel creation (sets tunnel+20, the datagram mode, to 2); tunnel_mode_hook.cpp
+ #define PASS_FRAME sub_824F0210
+ #define PASS_PREP sub_8250B4D0
+ #define PASS_1 sub_824EED60
+diff --git a/src/tunnel_mode_hook.cpp b/src/tunnel_mode_hook.cpp
+new file mode 100644
+index 0000000..715b192
+--- /dev/null
++++ b/src/tunnel_mode_hook.cpp
+@@ -0,0 +1,38 @@
++// Online (fake Live) only: make the game's UDP tunnel encrypt its datagrams the way the PC game does.
++//
++// sub_82A432B8 creates the DirtySDK ProtoTunnel and sets its mode field (tunnel + 20) to 2, which sends and
++// expects the tunnel's datagram table and bodies in clear text (the 360 normally relies on the Xbox secure
++// network for that). The community PC server only accepts datagrams RC4-encrypted with the game's key, and
++// answers in RC4, so a clear datagram is dropped without a reply. Mode 0 is the tunnel's own RC4 path, present
++// and symmetric in the same code (send: sub_82A41A88, receive: sub_82A42CE0), so setting it after creation
++// makes the game's own state machine do both directions. See docs/superpowers/findings/stage5-udp-handshake.md.
++//
++// Standard edition only (the Collector's address of this function has not been matched yet).
++#include <rex/cvar.h>
++#include <rex/logging.h>
++
++#include <cstdint>
++
++#include "edition.h"
++#include CARBON_GUEST_PCH
++
++#if !defined(NFSCARBON_COLLECTORS)
++
++REXCVAR_DECLARE(bool, online_fake_live);
++
++REXCVAR_DEFINE_BOOL(online_tunnel_rc4, true, "Online",
++                    "With online_fake_live on, create the game's UDP tunnel in its encrypted mode so a PC "
++                    "community server's race transport accepts it; false keeps the console's clear mode");
++
++extern "C" void CARBON_IMP(TUNNEL_CREATE)(PPCContext& __restrict ctx, uint8_t* base);
++
++extern "C" REX_FUNC(TUNNEL_CREATE) {
++  CARBON_IMP(TUNNEL_CREATE)(ctx, base);
++  const uint32_t tunnel = ctx.r3.u32;  // the new tunnel, or 0 when it could not be created
++  if (tunnel != 0 && REXCVAR_GET(online_fake_live) && REXCVAR_GET(online_tunnel_rc4)) {
++    REX_STORE_U32(tunnel + 20, 0);
++    REXLOG_WARN("fake Live: tunnel 0x{:08X} created in the encrypted mode (was clear)", tunnel);
++  }
++}
++
++#endif
