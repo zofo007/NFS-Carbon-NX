@@ -743,6 +743,29 @@ void EntryReplyStartsTheTunnelWithItsKey() {
   CHECK(out.packets.size() == 2);
 }
 
+void ServerDatagramNumberingShowsLostDatagrams() {
+  tn::TunnelState state;
+  state.Begin("4455667788");
+  // The server's datagrams: each one is a single channel 1 packet of 22 bytes, which uses a table entry
+  // and the body from the keystream (24 bytes, 6 words).
+  const auto datagram = [](uint16_t prefix) {
+    tn::Datagram d;
+    d.prefix = prefix;
+    d.packets.push_back({1, std::vector<uint8_t>(22, 0x5a)});
+    return tn::Encode(d, "4455667788");
+  };
+  const auto observe = [&](uint16_t prefix) {
+    const auto wire = datagram(prefix);
+    return state.ObserveFromServer(wire.data(), wire.size());
+  };
+  CHECK(observe(100) == 0);   // the first one only sets the position
+  CHECK(observe(106) == 0);   // the next in line
+  CHECK(observe(106) == 0);   // the same datagram again
+  CHECK(observe(118) == 6);   // the one at 112 never came: 6 words are missing
+  CHECK(observe(100) == 0);   // an old one repeated is not news
+  CHECK(observe(124) == 0);   // and the numbering carries on from the newest
+}
+
 void TheaterIsUntouchedWithoutAHost() {
   fesl::Shim account(1, "Racer0001", kSecret, "188.27.34.215");
   FromServer(account, HelloReply(0x80000001));
@@ -971,6 +994,7 @@ int main(int argc, char** argv) {
   TheaterFramesWithoutTheAnnouncedAddressAreUntouched();
   TheaterIsUntouchedWithoutAHost();
   EntryReplyStartsTheTunnelWithItsKey();
+  ServerDatagramNumberingShowsLostDatagrams();
   ServerPortReplacesOnlyTheLoginPort();
   HelloPointsTheaterAndMessengerAtTheReachableHost();
   HelloIsUntouchedWithoutAHost();
