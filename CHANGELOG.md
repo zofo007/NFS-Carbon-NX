@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 1.2.0-collectors-beta.1 (Collector's Edition)
+
+Same as 1.2.0 below: the game plays as in 1.1.0-collectors-beta.1, and the experimental online groundwork is in the build but off.
+The online tunnel hook is Standard Edition only; in this edition `online_fake_live` and `online_server_host` do nothing
+useful yet. Beta.
+
+## 1.2.0 (Standard Edition)
+
+The game plays as in 1.1.0: nothing changes in speed, saves or settings. This release only adds experimental online groundwork,
+which is **off** unless you turn it on in `nfscarbon.toml`.
 
 ### Added
 - Online groundwork (experimental, **off by default**, not working end to end yet): with `online_fake_live` on, the profile reports as signed in to Xbox Live and `online_server_host` redirects the game's EA service lookups to a community PC server, so the game reaches that server's lobby. With these settings left off, the game behaves as in 1.1.0. Also fixes `XamEnumerate` returning an uninitialized item count when the handle is invalid. See docs/CONFIG.md.

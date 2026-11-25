@@ -1,6 +1,6 @@
 # Known issues
 
-Standard Edition 1.1.0; Collector's Edition 1.1.0-collectors-beta.1 is a beta. Numbers are from the reference clocks
+Standard Edition 1.2.0; Collector's Edition 1.2.0-collectors-beta.1 is a beta. Numbers are from the reference clocks
 (CPU 1428 / GPU 768 / memory 1600 MHz) unless stated.
 
 ## Open
